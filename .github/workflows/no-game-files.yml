@@ -1,0 +1,44 @@
+# Fails any push or pull request that carries something from the game: a
+# dump, the code 3dsrecomp translates from it, what that compiles into, or
+# anything big enough to be one of them. The repository holds code written
+# by people, nothing else.
+name: no game files
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: No dumps, translated code or binaries
+        run: |
+          bad=$(git ls-files | grep -iE '\.(3ds|cci|cia|cxi|cxa|nds|app|sav|bin|exe|dll|so|a|o|obj|lib|pdb|hints|keys|state)$' || true)
+          translated=$(git ls-files | grep -E '(^|/)code/.*\.c$' || true)
+          if [ -n "$bad$translated" ]; then
+            echo "These files can't be in the repository:"
+            echo "$bad"
+            echo "$translated"
+            exit 1
+          fi
+
+      - name: Nothing over 2 MB
+        run: |
+          big=$(git ls-files -z | xargs -0 -I{} sh -c 'size=$(wc -c < "{}"); [ "$size" -gt 2097152 ] && echo "{} ($size bytes)"' || true)
+          if [ -n "$big" ]; then
+            echo "These files are too big for code written by hand:"
+            echo "$big"
+            exit 1
+          fi
+
+      - name: No pictures of the game
+        run: |
+          pictures=$(git ls-files | grep -iE '\.(png|jpe?g|gif|webp|bmp|mp4|webm)$' || true)
+          if [ -n "$pictures" ]; then
+            echo "Screenshots and videos of the game stay out of the repository:"
+            echo "$pictures"
+            exit 1
+          fi
