@@ -6,11 +6,7 @@ Bug reports, progress and everything else are on the [Discord server](https://di
 
 The games tested so far are in [COMPATIBILITY.md](COMPATIBILITY.md).
 
-<p>
-  <img width="266" alt="Pokémon Y running in Zakuro" src="docs/screenshots/pokemon-y.png" />
-  <img width="266" alt="The Legend of Zelda: Majora's Mask 3D running in Zakuro" src="docs/screenshots/majoras-mask-3d.png" />
-  <img width="266" alt="Persona Q running in Zakuro" src="docs/screenshots/persona-q.png" />
-</p>
+<!-- the screenshots of games are left out of this copy, see the original repository -->
 
 
 I started developing this project in October 2025, before
