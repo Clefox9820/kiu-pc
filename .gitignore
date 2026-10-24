@@ -40,3 +40,6 @@ target/
 
 # made by setup.ps1, with this machine's paths
 /Play.bat
+
+# personal tooling
+/.engram/
