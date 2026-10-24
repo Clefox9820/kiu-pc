@@ -1,0 +1,39 @@
+# Nothing from the game ever goes in this repository: not the ROM, not the
+# code 3dsrecomp translates from it, not what that compiles into.
+
+# game dumps
+*.3ds
+*.cci
+*.cia
+*.cxi
+*.cxa
+*.app
+*.nds
+*.bin
+*.sav
+
+# what `3dsrecomp port` writes: the game's code translated to C and its build
+/build/
+/port/
+code/
+*.c.o
+*.a
+*.o
+*.obj
+*.lib
+*.dll
+*.so
+*.exe
+*.pdb
+
+# what a run of the game leaves behind
+*.hints
+*.keys
+*.log
+*.state
+savedata/
+extdata/
+
+# Rust and tools
+target/
+/tools/
