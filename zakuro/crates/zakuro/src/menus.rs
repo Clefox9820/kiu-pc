@@ -772,6 +772,7 @@ impl Menus {
                 ui.separator();
                 ui.heading("Interface");
                 ui.checkbox(&mut settings.show_fps, "Show the frame rate");
+                ui.checkbox(&mut settings.show_controls, "Show the controls beside the screens");
                 ui.horizontal(|ui| {
                     ui.label("Library background");
                     match &settings.background {
@@ -813,6 +814,8 @@ impl Menus {
                     self.rebinding = None;
                 }
                 ui.label(RichText::new("Drag with the right mouse button to tilt the console, for games that use the motion sensors.").weak());
+                ui.add(egui::Slider::new(&mut settings.air_aim_speed, 0.1..=3.0).text("Mouse aim speed, flying (2)"));
+                ui.add(egui::Slider::new(&mut settings.land_aim_speed, 0.1..=5.0).text("Mouse aim speed, on foot (3)"));
 
                 ui.separator();
                 ui.heading("Controller");
@@ -957,6 +960,211 @@ fn progress(ui: &mut egui::Ui, job: &Job) {
 }
 
 /// a key as a person would call it.
+/// a line of the controls: the keys, each drawn as a cap, and what they do.
+struct ControlRow {
+    keys: Vec<String>,
+    does: &'static str,
+}
+
+/// the keyboard and mouse controls in sections, for Kid Icarus Uprising,
+/// whose port this is, from the keys bound now.
+fn controls_sections(k: &Keys) -> Vec<(&'static str, Vec<ControlRow>)> {
+    let row = |keys: Vec<String>, does| ControlRow { keys, does };
+    let n = key_name;
+    let text = |name: &str| name.to_owned();
+    vec![
+        ("MOVE", vec![
+            row(vec![n(k.circle_up), n(k.circle_left), n(k.circle_down), n(k.circle_right)], "Move, twice to dash"),
+            row(vec![text("Shift")], "Walk"),
+            row(vec![n(k.r)], "Reset camera"),
+        ]),
+        ("ATTACK", vec![row(vec![n(k.l), text("Left click")], "Fire, hold for more")]),
+        ("POWERS", vec![
+            row(vec![n(k.left), n(k.right), text("Wheel")], "Pick a power"),
+            row(vec![n(k.down), text("Middle click")], "Use it"),
+        ]),
+        ("AIM", vec![
+            row(vec![text("1"), text("2"), text("3")], "Off, air, land"),
+            row(vec![text("Right click")], "Steady aim on land"),
+        ]),
+        ("MENUS", vec![
+            row(vec![n(k.a), n(k.b)], "A, B"),
+            row(vec![n(k.x), n(k.y)], "X, Y"),
+            row(vec![n(k.start), n(k.select)], "Start, Select"),
+            row(vec![n(k.up)], "D-pad up"),
+            row(vec![text("Esc")], "Emulator menu"),
+        ]),
+    ]
+}
+
+/// Kid Icarus' colours: gold trim on a night sky, with sky blue headings.
+const GOLD: Color32 = Color32::from_rgb(226, 188, 98);
+const GOLD_DIM: Color32 = Color32::from_rgb(140, 112, 56);
+const NIGHT: Color32 = Color32::from_rgba_premultiplied(9, 20, 48, 232);
+const NIGHT_LIGHT: Color32 = Color32::from_rgba_premultiplied(26, 52, 104, 120);
+const SKY: Color32 = Color32::from_rgb(150, 206, 255);
+const CAP: Color32 = Color32::from_rgb(246, 238, 214);
+const CAP_TEXT: Color32 = Color32::from_rgb(28, 38, 70);
+const TEXT: Color32 = Color32::from_rgb(236, 240, 250);
+
+/// lays the controls panel out at a scale, its sections in columns, painting
+/// it at `at` when given, and says how big it is.
+fn controls_panel(
+    painter: &egui::Painter,
+    columns: &[&[(&str, Vec<ControlRow>)]],
+    scale: f32,
+    at: Option<egui::Pos2>,
+    active: &str,
+) -> Vec2 {
+    use egui::{pos2, vec2, FontId, Rect, Shape, Stroke, StrokeKind};
+    let unit = |v: f32| v * scale;
+    let (pad, cap_h, cap_pad, gap, row_gap, section_gap, column_gap) =
+        (unit(14.0), unit(19.0), unit(6.0), unit(4.0), unit(5.0), unit(9.0), unit(18.0));
+    let layout = |text: &str, size: f32, color| painter.layout_no_wrap(text.to_owned(), FontId::proportional(unit(size)), color);
+    let title = layout("CONTROLS", 15.0, GOLD);
+    let heading_h = layout("MOVE", 10.0, SKY).size().y;
+    let row_width = |row: &ControlRow| {
+        let caps: f32 = row.keys.iter().map(|key| layout(key, 11.0, CAP_TEXT).size().x + 2.0 * cap_pad + gap).sum();
+        caps + unit(6.0) + layout(row.does, 12.0, TEXT).size().x
+    };
+    let column_size = |sections: &[(&str, Vec<ControlRow>)]| {
+        let width = sections.iter().flat_map(|(_, rows)| rows).map(row_width).fold(0.0, f32::max);
+        let rows = sections.iter().map(|(_, rows)| rows.len()).sum::<usize>() as f32;
+        let height = sections.len() as f32 * (heading_h + unit(3.0))
+            + rows * (cap_h + row_gap)
+            + (sections.len() as f32 - 1.0).max(0.0) * section_gap;
+        vec2(width, height)
+    };
+    let sizes: Vec<Vec2> = columns.iter().map(|column| column_size(column)).collect();
+    let body = vec2(
+        sizes.iter().map(|size| size.x).sum::<f32>() + column_gap * (sizes.len() as f32 - 1.0),
+        sizes.iter().map(|size| size.y).fold(0.0, f32::max),
+    );
+    let inner_width = body.x.max(title.size().x + unit(60.0));
+    let width = inner_width + 2.0 * pad;
+    let height = pad * 2.0 + title.size().y + unit(12.0) + body.y;
+    let Some(at) = at else { return vec2(width, height) };
+
+    let panel = Rect::from_min_size(at, vec2(width, height));
+    let corner = unit(10.0);
+    painter.rect_filled(panel, corner, NIGHT);
+    // a glow toward the top, as the game's skies have
+    painter.rect_filled(Rect::from_min_max(panel.min, pos2(panel.max.x, panel.min.y + height * 0.35)), corner, NIGHT_LIGHT);
+    painter.rect_stroke(panel, corner, Stroke::new(unit(1.6), GOLD), StrokeKind::Inside);
+    painter.rect_stroke(panel.shrink(unit(4.0)), unit(7.0), Stroke::new(unit(0.6), GOLD_DIM), StrokeKind::Inside);
+
+    let middle = panel.center().x;
+    let mut y = panel.min.y + pad;
+    painter.galley(pos2(middle - title.size().x / 2.0, y), title.clone(), GOLD);
+    y += title.size().y + unit(5.0);
+    // a gold rule with a diamond in the middle under the title
+    let half = inner_width / 2.0;
+    painter.line_segment([pos2(middle - half, y), pos2(middle - unit(7.0), y)], Stroke::new(unit(1.0), GOLD_DIM));
+    painter.line_segment([pos2(middle + unit(7.0), y), pos2(middle + half, y)], Stroke::new(unit(1.0), GOLD_DIM));
+    let d = unit(4.0);
+    painter.add(Shape::convex_polygon(
+        vec![pos2(middle, y - d), pos2(middle + d, y), pos2(middle, y + d), pos2(middle - d, y)],
+        GOLD,
+        Stroke::NONE,
+    ));
+    let top = y + unit(7.0);
+
+    let mut left = panel.min.x + pad + (inner_width - body.x) / 2.0;
+    for (column, size) in columns.iter().zip(&sizes) {
+        let mut y = top;
+        for (index, (name, rows)) in column.iter().enumerate() {
+            if index > 0 {
+                y += section_gap;
+            }
+            let heading = layout(name, 10.0, SKY);
+            let heading_size = heading.size();
+            painter.galley(pos2(left, y), heading, SKY);
+            y += heading_size.y + unit(3.0);
+            for row in rows {
+                let mut x = left;
+                for key in &row.keys {
+                    let label = layout(key, 11.0, CAP_TEXT);
+                    let cap = Rect::from_min_size(pos2(x, y), vec2(label.size().x + 2.0 * cap_pad, cap_h));
+                    // a key cap: a shadow under it, then cream with a gold edge,
+                    // gold all over for the aim in use
+                    let lit = name == &"AIM" && key == active;
+                    painter.rect_filled(cap.translate(vec2(0.0, unit(1.5))), unit(4.0), GOLD_DIM);
+                    painter.rect_filled(cap, unit(4.0), if lit { GOLD } else { CAP });
+                    painter.rect_stroke(cap, unit(4.0), Stroke::new(unit(if lit { 2.0 } else { 1.0 }), if lit { TEXT } else { GOLD }), StrokeKind::Inside);
+                    painter.galley(cap.center() - label.size() / 2.0, label, CAP_TEXT);
+                    x = cap.max.x + gap;
+                }
+                let does = layout(row.does, 12.0, TEXT);
+                painter.galley(pos2(x + unit(6.0), y + (cap_h - does.size().y) / 2.0), does, TEXT);
+                y += cap_h + row_gap;
+            }
+        }
+        left += size.x + column_gap;
+    }
+    vec2(width, height)
+}
+
+/// the sections split, in order, into this many columns of about as many rows.
+fn split_columns<'a>(sections: &'a [(&'a str, Vec<ControlRow>)], count: usize) -> Vec<&'a [(&'a str, Vec<ControlRow>)]> {
+    let weight = |(_, rows): &(&str, Vec<ControlRow>)| rows.len() + 1;
+    let total: usize = sections.iter().map(weight).sum();
+    let mut columns = Vec::new();
+    let (mut start, mut taken) = (0, 0);
+    for (index, section) in sections.iter().enumerate() {
+        taken += weight(section);
+        let target = total * (columns.len() + 1) / count;
+        if taken >= target && columns.len() + 1 < count && index + 1 < sections.len() {
+            columns.push(&sections[start..=index]);
+            start = index + 1;
+        }
+    }
+    columns.push(&sections[start..]);
+    columns
+}
+
+/// draws the controls panel where it shows biggest, in whichever free
+/// rectangle, in points, and however many columns suit it, up to its full
+/// size, and nowhere when it would be too small to read. it only paints, so
+/// clicks go through to the screens.
+pub fn controls_hint(ctx: &egui::Context, free: &[egui::Rect], keys: &Keys, active: &str) {
+    const SMALLEST: f32 = 0.6;
+    const MARGIN: f32 = 8.0;
+    let sections = controls_sections(keys);
+    let painter = ctx.layer_painter(egui::LayerId::background());
+    let layouts: Vec<_> = (1..=3).map(|count| split_columns(&sections, count)).collect();
+    let best = free
+        .iter()
+        .flat_map(|rect| layouts.iter().map(move |columns| (rect, columns)))
+        .map(|(rect, columns)| {
+            let full = controls_panel(&painter, columns, 1.0, None, active);
+            let scale = ((rect.width() - MARGIN) / full.x).min((rect.height() - MARGIN) / full.y).min(1.0);
+            (rect, columns, scale)
+        })
+        .max_by(|a, b| a.2.total_cmp(&b.2));
+    let Some((rect, columns, scale)) = best else { return };
+    if scale < SMALLEST {
+        return;
+    }
+    let size = controls_panel(&painter, columns, scale, None, active);
+    controls_panel(&painter, columns, scale, Some(rect.center() - size / 2.0), active);
+}
+
+#[cfg(test)]
+mod controls_tests {
+    use super::*;
+
+    #[test]
+    fn controls_split_into_columns_in_order_without_losing_any() {
+        let sections = controls_sections(&Keys::default());
+        for count in 1..=3 {
+            let columns = split_columns(&sections, count);
+            assert_eq!(columns.len(), count);
+            let names: Vec<_> = columns.iter().flat_map(|column| column.iter().map(|(name, _)| *name)).collect();
+            assert_eq!(names, ["MOVE", "ATTACK", "POWERS", "AIM", "MENUS"]);
+        }
+    }
+}
+
 pub fn key_name(key: KeyCode) -> String {
     let name = format!("{key:?}");
     for prefix in ["Key", "Digit", "Arrow"] {

@@ -575,6 +575,7 @@ fn process_vertices<'a>(
     inputs: &[[Vec4; shader::INPUT_REGISTERS]],
     order: Option<&'a [usize]>,
 ) -> (Vec<Vertex>, Option<&'a [usize]>) {
+    let _timer = crate::stats::time(&crate::stats::SHADING);
     if log::log_enabled!(log::Level::Trace) {
         if let Some(input) = inputs.first() {
             let used_uniforms = vertex_shader.float_uniforms.iter().filter(|u| **u != shader::ZERO).count();
@@ -757,8 +758,13 @@ fn geometry_stage(
     vertex_outputs: impl Iterator<Item = [Vec4; 16]>,
 ) -> Vec<Vertex> {
     let mode = registers[REG_GS_CONFIG] & 0xFF;
+    if mode == 2 {
+        return fixed_primitives(registers, unit, map, vertex_outputs);
+    }
     if mode != 0 {
-        log::warn!("geometry shader mode {mode} is not implemented");
+        // once, a warning a draw costs a frame its time
+        static WARNED: std::sync::Once = std::sync::Once::new();
+        WARNED.call_once(|| log::warn!("geometry shader mode {mode} is not implemented"));
         return Vec::new();
     }
     let per_vertex = ((registers[REG_VS_OUTPUT_TOTAL] & 0xF) + 1) as usize;
@@ -812,6 +818,47 @@ fn geometry_stage(
         }
     }
     vertices
+}
+
+/// the geometry shader's fixed primitive mode: each primitive's vertices,
+/// a fixed number of them in draw order, go into its float uniforms from a
+/// start index on, the vertex shader's outputs one after another, and the
+/// program runs once for each primitive with no inputs of its own.
+fn fixed_primitives(
+    registers: &[u32],
+    unit: &ShaderUnit,
+    map: &OutputMap,
+    vertex_outputs: impl Iterator<Item = [Vec4; 16]>,
+) -> Vec<Vertex> {
+    let config = registers[REG_GS_CONFIG];
+    let per_vertex = ((registers[REG_VS_OUTPUT_TOTAL] & 0xF) + 1) as usize;
+    let fixed = (((config >> 8) & 0xF) + 1) as usize;
+    let start = ((config >> 16) & 0xFF) as usize;
+    let per_primitive = per_vertex * fixed;
+    if start + per_primitive > shader::FLOAT_UNIFORMS {
+        return Vec::new();
+    }
+    let attributes: Vec<Vec4> = vertex_outputs.flat_map(|outputs| outputs.into_iter().take(per_vertex)).collect();
+    let primitives: Vec<&[Vec4]> = attributes.chunks_exact(per_primitive).collect();
+    // ponytail: one run a primitive, as the uniforms differ for each; uniforms
+    // a lane in the batched runner would take eight at once if this shows
+    let run = |chunk: &[&[Vec4]]| {
+        let mut patched = unit.clone();
+        chunk
+            .iter()
+            .flat_map(|primitive| {
+                patched.float_uniforms[start..start + per_primitive].copy_from_slice(primitive);
+                shader::run_geometry_many(&patched, &[[shader::ZERO; shader::INPUT_REGISTERS]]).into_iter().flatten()
+            })
+            .collect::<Vec<_>>()
+    };
+    let triangles: Vec<_> = if primitives.len() < PARALLEL_VERTICES / 4 {
+        run(&primitives)
+    } else {
+        primitives.par_chunks(PARALLEL_CHUNK).flat_map_iter(run).collect()
+    };
+    let plan = VertexPlan::new(map, registers[REG_GS_BLOCK + SHADER_OUTPUT_MASK]);
+    triangles.iter().flatten().map(|outputs| plan.vertex(outputs)).collect()
 }
 
 /// screen-space vertex, with every varying pre-divided by w so the
@@ -1151,6 +1198,7 @@ impl TextureCache {
     }
 
     fn decoded(&mut self, key: TextureKey, data: &[u8]) -> Found {
+        let _timer = crate::stats::time(&crate::stats::TEXTURES);
         let (_, format, width, height) = key;
         let hash = fingerprint(data);
         let checked = (self.list, self.written.len());
@@ -2157,6 +2205,8 @@ pub fn draw<M: GpuMemory>(
     resources: &mut Resources,
     indexed: bool,
 ) -> u32 {
+    let _timer = crate::stats::time(&crate::stats::DRAWING);
+    crate::stats::DRAWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let vertex_count = registers[REG_VERTEX_COUNT];
     let first_vertex = registers[REG_VERTEX_OFFSET];
     if vertex_count == 0 || vertex_count > 0x1_0000 {

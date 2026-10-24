@@ -14,23 +14,25 @@ mod present;
 mod recompile;
 mod report;
 mod settings;
+mod warm;
 mod zig;
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use winit::application::ApplicationHandler;
-use winit::event::{ElementState, KeyEvent, MouseButton, WindowEvent};
+use winit::event::{DeviceEvent, DeviceId, ElementState, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{KeyCode, PhysicalKey};
-use winit::window::{Fullscreen, Window, WindowId};
+use winit::window::{CursorGrabMode, Fullscreen, Window, WindowId};
 
 use zakuro_common::Screen;
+use zakuro_core::services::hid::PadState;
 use zakuro_core::{loader, Config, FrameOutcome, System};
-use zakuro_gpu::{layout, GpuScreen, Overlay, PresentError, RendererKind, ScreenImage};
+use zakuro_gpu::{layout, GpuScreen, Overlay, PresentError, RendererKind, ScreenImage, Viewport};
 
 use gui::Gui;
-use input::Keyboard;
+use input::{AimMode, Keyboard};
 use library::Library;
 use menus::{Action, Menus};
 use present::Backend;
@@ -51,6 +53,8 @@ pub fn run(linked: Option<Linked>) {
             std::process::exit(2);
         }
     };
+    // the code and the game into memory before play reaches them
+    warm::start(options.rom.as_deref());
     let mut settings = Settings::load();
     // the console's own number, made the first time and kept, which tells
     // it apart from others over local wireless
@@ -94,6 +98,7 @@ pub fn run(linked: Option<Linked>) {
         tilting_from: None,
         cursor: (0.0, 0.0),
         last_title_update: Instant::now(),
+        last_emulated: None,
         next_frame: Instant::now(),
         skipped: 0,
         shown: 0,
@@ -369,6 +374,8 @@ struct App {
     tilting_from: Option<(f32, f32)>,
     cursor: (f32, f32),
     last_title_update: Instant,
+    /// when the last frame was emulated, to tell hitches from the frames' spacing.
+    last_emulated: Option<Instant>,
     /// when the next frame is due. frames run to a schedule rather than one
     /// after another, so that a slow one is made up by those after it and
     /// the sound, made as the console runs, keeps up.
@@ -450,6 +457,25 @@ const CATCH_UP_LIMIT: Duration = Duration::from_millis(200);
 /// frames that may go unshown in a row while catching up.
 const MAX_SKIPPED: u32 = 4;
 
+/// the window's rectangles no screen covers, beside, above and below each
+/// screen as far as the next screen or the window's edge, in window pixels, as
+/// [x0, y0, x1, y1].
+fn free_regions(width: f32, height: f32, screens: &[Viewport]) -> Vec<[f32; 4]> {
+    let mut free = Vec::new();
+    for s in screens {
+        let (x0, y0, x1, y1) = (s.x, s.y, s.x + s.width, s.y + s.height);
+        let in_rows = |o: &&Viewport| o.y < y1 && o.y + o.height > y0;
+        let in_columns = |o: &&Viewport| o.x < x1 && o.x + o.width > x0;
+        let left = screens.iter().filter(in_rows).map(|o| o.x + o.width).filter(|&e| e <= x0).fold(0.0, f32::max);
+        let right = screens.iter().filter(in_rows).map(|o| o.x).filter(|&e| e >= x1).fold(width, f32::min);
+        let above = screens.iter().filter(in_columns).map(|o| o.y + o.height).filter(|&e| e <= y0).fold(0.0, f32::max);
+        let below = screens.iter().filter(in_columns).map(|o| o.y).filter(|&e| e >= y1).fold(height, f32::min);
+        free.extend([[left, y0, x0, y1], [x1, y0, right, y1], [x0, above, x1, y0], [x0, y1, x1, below]]);
+    }
+    free.retain(|[x0, y0, x1, y1]| x1 - x0 >= 1.0 && y1 - y0 >= 1.0);
+    free
+}
+
 /// whether a frame goes unshown, the game running behind the schedule with
 /// a presenter that waits for the display, and fewer than MAX_SKIPPED
 /// unshown before it.
@@ -520,6 +546,7 @@ impl ApplicationHandler for App {
             // keys let go while another window has the keyboard never come
             WindowEvent::Focused(false) => {
                 self.fast_forward_key = false;
+                self.set_mouse_aim(None);
                 self.keyboard.release();
             }
             WindowEvent::Resized(size) => {
@@ -529,15 +556,31 @@ impl ApplicationHandler for App {
             }
             WindowEvent::KeyboardInput { event, .. } => self.key(event, consumed),
             WindowEvent::MouseInput { state, button, .. } => {
-                if button == MouseButton::Left {
+                if button == MouseButton::Left && self.keyboard.aiming() {
+                    self.keyboard.fire(state == ElementState::Pressed);
+                } else if button == MouseButton::Left {
                     self.mouse_down = state == ElementState::Pressed && !self.pointer_taken(consumed);
                     self.touch();
                 }
-                if button == MouseButton::Right {
+                // while aiming the middle button uses the power, as the D-pad's down does
+                if button == MouseButton::Middle {
+                    self.keyboard.mouse_button(PadState::DOWN, state == ElementState::Pressed);
+                }
+                if button == MouseButton::Right && self.keyboard.aiming() {
+                    self.keyboard.precise(state == ElementState::Pressed);
+                } else if button == MouseButton::Right {
                     let pressed = state == ElementState::Pressed && !self.pointer_taken(consumed);
                     self.tilting_from = pressed.then_some(self.cursor);
                     self.tilt();
                 }
+            }
+            // while aiming the wheel steps through powers, the D-pad's left and right
+            WindowEvent::MouseWheel { delta, .. } => {
+                let up = match delta {
+                    MouseScrollDelta::LineDelta(_, y) => y > 0.0,
+                    MouseScrollDelta::PixelDelta(position) => position.y > 0.0,
+                };
+                self.keyboard.wheel(if up { PadState::LEFT } else { PadState::RIGHT });
             }
             WindowEvent::CursorMoved { position, .. } => {
                 self.cursor = (position.x as f32, position.y as f32);
@@ -546,6 +589,17 @@ impl ApplicationHandler for App {
             }
             WindowEvent::RedrawRequested => self.step(event_loop),
             _ => {}
+        }
+    }
+
+    fn device_event(&mut self, _event_loop: &ActiveEventLoop, _device: DeviceId, event: DeviceEvent) {
+        // raw movement, which keeps coming with the pointer locked in place
+        if let DeviceEvent::MouseMotion { delta } = event {
+            let speed = match self.keyboard.aim_mode() {
+                Some(AimMode::Air) => self.settings.air_aim_speed,
+                _ => self.settings.land_aim_speed,
+            };
+            self.keyboard.aim_by(delta.0 as f32 * speed, delta.1 as f32 * speed);
         }
     }
 
@@ -720,6 +774,7 @@ impl App {
             match code {
                 KeyCode::Escape if self.game.is_some() => {
                     self.menus.menu_open = !self.menus.menu_open;
+                    self.set_mouse_aim(None);
                     self.keyboard.release();
                     return;
                 }
@@ -738,6 +793,23 @@ impl App {
                     self.apply_layout();
                 }
                 KeyCode::F11 => self.toggle_fullscreen(),
+                // mouse aim: 1 off, for menus, 2 for flying, 3 on foot
+                KeyCode::Digit1 | KeyCode::Digit2 | KeyCode::Digit3
+                    if self.game.is_some() && !self.menus.menu_open && !self.settings.keys.binds(code) =>
+                {
+                    let mode = match code {
+                        KeyCode::Digit2 => Some(AimMode::Air),
+                        KeyCode::Digit3 => Some(AimMode::Land),
+                        _ => None,
+                    };
+                    self.set_mouse_aim(mode);
+                    let said = match mode {
+                        Some(AimMode::Air) => "Mouse aim: flying",
+                        Some(AimMode::Land) => "Mouse aim: on foot",
+                        None => "Mouse aim off",
+                    };
+                    self.menus.toast = Some((said.to_owned(), Instant::now()));
+                }
                 KeyCode::F5 if self.game.is_some() => self.save_state(),
                 KeyCode::F8 if self.game.is_some() => self.load_state(),
                 _ => {}
@@ -773,6 +845,21 @@ impl App {
     /// whether the pointer is busy with something other than the game.
     fn pointer_taken(&self, consumed: bool) -> bool {
         consumed || self.game.is_none() || self.menus.menu_open || self.gui.as_ref().is_some_and(Gui::wants_pointer)
+    }
+
+    /// mouse aim: the mouse drags the stylus with the pointer hidden and held
+    /// in the window, the left button fires.
+    fn set_mouse_aim(&mut self, mode: Option<AimMode>) {
+        let on = mode.is_some();
+        self.keyboard.set_aim(mode);
+        if let Some(window) = &self.window {
+            let grab = if on { CursorGrabMode::Locked } else { CursorGrabMode::None };
+            // Windows has no locked mode, confined does there
+            if window.set_cursor_grab(grab).is_err() && on {
+                let _ = window.set_cursor_grab(CursorGrabMode::Confined);
+            }
+            window.set_cursor_visible(!on);
+        }
     }
 
     /// touches the bottom screen while the button is down over it.
@@ -1190,9 +1277,13 @@ impl App {
             let start = Instant::now();
             self.emulate();
             self.spent.emulating.add(start.elapsed());
-        } else if let Some(audio) = &self.audio {
-            // the sound stops with the game, which is not falling behind
-            audio.hold();
+        } else {
+            // a pause is no hitch, the next frame's spacing starts afresh
+            self.last_emulated = None;
+            if let Some(audio) = &self.audio {
+                // the sound stops with the game, which is not falling behind
+                audio.hold();
+            }
         }
 
         self.next_frame += FRAME_TIME;
@@ -1259,12 +1350,46 @@ impl App {
             Some(replay) => replay.input(game.frame),
             None => self.gamepads.apply(self.keyboard.state()),
         };
+        self.keyboard.frame_done();
         game.frame += 1;
         if let Some(recorder) = &mut game.recorder {
             recorder.record(input);
         }
         game.system.set_input(input);
+        let interpreted = |system: &System| system.interpreted_instructions + system.recompiled.as_ref().map_or(0, |library| library.fallbacks());
+        let before = interpreted(&game.system);
+        let faults = warm::page_faults();
+        let started = Instant::now();
         let outcome = game.system.run_frame();
+        // a frame far over its 16.7 ms is a hitch the player feels; the log
+        // around it says what the game was doing
+        let took = started.elapsed();
+        let gpu = zakuro_gpu::stats::take();
+        // and the whole time since the last frame, showing it included, which
+        // catches a stall outside the emulation too; a pause or the menu is no hitch
+        let since = self.last_emulated.replace(started).map(|last| started - last).unwrap_or_default();
+        let menu = self.paused || self.menus.menu_open;
+        if !menu && (took.as_millis() >= 50 || since.as_millis() >= 100) {
+            log::warn!(
+                "hitch: frame {} took {:.0} ms, {:.0} ms since the last, {} instructions interpreted,                  {} draws in {:.0} ms: vertices {:.0} ms, textures {:.0} ms, waiting for the GPU {:.0} ms;                  recompiled code {:.0} ms, services {:.0} ms, frame end {:.0} ms, sound {:.0} ms,                  {} syncs with the GPU in {:.0} ms, {} pages brought in",
+                game.frame,
+                took.as_secs_f64() * 1000.0,
+                since.as_secs_f64() * 1000.0,
+                interpreted(&game.system) - before,
+                gpu.draws,
+                gpu.drawing,
+                gpu.shading,
+                gpu.textures,
+                gpu.waiting,
+                gpu.recompiled,
+                gpu.services,
+                gpu.frame_end,
+                gpu.audio,
+                gpu.syncs,
+                gpu.sync,
+                warm::page_faults() - faults
+            );
+        }
         game.count_frame();
         let sound = game.system.take_audio();
         // fast forward plays no sound, there is too much of it too soon
@@ -1501,9 +1626,45 @@ impl App {
         let cheats = self.game.as_ref().filter(|_| self.menus.cheats_open).map(|game| {
             game.system.cheats.iter().map(|cheat| (cheat.name.clone(), cheat.enabled, cheat.notes.join("\n"), cheat.builtin)).collect::<Vec<_>>()
         });
+        // where the controls can go, the window's pixels no screen covers, while
+        // a game runs without the 3D, which places the screens otherwise
+        let free = (self.game.is_some() && self.settings.show_controls && self.settings.stereo == settings::Stereo3d::Off)
+            .then(|| {
+                let size = window.inner_size();
+                let (top, bottom) =
+                    layout(size.width, size.height, self.layout.screens(), self.top_shape.width(), self.settings.integer_scale);
+                free_regions(size.width as f32, size.height as f32, &[top, bottom].into_iter().flatten().collect::<Vec<_>>())
+            })
+            .unwrap_or_default();
+        let aim = match self.keyboard.aim_mode() {
+            Some(AimMode::Air) => "2",
+            Some(AimMode::Land) => "3",
+            None => "1",
+        };
+        let warming = self.game.as_ref().and(warm::progress());
         let (menus, library, settings, jobs) = (&mut self.menus, &self.library, &mut self.settings, &self.jobs);
         let mut actions = Vec::new();
         let overlay = gui.frame(window, |ui| {
+            // the code still coming in from disk, which can hitch until it is
+            if let Some(percent) = warming {
+                egui::Area::new(egui::Id::new("warming"))
+                    .anchor(egui::Align2::LEFT_BOTTOM, egui::vec2(8.0, -8.0))
+                    .interactable(false)
+                    .show(ui.ctx(), |ui| {
+                        egui::Frame::popup(ui.style()).show(ui, |ui| {
+                            ui.label(egui::RichText::new(format!("Loading the game into memory, {percent}%")).small());
+                        });
+                    });
+                ui.ctx().request_repaint();
+            }
+            if !free.is_empty() && !menus.menu_open {
+                let points = ui.ctx().pixels_per_point();
+                let rects: Vec<_> = free
+                    .iter()
+                    .map(|[x0, y0, x1, y1]| egui::Rect::from_min_max(egui::pos2(x0 / points, y0 / points), egui::pos2(x1 / points, y1 / points)))
+                    .collect();
+                menus::controls_hint(ui.ctx(), &rects, &settings.keys, aim);
+            }
             match &game {
                 Some((name, fps, recompiled)) => {
                     actions.extend(menus.game(ui, name, show_fps.then_some(*fps), *recompiled, fast, jobs, saved.as_deref()))
@@ -1633,6 +1794,26 @@ const _: RendererKind = RendererKind::Software;
 
 #[cfg(test)]
 mod tests {
+    use zakuro_gpu::Viewport;
+
+    fn viewport(x: f32, y: f32, width: f32, height: f32) -> Viewport {
+        Viewport { x, y, width, height }
+    }
+
+    #[test]
+    fn free_regions_are_the_margins_and_gaps_beside_the_screens() {
+        // stacked in a wide window: margins left and right, wider beside the
+        // narrower bottom screen
+        let free = super::free_regions(1000.0, 960.0, &[viewport(100.0, 0.0, 800.0, 480.0), viewport(180.0, 480.0, 640.0, 480.0)]);
+        assert!(free.contains(&[0.0, 0.0, 100.0, 480.0]));
+        assert!(free.contains(&[0.0, 480.0, 180.0, 960.0]));
+        assert!(free.contains(&[820.0, 480.0, 1000.0, 960.0]));
+        // large top: the block above the small bottom screen, beside the top
+        let free = super::free_regions(1120.0, 480.0, &[viewport(0.0, 0.0, 800.0, 480.0), viewport(800.0, 240.0, 320.0, 240.0)]);
+        assert!(free.contains(&[800.0, 0.0, 1120.0, 240.0]));
+        assert!(!free.iter().any(|[x0, _, _, _]| *x0 < 800.0), "nothing over the top screen");
+    }
+
     use super::*;
 
     /// a frame goes unshown only while the game runs behind with a

@@ -201,7 +201,7 @@ pub enum LogicOp {
 }
 
 impl LogicOp {
-    const ALL: [LogicOp; 16] = [
+    pub(crate) const ALL: [LogicOp; 16] = [
         LogicOp::Clear,
         LogicOp::And,
         LogicOp::AndReverse,

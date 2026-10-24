@@ -155,6 +155,13 @@ pub fn load(path: impl AsRef<std::path::Path>, mut config: Config) -> Result<Sys
                 Ok(library) => {
                     log::info!("running the recompiled code linked in, {}", library.describe());
                     system.recompiled = Some(library);
+                    // where it still interprets goes where 3dsrecomp build
+                    // would put the library, which 3dsrecomp port takes in too
+                    if let Some(dir) = recomp_abi::library_dir() {
+                        let _ = std::fs::create_dir_all(&dir);
+                        let path = dir.join(recomp_abi::library_name(title.program_id()));
+                        system.hints = Some(crate::hints::Hints::new(&path, exheader_text(&title)));
+                    }
                 }
                 Err(error) => log::warn!("could not use the code linked in, {error}, interpreting everything"),
             }

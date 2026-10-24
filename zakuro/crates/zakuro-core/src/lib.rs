@@ -462,7 +462,26 @@ impl System {
             self.sample();
         }
 
-        let exit = match self.run_recompiled(deadline) {
+        let recompiled = {
+            let _timer = zakuro_gpu::stats::time(&zakuro_gpu::stats::RECOMPILED);
+            let started = std::time::Instant::now();
+            let (instructions, cycles) = (self.recompiled_instructions, self.cpu.cycles);
+            let ran = self.run_recompiled(deadline);
+            // one call that long is a frame the player feels, and where
+            let took = started.elapsed().as_secs_f64() * 1000.0;
+            if took >= 20.0 {
+                let thread = self.kernel.current().map_or_else(String::new, |t| format!("{} (priority {}, core {})", t.name, t.priority, t.processor_id));
+                let (instructions, cycles) = (self.recompiled_instructions - instructions, self.cpu.cycles - cycles);
+                log::warn!(
+                    target: "zakuro_core::slow",
+                    "recompiled code from {pc:08X} ran {took:.0} ms, to {:08X}, on {thread}, {instructions} instructions, {cycles} cycles, {:.0} MIPS",
+                    self.cpu.regs[15],
+                    instructions as f64 / took / 1000.0
+                );
+            }
+            ran
+        };
+        let exit = match recompiled {
             Some(exit) => {
                 // its writes do not go through the log a watch keeps
                 self.idle_interrupted(false);
@@ -501,7 +520,10 @@ impl System {
         }
         match exit {
             None => {}
-            Some(Exit::Supervisor(number)) => kernel::svc::dispatch(self, number),
+            Some(Exit::Supervisor(number)) => {
+                let _timer = zakuro_gpu::stats::time(&zakuro_gpu::stats::SERVICES);
+                kernel::svc::dispatch(self, number)
+            }
             Some(Exit::Undefined { pc, opcode }) => {
                 let count = self.undefined_seen.entry(pc).or_insert(0);
                 *count += 1;
@@ -694,6 +716,7 @@ impl System {
 
     /// everything that happens between frames, vertical blank, input, clock.
     fn end_frame(&mut self) {
+        let _timer = zakuro_gpu::stats::time(&zakuro_gpu::stats::FRAME_END);
         self.idle_interrupted(false);
         self.frames += 1;
         if self.frames.is_multiple_of(hints::SAVE_EVERY) {
@@ -786,6 +809,7 @@ impl System {
     /// the DSP finishing an audio frame, it plays its voices one frame on and
     /// interrupts the title, whose sound library does one update per interrupt.
     fn audio_frame(&mut self) {
+        let _timer = zakuro_gpu::stats::time(&zakuro_gpu::stats::AUDIO);
         self.idle_interrupted(false);
         // the whole opening froze until this ran every 4.9 ms. goddamn audio timing
         if self.services.dsp.running {
@@ -1229,6 +1253,8 @@ unsafe fn sync_for_cpu(gpu: *mut (), linear_base: u32, memory: &mut Memory, addr
         "the CPU reads 0x{addr:08X}..0x{:08X}, which the GPU drew, written back first",
         addr.wrapping_add(len)
     );
+    let _timer = zakuro_gpu::stats::time(&zakuro_gpu::stats::SYNC);
+    zakuro_gpu::stats::SYNCS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let gpu = unsafe { &mut *(gpu as *mut Gpu) };
     gpu.sync_depth(&mut GuestMemory { memory, linear_base }, addr, len);
 }
@@ -1245,6 +1271,8 @@ unsafe fn sync_for_cpu_write(gpu: *mut (), linear_base: u32, memory: &mut Memory
         "the CPU writes 0x{addr:08X}..0x{:08X}, which the GPU drew, written back first",
         addr.wrapping_add(len)
     );
+    let _timer = zakuro_gpu::stats::time(&zakuro_gpu::stats::SYNC);
+    zakuro_gpu::stats::SYNCS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let gpu = unsafe { &mut *(gpu as *mut Gpu) };
     gpu.sync_memory(&mut GuestMemory { memory, linear_base }, addr, len);
 }

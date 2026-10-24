@@ -294,29 +294,32 @@ pub struct Keys {
 
 impl Default for Keys {
     fn default() -> Self {
+        // laid out for Kid Icarus Uprising, whose port this is: the left hand
+        // on WASD with the powers and the camera around it, the right on the
+        // mouse, which fires and aims; 1, 2 and 3 pick how the mouse aims
         Keys {
-            a: KeyCode::KeyX,
-            b: KeyCode::KeyZ,
-            x: KeyCode::KeyS,
-            y: KeyCode::KeyA,
-            l: KeyCode::KeyQ,
-            r: KeyCode::KeyW,
-            start: KeyCode::Enter,
-            select: KeyCode::Backspace,
-            up: KeyCode::ArrowUp,
-            down: KeyCode::ArrowDown,
-            left: KeyCode::ArrowLeft,
-            right: KeyCode::ArrowRight,
-            circle_up: KeyCode::KeyI,
-            circle_down: KeyCode::KeyK,
-            circle_left: KeyCode::KeyJ,
-            circle_right: KeyCode::KeyL,
-            zl: KeyCode::Digit1,
-            zr: KeyCode::Digit2,
-            c_up: KeyCode::KeyT,
-            c_down: KeyCode::KeyG,
-            c_left: KeyCode::KeyF,
-            c_right: KeyCode::KeyH,
+            a: KeyCode::Enter,
+            b: KeyCode::Backspace,
+            x: KeyCode::KeyX,
+            y: KeyCode::KeyT,
+            l: KeyCode::Space,
+            r: KeyCode::KeyR,
+            start: KeyCode::KeyP,
+            select: KeyCode::KeyM,
+            up: KeyCode::KeyC,
+            down: KeyCode::KeyF,
+            left: KeyCode::KeyQ,
+            right: KeyCode::KeyE,
+            circle_up: KeyCode::KeyW,
+            circle_down: KeyCode::KeyS,
+            circle_left: KeyCode::KeyA,
+            circle_right: KeyCode::KeyD,
+            zl: KeyCode::KeyN,
+            zr: KeyCode::KeyB,
+            c_up: KeyCode::Numpad8,
+            c_down: KeyCode::Numpad2,
+            c_left: KeyCode::Numpad4,
+            c_right: KeyCode::Numpad6,
         }
     }
 }
@@ -486,6 +489,12 @@ pub struct Settings {
     pub volume: f32,
     pub mute: bool,
     pub show_fps: bool,
+    /// the keyboard controls, drawn where the window has no screen.
+    pub show_controls: bool,
+    /// bottom screen pixels mouse aim moves the stylus for a pixel of the
+    /// mouse's, flying and on foot.
+    pub air_aim_speed: f32,
+    pub land_aim_speed: f32,
     /// a picture behind the library.
     pub background: Option<PathBuf>,
     /// how much of it shows, 0 to 1.
@@ -531,6 +540,9 @@ impl Default for Settings {
             volume: 1.0,
             mute: false,
             show_fps: false,
+            show_controls: true,
+            air_aim_speed: 0.5,
+            land_aim_speed: 1.5,
             background: None,
             background_opacity: 0.35,
             keys: Keys::default(),

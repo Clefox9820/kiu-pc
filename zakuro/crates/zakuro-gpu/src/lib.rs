@@ -16,6 +16,7 @@ pub mod registers;
 pub mod renderer;
 pub mod shader;
 pub mod state;
+pub mod stats;
 pub mod tev;
 pub mod texture;
 
@@ -1570,6 +1571,58 @@ mod tests {
 
         let green = [0.0, 1.0, 0.0, 1.0];
         send_vertex(&mut gpu, &mut memory, &mut renderer, &[[0.0, 0.0, 0.0, 1.0], green]);
+        gpu.write_internal(&mut memory, &mut renderer, 0x245, 1, 0xF);
+
+        for pixel in memory.0[COLOR_BUFFER as usize..][..8 * 8 * 4].chunks(4) {
+            assert_eq!(ColorFormat::Rgba8.decode(pixel), [0, 255, 0, 255]);
+        }
+    }
+
+    /// in the fixed primitive mode a primitive's vertices reach the geometry
+    /// shader through its uniforms, three vertices of two attributes each from
+    /// c0 here, and it draws the triangle they make.
+    #[test]
+    fn a_fixed_primitive_geometry_shader_reads_its_vertices_from_uniforms() {
+        let mut memory = FlatMemory(vec![0; 0x2000]);
+        let mut renderer = SoftwareRenderer::default();
+        let mut gpu = gpu_for_immediate_draws(&mut memory, &mut renderer);
+
+        let mov = |dest: u32, source: u32| (0x13 << 26) | (dest << 21) | (source << 12);
+        let setemit = |slot: u32, primitive: bool| (0x2B << 26) | (slot << 24) | ((primitive as u32) << 23);
+        let emit = 0x2A << 26;
+        let program = [
+            setemit(0, false),
+            mov(0, 0x20), // o0 = c0, the first vertex's position
+            mov(1, 0x21), // o1 = c1, its color
+            emit,
+            setemit(1, false),
+            mov(0, 0x22),
+            mov(1, 0x23),
+            emit,
+            setemit(2, true),
+            mov(0, 0x24),
+            mov(1, 0x25),
+            emit,
+            0x22 << 26,
+        ];
+        gpu.geometry_shader.program[..program.len()].copy_from_slice(&program);
+        gpu.geometry_shader.descriptors[0] = 0xF | (0b00_01_10_11 << 5) | (0b00_01_10_11 << 14);
+
+        let mut write = |register: usize, value: u32| {
+            gpu.write_internal(&mut memory, &mut renderer, register, value, 0xF)
+        };
+        write(REG_GEOSTAGE_CONFIG, 2);
+        write(REG_VS_COM_MODE, 1);
+        write(REG_VS_OUTPUT_TOTAL, 1); // two attributes per vertex
+        write(REG_GS_CONFIG, 2 | (2 << 8)); // fixed primitives of three vertices, from c0
+        write(REG_GS_BLOCK + SHADER_INPUT_CONFIG, 1 | (1 << 8));
+        write(REG_PRIMITIVE_CONFIG, 3 << 8);
+        write(REG_FIXED_ATTRIBUTE_INDEX, 0xF);
+
+        let green = [0.0, 1.0, 0.0, 1.0];
+        for position in [[-1.0, -1.0, 0.0, 1.0], [3.0, -1.0, 0.0, 1.0], [-1.0, 3.0, 0.0, 1.0]] {
+            send_vertex(&mut gpu, &mut memory, &mut renderer, &[position, green]);
+        }
         gpu.write_internal(&mut memory, &mut renderer, 0x245, 1, 0xF);
 
         for pixel in memory.0[COLOR_BUFFER as usize..][..8 * 8 * 4].chunks(4) {
