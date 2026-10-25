@@ -522,7 +522,13 @@ impl System {
             None => {}
             Some(Exit::Supervisor(number)) => {
                 let _timer = zakuro_gpu::stats::time(&zakuro_gpu::stats::SERVICES);
-                kernel::svc::dispatch(self, number)
+                let started = std::time::Instant::now();
+                kernel::svc::dispatch(self, number);
+                // a service request names itself when slow, see services
+                let took = started.elapsed();
+                if number != 0x32 && took.as_millis() >= 20 {
+                    log::warn!("slow syscall 0x{number:02X} took {:.0} ms", took.as_secs_f64() * 1000.0);
+                }
             }
             Some(Exit::Undefined { pc, opcode }) => {
                 let count = self.undefined_seen.entry(pc).or_insert(0);

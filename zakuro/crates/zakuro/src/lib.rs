@@ -339,6 +339,34 @@ struct Running {
     flying: bool,
     /// when the game started, in seconds since 1970, for Discord.
     started: u64,
+    /// how evenly the frames came, for the log.
+    pacing: Pacing,
+}
+
+/// how many frames of a window came late, the small stutters a hitch line
+/// is too coarse for: one over 20 ms shows a frame twice, one over 33 ms
+/// shows it three times or more.
+#[derive(Debug, Default, PartialEq)]
+struct Pacing {
+    frames: u32,
+    late: u32,
+    very_late: u32,
+    worst: Duration,
+}
+
+impl Pacing {
+    /// frames counted before the log hears of them, 10 s at 60 a second.
+    const WINDOW: u32 = 600;
+
+    /// counts a frame that came the time given after the one before; the
+    /// window's counts, once it is full.
+    fn note(&mut self, since: Duration) -> Option<Pacing> {
+        self.frames += 1;
+        self.late += (since > Duration::from_millis(20)) as u32;
+        self.very_late += (since > Duration::from_millis(33)) as u32;
+        self.worst = self.worst.max(since);
+        (self.frames >= Self::WINDOW).then(|| std::mem::take(self))
+    }
 }
 
 impl Running {
@@ -356,6 +384,7 @@ impl Running {
             out_of_play: u32::MAX,
             flying: false,
             started: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |since| since.as_secs()),
+            pacing: Pacing::default(),
         }
     }
 
@@ -1518,6 +1547,18 @@ impl App {
         // catches a stall outside the emulation too; a pause or the menu is no hitch
         let since = self.last_emulated.replace(started).map(|last| started - last).unwrap_or_default();
         let menu = self.paused || self.menus.menu_open;
+        // fast forward runs frames as fast as it can, no pacing to speak of
+        if !menu && !self.fast_forwarding && !since.is_zero() {
+            if let Some(window) = game.pacing.note(since) {
+                log::info!(
+                    "pacing: {} frames, {} over 20 ms, {} over 33 ms, the worst {:.0} ms",
+                    window.frames,
+                    window.late,
+                    window.very_late,
+                    window.worst.as_secs_f64() * 1000.0
+                );
+            }
+        }
         if !menu && (took.as_millis() >= 50 || since.as_millis() >= 100) {
             log::warn!(
                 "hitch: frame {} took {:.0} ms, {:.0} ms since the last, {} instructions interpreted,                  {} draws in {:.0} ms: vertices {:.0} ms, textures {:.0} ms, waiting for the GPU {:.0} ms;                  recompiled code {:.0} ms, services {:.0} ms, frame end {:.0} ms, sound {:.0} ms,                  {} syncs with the GPU in {:.0} ms, {} pages brought in",
@@ -1946,6 +1987,26 @@ const _: RendererKind = RendererKind::Software;
 #[cfg(test)]
 mod tests {
     use zakuro_gpu::Viewport;
+
+    #[test]
+    fn pacing_counts_late_frames_once_a_window() {
+        use super::Pacing;
+        use std::time::Duration;
+        let mut pacing = Pacing::default();
+        let ms = Duration::from_millis;
+        for frame in 1..Pacing::WINDOW {
+            let since = match frame {
+                10 => ms(25),
+                20 => ms(40),
+                _ => ms(16),
+            };
+            assert_eq!(pacing.note(since), None, "frame {frame} is before the window is full");
+        }
+        let window = pacing.note(ms(21)).expect("the window is full");
+        assert_eq!(window, Pacing { frames: Pacing::WINDOW, late: 3, very_late: 1, worst: ms(40) });
+        // the next window starts from nothing
+        assert_eq!(pacing, Pacing::default());
+    }
 
     fn viewport(x: f32, y: f32, width: f32, height: f32) -> Viewport {
         Viewport { x, y, width, height }

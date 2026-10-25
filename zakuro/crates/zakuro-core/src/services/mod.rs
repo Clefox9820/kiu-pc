@@ -100,6 +100,7 @@ pub fn handle_request(system: &mut System, target: Target) {
         header.translate_params()
     );
 
+    let started = std::time::Instant::now();
     let handled = match name.as_str() {
         "srv:" | "srv:pm" => srv::handle(system, &buffer, header),
         "APT:U" | "APT:A" | "APT:S" => apt::handle(system, &buffer, header),
@@ -122,6 +123,12 @@ pub fn handle_request(system: &mut System, target: Target) {
         "dlp:SRVR" => dlp::handle(system, &buffer, header),
         _ => misc::handle(system, &buffer, header, &name),
     };
+    // a request this slow is a stall the player sees; which one it was says
+    // where to look
+    let took = started.elapsed();
+    if took >= SLOW_REQUEST {
+        log::warn!("slow request: {name} command 0x{command:04X} took {:.0} ms", took.as_secs_f64() * 1000.0);
+    }
 
     if !handled {
         if is_network_service(&name) {
@@ -131,6 +138,9 @@ pub fn handle_request(system: &mut System, target: Target) {
         }
     }
 }
+
+/// how long a request can take before the log names it, a frame's worth.
+const SLOW_REQUEST: std::time::Duration = std::time::Duration::from_millis(20);
 
 /// services whose entire job is talking to the internet or to another console.
 fn is_network_service(name: &str) -> bool {
