@@ -737,6 +737,12 @@ impl App {
         self.keyboard.release();
         self.paused = false;
         self.next_frame = Instant::now();
+        // ZAKURO_LOAD_SLOT=<1-9> goes straight on from that slot's state, for
+        // runs nobody has to steer to the same spot
+        if let Some(slot) = std::env::var("ZAKURO_LOAD_SLOT").ok().and_then(|slot| slot.parse().ok()).filter(|slot| (1..=9).contains(slot)) {
+            self.menus.slot = slot;
+            self.load_state();
+        }
         Ok(())
     }
 
