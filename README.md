@@ -83,9 +83,7 @@ When it finishes, start the game with `Play.bat`.
 ## Controls
 
 Defaults are laid out for this game. They can be changed in
-**Settings > Controls**, where the mouse aim speeds are also set. A controls
-panel is drawn in the free space of the window; it can be turned off in
-**Settings > Interface**.
+**Settings > Controls**, where the mouse aim speeds are also set.
 
 | Input | 3DS / action |
 | --- | --- |

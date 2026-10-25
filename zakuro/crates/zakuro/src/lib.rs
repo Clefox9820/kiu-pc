@@ -1628,7 +1628,7 @@ impl App {
         });
         // where the controls can go, the window's pixels no screen covers, while
         // a game runs without the 3D, which places the screens otherwise
-        let free = (self.game.is_some() && self.settings.show_controls && self.settings.stereo == settings::Stereo3d::Off)
+        let free = (menus::CONTROLS_HINT_ENABLED && self.game.is_some() && self.settings.show_controls &&self.settings.stereo == settings::Stereo3d::Off)
             .then(|| {
                 let size = window.inner_size();
                 let (top, bottom) =

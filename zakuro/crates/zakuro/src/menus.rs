@@ -772,7 +772,9 @@ impl Menus {
                 ui.separator();
                 ui.heading("Interface");
                 ui.checkbox(&mut settings.show_fps, "Show the frame rate");
-                ui.checkbox(&mut settings.show_controls, "Show the controls beside the screens");
+                if CONTROLS_HINT_ENABLED {
+                    ui.checkbox(&mut settings.show_controls, "Show the controls beside the screens");
+                }
                 ui.horizontal(|ui| {
                     ui.label("Library background");
                     match &settings.background {
@@ -1126,6 +1128,9 @@ fn split_columns<'a>(sections: &'a [(&'a str, Vec<ControlRow>)], count: usize) -
 /// rectangle, in points, and however many columns suit it, up to its full
 /// size, and nowhere when it would be too small to read. it only paints, so
 /// clicks go through to the screens.
+// ponytail: switched off for now, set true to bring the panel and its setting back.
+pub const CONTROLS_HINT_ENABLED: bool = false;
+
 pub fn controls_hint(ctx: &egui::Context, free: &[egui::Rect], keys: &Keys, active: &str) {
     const SMALLEST: f32 = 0.6;
     const MARGIN: f32 = 8.0;
