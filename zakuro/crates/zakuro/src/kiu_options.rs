@@ -36,7 +36,8 @@ impl Menus {
             .collapsible(false)
             .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
             .frame(frame)
-            .fixed_size([width, 0.0])
+            .min_width(width)
+            .max_width(width)
             .vscroll(true)
             .max_height(screen.height() - margin)
             .show(ctx, |ui| {
@@ -241,6 +242,12 @@ mod tests {
             let (window, screen) = shown(width, height);
             assert!(screen.contains_rect(window), "{window:?} in {screen:?}");
         }
+    }
+
+    #[test]
+    fn the_options_open_tall_enough_to_read_on_a_big_window() {
+        let (window, _) = shown(1920.0, 1080.0);
+        assert!(window.height() > 300.0, "{window:?}");
     }
 
     #[test]
