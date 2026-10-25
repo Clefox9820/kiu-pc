@@ -1023,6 +1023,233 @@ pub struct Resources {
     /// the host GPU, when draws go to it rather than to the software path.
     #[cfg(feature = "vulkan")]
     pub(crate) hardware: Option<hardware::Hardware>,
+    /// dialogue portraits drawn again on the top screen, see mirror_portrait.
+    pub(crate) portraits: Portraits,
+}
+
+/// what mirror_portrait needs to put the bottom screen's portraits on the
+/// top screen.
+#[derive(Default)]
+pub(crate) struct Portraits {
+    /// where the last transfer to the top screen read from.
+    pub(crate) top_source: Option<u32>,
+    /// the top screen's color buffer registers, address, format and size,
+    /// from the last draw into the buffer that transfer read.
+    top: Option<[u32; 3]>,
+    /// the left corner's portrait and the right one's.
+    sides: [Side; 2],
+}
+
+/// a corner of the top screen and the portraits fading in and out there.
+#[derive(Default)]
+struct Side {
+    /// the draws of the portrait the game drew this frame.
+    incoming: Vec<PortraitDraw>,
+    /// the portrait shown, and the one before it while it fades out.
+    shown: Option<Faded>,
+    leaving: Option<Faded>,
+}
+
+/// a portrait's draws, moved into the top screen's buffer, and how much of
+/// it shows.
+struct Faded {
+    draws: Vec<PortraitDraw>,
+    alpha: f32,
+}
+
+/// one draw of a portrait, its registers pointed at the top screen and its
+/// vertices already shaded, so it can be drawn again after the game stops.
+struct PortraitDraw {
+    registers: Vec<u32>,
+    vertices: Vec<Vertex>,
+}
+
+impl PortraitDraw {
+    /// the picture it shows, its texture's address.
+    fn picture(&self) -> u32 {
+        self.registers[TEXTURE_UNIT_BASES[0] + 4]
+    }
+}
+
+/// whether ZAKURO_PORTRAITS=1 asks for the bottom screen's portraits on the
+/// top screen.
+pub(crate) fn portraits_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("ZAKURO_PORTRAITS").is_ok_and(|value| value != "0"))
+}
+
+/// a dialogue portrait as Kid Icarus Uprising draws it, an Etc1 256x256
+/// picture on the whole bottom screen.
+// ponytail: matched by its shape alone, a per-title list when another game
+// draws the same way.
+fn is_portrait(registers: &[u32]) -> bool {
+    let base = TEXTURE_UNIT_BASES[0];
+    read_float24(registers, REG_VIEWPORT_WIDTH) == 120.0
+        && read_float24(registers, REG_VIEWPORT_HEIGHT) == 160.0
+        && registers[REG_TEXTURE_CONFIG] & 1 != 0
+        && registers[base + 1] == (256 << 16 | 256)
+        && TextureFormat::from_raw(registers[base + 13]) == TextureFormat::Etc1
+}
+
+/// remembers the top screen's color buffer, the one the last transfer to
+/// the top screen read from, as a draw into it shows it.
+fn note_top_buffer(registers: &[u32], resources: &mut Resources) {
+    let Some(source) = resources.portraits.top_source else { return };
+    let dimensions = registers[REG_FRAMEBUFFER_DIMENSIONS];
+    let (width, height) = (dimensions & 0x7FF, ((dimensions >> 12) & 0x3FF) + 1);
+    let format = ColorFormat::from_color_buffer((registers[REG_COLOR_BUFFER_FORMAT] >> 16) & 7);
+    let start = loc_register(registers, REG_COLOR_BUFFER_ADDRESS);
+    if (start..start + width * height * format.bytes_per_pixel() as u32).contains(&source) {
+        resources.portraits.top = Some([
+            registers[REG_COLOR_BUFFER_ADDRESS],
+            registers[REG_COLOR_BUFFER_FORMAT],
+            dimensions,
+        ]);
+    }
+}
+
+/// takes a bottom-screen portrait for the top screen's buffer, smaller, in
+/// the lower corner on its side, beside the subtitles. flush_portraits
+/// draws it there.
+fn mirror_portrait(registers: &[u32], resources: &mut Resources, vertices: Vertices) {
+    /// how big the portrait is on the top screen, and how far from its side.
+    const SCALE: f32 = 0.4;
+    const MARGIN: f32 = 4.0;
+    let Some([address, format, dimensions]) = resources.portraits.top else { return };
+    // the vertices in the order the draw takes them, shaded
+    let vertices = match vertices {
+        Vertices::Unshaded { vertex_shader, geometry_shader, inputs, order } => {
+            let (shaded, order) = process_vertices(registers, vertex_shader, geometry_shader, inputs, order);
+            match order {
+                Some(order) => order.iter().map(|&i| shaded[i]).collect(),
+                None => shaded,
+            }
+        }
+        Vertices::Shaded(shaded) => shaded.to_vec(),
+        #[cfg(feature = "vulkan")]
+        Vertices::Raw { .. } => return,
+    };
+    // the part of it on the bottom screen, x across its 240 rows, y along
+    // them. the screen's edge cuts it, so that edge goes on the top
+    // screen's bottom edge and the cut does not show
+    let viewport = (0.0, 0.0, 240.0, 320.0);
+    let (mut low, mut high) = ([f32::MAX; 2], [f32::MIN; 2]);
+    for screen in vertices.iter().filter(|vertex| inside(vertex)).filter_map(|vertex| to_screen(vertex, viewport)) {
+        low = [low[0].min(screen.x), low[1].min(screen.y)];
+        high = [high[0].max(screen.x), high[1].max(screen.y)];
+    }
+    let (low, high) = ([low[0].max(0.0), low[1].max(0.0)], [high[0].min(240.0), high[1].min(320.0)]);
+    if low[0] >= high[0] || low[1] >= high[1] {
+        return;
+    }
+    // the bottom screen scaled down, placed so the portrait sits in the
+    // corner of the top screen's 240x400: its lowest x on the bottom edge,
+    // and its y against the end of its own side
+    let left = (low[1] + high[1]) / 2.0 < 160.0;
+    let x = -low[0] * SCALE;
+    let y = match left {
+        true => MARGIN - low[1] * SCALE,
+        false => 400.0 - MARGIN - high[1] * SCALE,
+    };
+    let mut patched = registers.to_vec();
+    patched[REG_COLOR_BUFFER_ADDRESS] = address;
+    patched[REG_COLOR_BUFFER_FORMAT] = format;
+    patched[REG_FRAMEBUFFER_DIMENSIONS] = dimensions;
+    patched[REG_VIEWPORT_WIDTH] = float24(120.0 * SCALE);
+    patched[REG_VIEWPORT_HEIGHT] = float24(160.0 * SCALE);
+    patched[REG_VIEWPORT_XY] = (x.round() as i32 as u32 & 0x3FF) | ((y.round() as i32 as u32 & 0x3FF) << 16);
+    // no depth, the top screen's buffer has none of the bottom one's
+    patched[REG_DEPTH_COLOR_MASK] &= !(1 | 1 << 12);
+    patched[REG_DEPTH_STENCIL_WRITE] = 0;
+    patched[REG_DEPTH_BUFFER_FORMAT] &= !3;
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        log::info!(
+            "portraits go to the top screen, the game's draw has color operation 0x{:08X}, blend 0x{:08X}",
+            registers[REG_COLOR_OPERATION],
+            registers[REG_BLEND_FUNC]
+        )
+    });
+    resources.portraits.sides[!left as usize].incoming.push(PortraitDraw { registers: patched, vertices });
+}
+
+/// draws the portraits taken this frame into the top screen's buffer,
+/// fading in a new one over the one before, and out one the game stopped
+/// drawing. whether it drew any, and the top screen has to go out again.
+pub(crate) fn flush_portraits<M: GpuMemory>(memory: &mut M, resources: &mut Resources) -> bool {
+    // how much of a portrait fades in or out each frame, 8 frames in all
+    let step = 1.0 / 8.0;
+    let mut sides = std::mem::take(&mut resources.portraits.sides);
+    let mut drew = false;
+    for side in &mut sides {
+        let incoming = std::mem::take(&mut side.incoming);
+        match (incoming.is_empty(), &mut side.shown) {
+            // the same picture, where the game has it now
+            (false, Some(shown)) if shown.draws.first().map(PortraitDraw::picture) == incoming.first().map(PortraitDraw::picture) => {
+                shown.draws = incoming;
+                shown.alpha = (shown.alpha + step).min(1.0);
+            }
+            // a new one, over the one before
+            (false, _) => {
+                side.leaving = side.shown.take().or(side.leaving.take());
+                side.shown = Some(Faded { draws: incoming, alpha: step });
+            }
+            // the game stopped drawing it
+            (true, Some(shown)) => shown.alpha -= step,
+            (true, None) => {}
+        }
+        if let Some(leaving) = &mut side.leaving {
+            leaving.alpha -= step;
+        }
+        for faded in [&mut side.leaving, &mut side.shown] {
+            if faded.as_ref().is_some_and(|faded| faded.alpha <= 0.0) {
+                *faded = None;
+            }
+        }
+        for faded in [&side.leaving, &side.shown].into_iter().flatten() {
+            for draw in &faded.draws {
+                draw_faded(memory, resources, draw, faded.alpha);
+                drew = true;
+            }
+        }
+    }
+    resources.portraits.sides = sides;
+    drew
+}
+
+/// draws a portrait with only alpha of it showing over what is there.
+fn draw_faded<M: GpuMemory>(memory: &mut M, resources: &mut Resources, draw: &PortraitDraw, alpha: f32) {
+    if alpha >= 1.0 {
+        rasterize(&draw.registers, memory, resources, Vertices::Shaded(&draw.vertices));
+        return;
+    }
+    let mut registers = draw.registers.clone();
+    let mut vertices = draw.vertices.clone();
+    if registers[REG_COLOR_OPERATION] & 0x100 == 0 {
+        // blends it with the constant alpha, color source * alpha plus the
+        // buffer * (1 - alpha), the buffer's alpha kept
+        registers[REG_COLOR_OPERATION] |= 0x100;
+        registers[REG_BLEND_FUNC] = 12 << 16 | 13 << 20 | 1 << 28;
+        registers[REG_BLEND_COLOR] = ((alpha * 255.0).round() as u32) << 24;
+    } else {
+        // it blends already, by its own alpha as the game draws it
+        for vertex in &mut vertices {
+            vertex.color[3] *= alpha;
+        }
+    }
+    rasterize(&registers, memory, resources, Vertices::Shaded(&vertices));
+}
+
+const REG_BLEND_COLOR: usize = 0x103;
+
+/// the inverse of decode_float24, for normal values.
+fn float24(value: f32) -> u32 {
+    if value == 0.0 {
+        return 0;
+    }
+    let bits = value.to_bits();
+    let exponent = ((bits >> 23) & 0xFF) - 127 + 63;
+    ((bits >> 31) << 23) | (exponent << 16) | ((bits >> 7) & 0xFFFF)
 }
 
 impl Resources {
@@ -1479,8 +1706,49 @@ fn drawn_texture<M: GpuMemory>(registers: &[u32], memory: &M, unit: usize) -> Op
     (width != 0 && height != 0 && address != 0).then(|| DrawnTexture { addr: memory.translate(address), width, height, format })
 }
 
+/// with ZAKURO_LOG_DRAWS=1, logs each texture a draw reads and the buffer it
+/// draws into, the first time the pair shows up and again whenever it comes
+/// back after two seconds unseen. the id is the texture's hash as Citra
+/// names it, the name ZAKURO_DUMP_TEXTURES saves it under, to find which
+/// draws are which picture. it hashes up to 256 KiB a draw, so drawing slows.
+fn log_draw<M: GpuMemory>(registers: &[u32], memory: &mut M, target: u32, buffer: (u32, u32), viewport: (f32, f32, f32, f32)) {
+    use std::hash::{Hash, Hasher};
+    use std::sync::{Mutex, OnceLock};
+    use std::time::{Duration, Instant};
+    static ON: OnceLock<bool> = OnceLock::new();
+    static SEEN: Mutex<Option<HashMap<u64, Instant>>> = Mutex::new(None);
+    if !*ON.get_or_init(|| std::env::var("ZAKURO_LOG_DRAWS").is_ok_and(|value| value != "0")) {
+        return;
+    }
+    for unit in 0..3 {
+        let Some((addr, len)) = texture_range(registers, memory, unit) else { continue };
+        let base = TEXTURE_UNIT_BASES[unit];
+        let dimensions = registers[base + 1];
+        let (height, width) = (dimensions & 0x7FF, (dimensions >> 16) & 0x7FF);
+        let format = TextureFormat::from_raw(registers[if unit == 0 { base + 13 } else { base + 5 }]);
+        let mut bytes = vec![0; len.min(256 << 10) as usize];
+        memory.read(addr, &mut bytes);
+        // the name ZAKURO_DUMP_TEXTURES gives the picture, so the two match
+        let Some(id) = crate::pack::hash(crate::pack::Hashing::Rows, &bytes, format, width, height, &mut Vec::new()) else { continue };
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        (id, target).hash(&mut hasher);
+        let key = hasher.finish();
+        let now = Instant::now();
+        let mut seen = SEEN.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let last = seen.get_or_insert_with(HashMap::new).insert(key, now);
+        if last.is_some_and(|last| now - last < Duration::from_secs(2)) {
+            continue;
+        }
+        let (x, y, w, h) = viewport;
+        log::info!(
+            "draw tex{unit} {id:016X} {width}x{height} {format:?} at 0x{addr:08X} into 0x{target:08X} {}x{} viewport {x},{y} {w}x{h}",
+            buffer.0,
+            buffer.1
+        );
+    }
+}
+
 /// the guest memory a texture unit reads, when it is on.
-#[cfg(feature = "vulkan")]
 fn texture_range<M: GpuMemory>(registers: &[u32], memory: &M, unit: usize) -> Option<(u32, u32)> {
     if registers[REG_TEXTURE_CONFIG] & (1 << unit) == 0 {
         return None;
@@ -2442,6 +2710,18 @@ fn assemble(topology: u32, count: usize) -> Vec<(usize, usize, usize)> {
 /// the triangles drawn, none for arrays the GPU could not decode, which the
 /// CPU decodes then.
 fn rasterize<M: GpuMemory>(registers: &[u32], memory: &mut M, resources: &mut Resources, vertices: Vertices) -> Option<u32> {
+    if portraits_on() {
+        if read_float24(registers, REG_VIEWPORT_WIDTH) == 120.0 && read_float24(registers, REG_VIEWPORT_HEIGHT) == 200.0 {
+            note_top_buffer(registers, resources);
+        } else if is_portrait(registers) {
+            // the CPU decodes its arrays then, and its vertices say where it is
+            #[cfg(feature = "vulkan")]
+            if matches!(vertices, Vertices::Raw { .. }) {
+                return None;
+            }
+            mirror_portrait(registers, resources, vertices);
+        }
+    }
     let vertex_count = vertices.len();
     // the offset is two signed 10-bit fields.
     let signed10 = |value: u32| (((value & 0x3FF) << 22) as i32 >> 22) as f32;
@@ -2516,6 +2796,7 @@ fn rasterize<M: GpuMemory>(registers: &[u32], memory: &mut M, resources: &mut Re
     }
     let textures: [Option<BoundTexture>; 3] =
         std::array::from_fn(|unit| bind_texture(registers, memory, &mut resources.textures, unit, drawn[unit], past[unit]));
+    log_draw(registers, memory, target_addr, (buffer_width, buffer_height), viewport);
     let tex_env = resources.tex_env.read(registers);
     // the lighting only matters to a draw whose combiners read it.
     let lighting = if tex_env.reads_lighting() { resources.lighting.read(registers) } else { None };
@@ -5636,5 +5917,89 @@ mod tests {
         assert!(own == plain, "the title's own picture");
         assert!(between == halfway, "the picture in between");
         assert!(own != between);
+    }
+
+    /// a quad covering x from `x.0` to `x.1` and y from `y.0` to `y.1` in
+    /// normalized device coordinates, as a list of two triangles.
+    fn quad(x: (f32, f32), y: (f32, f32), color: Vec4) -> Vec<Vertex> {
+        let vertex = |x: f32, y: f32| Vertex { clip: [x, y, -0.5, 1.0], color, texcoords: [[0.0; 2]; 3], quaternion: [0.0, 0.0, 0.0, 1.0], view: [0.0; 3] };
+        [(x.0, y.0), (x.1, y.0), (x.1, y.1), (x.0, y.0), (x.1, y.1), (x.0, y.1)].into_iter().map(|(x, y)| vertex(x, y)).collect()
+    }
+
+    /// a portrait on the left of the bottom screen goes to the top screen's
+    /// left corner, one on the right to its right corner, scaled by 0.4,
+    /// with the edge the bottom screen cuts on the top screen's bottom edge.
+    #[test]
+    fn a_portrait_goes_to_the_bottom_corner_of_its_side() {
+        let mut registers = target_registers();
+        sized(&mut registers, 240, 320);
+        let mut resources = Resources::default();
+        let top = [0x1F08_0000 >> 3, 0, 256 | (511 << 12)];
+        resources.portraits.top = Some(top);
+        // x past the bottom screen's edge, which cuts it at 0, y from 40 to 120
+        mirror_portrait(&registers, &mut resources, Vertices::Shaded(&quad((-1.5, 0.0), (-0.75, -0.25), RED)));
+        // y from 200 to 280, all of it on the screen, x from 60 to 180
+        mirror_portrait(&registers, &mut resources, Vertices::Shaded(&quad((-0.5, 0.5), (0.25, 0.75), RED)));
+        let placed = |side: usize| {
+            let [draw] = &resources.portraits.sides[side].incoming[..] else { panic!("one draw on side {side}") };
+            let xy = draw.registers[REG_VIEWPORT_XY];
+            let signed10 = |value: u32| ((value & 0x3FF) << 22) as i32 >> 22;
+            assert_eq!(draw.registers[REG_COLOR_BUFFER_ADDRESS], top[0]);
+            assert_eq!(draw.registers[REG_FRAMEBUFFER_DIMENSIONS], top[2]);
+            assert_eq!(read_float24(&draw.registers, REG_VIEWPORT_WIDTH), 48.0);
+            assert_eq!(read_float24(&draw.registers, REG_VIEWPORT_HEIGHT), 64.0);
+            assert_eq!(draw.registers[REG_DEPTH_COLOR_MASK] & (1 | 1 << 12), 0, "no depth");
+            (signed10(xy), signed10(xy >> 16))
+        };
+        // the cut edge at 0, the side 4 pixels in: 4 - 40 * 0.4
+        assert_eq!(placed(0), (0, -12));
+        // 60 * 0.4 below, and 400 - 4 - 280 * 0.4 along
+        assert_eq!(placed(1), (-24, 284));
+    }
+
+    /// a portrait fades in over 8 frames, the next picture fades in over it
+    /// while it fades out, and one the game stops drawing fades out.
+    #[test]
+    fn a_portrait_fades_in_over_and_out() {
+        let mut registers = target_registers();
+        // as Kid Icarus Uprising blends its portraits, by their alpha
+        registers[REG_COLOR_OPERATION] = 0x00E4_0100;
+        registers[REG_BLEND_FUNC] = 0x0176_0000;
+        let mut memory = ConsoleMemory::default();
+        let mut resources = Resources::default();
+        let draw = |picture: u32| {
+            let mut registers = registers.clone();
+            registers[TEXTURE_UNIT_BASES[0] + 4] = picture;
+            PortraitDraw { registers, vertices: cover(-0.5, RED) }
+        };
+        let alphas = |resources: &Resources| {
+            let side = &resources.portraits.sides[0];
+            (side.shown.as_ref().map(|faded| faded.alpha), side.leaving.as_ref().map(|faded| faded.alpha))
+        };
+
+        resources.portraits.sides[0].incoming.push(draw(1));
+        assert!(flush_portraits(&mut memory, &mut resources));
+        assert_eq!(alphas(&resources), (Some(0.125), None));
+        let red = pixels(&mut memory)[0][0];
+        assert!((28..=36).contains(&red), "an eighth of red over black, not {red}");
+
+        for _ in 0..7 {
+            resources.portraits.sides[0].incoming.push(draw(1));
+            flush_portraits(&mut memory, &mut resources);
+        }
+        assert_eq!(alphas(&resources), (Some(1.0), None));
+
+        resources.portraits.sides[0].incoming.push(draw(2));
+        flush_portraits(&mut memory, &mut resources);
+        assert_eq!(alphas(&resources), (Some(0.125), Some(0.875)), "the new one over the old");
+
+        // the game stops: the new one had an eighth to lose, the old one 7
+        assert!(flush_portraits(&mut memory, &mut resources));
+        assert_eq!(alphas(&resources), (None, Some(0.75)));
+        for _ in 0..5 {
+            assert!(flush_portraits(&mut memory, &mut resources));
+        }
+        assert!(!flush_portraits(&mut memory, &mut resources), "the last step leaves nothing to draw");
+        assert_eq!(alphas(&resources), (None, None));
     }
 }

@@ -16,6 +16,7 @@ Load when a change needs the game itself to behave differently (true mouse camer
 - Never state a function's purpose, address or formula without evidence from the binary or a runtime trace; AI-assisted RE has fabricated functions before (acnl-re). Mark unverified findings as such.
 - Overrides are hand-written C in this repo; they may reference addresses but must not copy disassembly or game bytes.
 - Never edit generated code in `build/port/code/`.
+- Overrides are written with European addresses only. Every address they name, comments included, needs its USA address in `$UsaAddresses` in `scripts/setup.ps1`; otherwise the USA build stops. Get it with `scripts\find-usa-addresses.ps1 -Europe <eur rom> -Usa <usa rom>`, never by guessing an offset. If it reports `not found`, the function changed between releases: find it by hand and say so.
 - Every override needs an in-game verification step the user can run, plus a RAM or image check when possible.
 
 ## Decision Gates
@@ -33,11 +34,12 @@ Load when a change needs the game itself to behave differently (true mouse camer
 2. Locate candidates with a runtime trace (log writes to a watched address, or `zakuro_core::slow` thread/PC hints).
 3. Read the function in the generated C or a disassembler; write down evidence (address, inputs, outputs).
 4. Write the override (see 3dsrecomp `docs/overrides.md`), pass it with `--overrides`, rebuild (`kiu-build`).
-5. Verify with the check from step 1 and ask the user to confirm in play.
+5. Run `scripts\find-usa-addresses.ps1`, add what it reports to `$UsaAddresses`, and rerun it until it prints `setup.ps1 has every USA address`. Rebuild both releases.
+6. Verify with the check from step 1 in both releases and ask the user to confirm in play.
 
 ## Output Contract
 
-Report the address, the evidence for what it does, the override file, how it was verified, and what remains unverified.
+Report the European and USA address, the evidence for what it does, the override file, how it was verified in each release, and what remains unverified.
 
 ## References
 

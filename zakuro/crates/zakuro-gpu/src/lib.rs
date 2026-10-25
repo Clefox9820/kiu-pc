@@ -175,6 +175,9 @@ pub struct Gpu {
     resources: raster::Resources,
     /// frame interpolation's record of the draws, none while it is off.
     interpolation: Option<interpolation::Interpolation>,
+    /// the last transfer to the top screen, its arguments, to run again when
+    /// portraits go into its buffer afterwards.
+    last_top_transfer: Option<[u32; 5]>,
 }
 
 /// number of external register words we track (0x1EF00000..0x1EF04000).
@@ -209,6 +212,7 @@ impl Gpu {
             busy: std::time::Duration::ZERO,
             resources: raster::Resources::default(),
             interpolation: None,
+            last_top_transfer: None,
         }
     }
 
@@ -357,6 +361,19 @@ impl Gpu {
     ) {
         let input_width = input_dimensions & 0xFFFF;
         let input_height = input_dimensions >> 16;
+        // the bottom screen's portraits go into the top screen's buffer after
+        // it went out, here, so it goes out again, before the bottom screen
+        if raster::portraits_on() {
+            let lcd = |index: usize| [self.framebuffers[index].address_a_left, self.framebuffers[index].address_b_left].contains(&output_paddr);
+            if lcd(0) {
+                self.resources.portraits.top_source = Some(input_paddr);
+                self.last_top_transfer = Some([input_paddr, output_paddr, input_dimensions, output_dimensions, flags]);
+            } else if lcd(1) && raster::flush_portraits(memory, &mut self.resources) {
+                if let Some([input, output, dimensions_in, dimensions_out, flags]) = self.last_top_transfer {
+                    self.display_transfer(memory, input, output, dimensions_in, dimensions_out, flags);
+                }
+            }
+        }
 
         // flag layout, from the transfer engine's register,
         //   bit 0      flip the input vertically

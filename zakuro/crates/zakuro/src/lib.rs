@@ -116,6 +116,7 @@ pub fn run(linked: Option<Linked>) {
         paused: false,
         away: Away::default(),
         fast_forward_key: false,
+        focused: true,
         fast_forwarding: false,
         next_shown: Instant::now(),
         stop: false,
@@ -404,6 +405,8 @@ struct App {
     away: Away,
     /// Tab is held down, for fast forward.
     fast_forward_key: bool,
+    /// the window has the keyboard, so mouse aim may take the pointer.
+    focused: bool,
     /// the game runs as fast as it can, its sound left out.
     fast_forwarding: bool,
     /// when fast forward shows its next frame, on a grid at the console's
@@ -589,8 +592,10 @@ impl ApplicationHandler for App {
             WindowEvent::CloseRequested => event_loop.exit(),
             // keys let go while another window has the keyboard never come
             WindowEvent::Focused(false) => {
+                self.focused = false;
                 // a room's others keep playing, so it never pauses there
                 let pause = self.settings.pause_unfocused && self.game.is_some() && self.room.is_none();
+                // the aim in use, read before release() forgets it
                 self.away = leave(pause, self.paused, self.keyboard.aim_mode(), self.settings.recapture_mouse);
                 self.paused |= self.away.paused;
                 self.fast_forward_key = false;
@@ -598,6 +603,7 @@ impl ApplicationHandler for App {
                 self.keyboard.release();
             }
             WindowEvent::Focused(true) => {
+                self.focused = true;
                 let away = std::mem::take(&mut self.away);
                 if away.paused {
                     self.paused = false;
@@ -797,6 +803,12 @@ impl App {
         self.keyboard.release();
         self.paused = false;
         self.next_frame = Instant::now();
+        // ZAKURO_LOAD_SLOT=<1-9> goes straight on from that slot's state, for
+        // runs nobody has to steer to the same spot
+        if let Some(slot) = std::env::var("ZAKURO_LOAD_SLOT").ok().and_then(|slot| slot.parse().ok()).filter(|slot| (1..=9).contains(slot)) {
+            self.menus.slot = slot;
+            self.load_state();
+        }
         Ok(())
     }
 
@@ -875,13 +887,7 @@ impl App {
                         KeyCode::Digit3 => Some(AimMode::Land),
                         _ => None,
                     };
-                    self.set_mouse_aim(mode);
-                    let said = match mode {
-                        Some(AimMode::Air) => "Mouse aim: flying",
-                        Some(AimMode::Land) => "Mouse aim: on foot",
-                        None => "Mouse aim off",
-                    };
-                    self.menus.toast = Some((said.to_owned(), Instant::now()));
+                    self.pick_aim(mode);
                 }
                 KeyCode::F5 if self.game.is_some() => self.save_state(),
                 KeyCode::F8 if self.game.is_some() => self.load_state(),
@@ -919,6 +925,17 @@ impl App {
     /// whether the pointer is busy with something other than the game.
     fn pointer_taken(&self, consumed: bool) -> bool {
         consumed || self.game.is_none() || self.menus.menu_open || self.gui.as_ref().is_some_and(Gui::wants_pointer)
+    }
+
+    /// changes the mouse aim mode and says so.
+    fn pick_aim(&mut self, mode: Option<AimMode>) {
+        self.set_mouse_aim(mode);
+        let said = match mode {
+            Some(AimMode::Air) => "Mouse aim: flying",
+            Some(AimMode::Land) => "Mouse aim: on foot",
+            None => "Mouse aim off",
+        };
+        self.menus.toast = Some((said.to_owned(), Instant::now()));
     }
 
     /// mouse aim: the mouse drags the stylus with the pointer hidden and held
@@ -1417,6 +1434,14 @@ impl App {
 
     /// runs one frame of the game.
     fn emulate(&mut self) {
+        // what game overrides say the game is doing picks the mouse aim mode,
+        // see input::GAME_ON_FOOT; not while the window or a menu has it
+        let said = self.game.as_mut().map_or(0, |game| std::mem::take(&mut game.system.memory.host_mailbox[3]));
+        if self.focused && !self.menus.menu_open {
+            if let Some(mode) = self.keyboard.game_mode(said) {
+                self.pick_aim(mode);
+            }
+        }
         let Some(game) = &mut self.game else { return };
         let input = match &mut game.replay {
             Some(replay) => replay.input(game.frame),
@@ -1428,7 +1453,9 @@ impl App {
             recorder.record(input);
         }
         game.system.set_input(input);
-        let interpreted = |system: &System| system.interpreted_instructions + system.recompiled.as_ref().map_or(0, |library| library.fallbacks());
+        // mouse look on foot, for a game override to take, see input::MOUSE_LOOK
+        self.keyboard.feed_mailbox(&mut game.system.memory.host_mailbox);
+        let interpreted =|system: &System| system.interpreted_instructions + system.recompiled.as_ref().map_or(0, |library| library.fallbacks());
         let before = interpreted(&game.system);
         let faults = warm::page_faults();
         let started = Instant::now();

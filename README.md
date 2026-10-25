@@ -1,7 +1,8 @@
 # kiu-pc
 
-A PC build of the Nintendo 3DS game *Kid Icarus: Uprising* (title ID
-`0004000000030200`), made from your own copy of the game.
+A PC build of the Nintendo 3DS game *Kid Icarus: Uprising* (European
+release `0004000000030200` or USA release `0004000000030100`), made from your
+own copy of the game.
 
 The game's ARM CPU code is statically recompiled to C with
 [3dsrecomp](https://github.com/fearkov/3dsrecomp) (pinned at commit
@@ -67,7 +68,8 @@ The script:
 1. Checks that the ROM is *Kid Icarus: Uprising* and is decrypted.
 2. Installs gcc and Rust into `tools/`.
 3. Clones and builds 3dsrecomp at the pinned commit.
-4. Translates the game's code into `build/port`.
+4. Translates the game's code into `build/port` (`build/port-usa` for the
+   USA release).
 5. Builds the port against `zakuro/` with optimizations for your CPU.
 6. Gives `kid-icarus.exe` the game's icon, read from your ROM, and its name,
    so Explorer and the taskbar show them.
@@ -78,7 +80,7 @@ Options:
 | Switch | Effect |
 | --- | --- |
 | `-CheckOnly` | Only verify that the ROM is the right game and decrypted, then stop |
-| `-Force` | Translate the game again even if `build/port` already exists |
+| `-Force` | Translate the game again even if `build/port` (or `build/port-usa`) already exists |
 
 When it finishes, start the game with `Play.bat`.
 
@@ -93,7 +95,7 @@ Defaults are laid out for this game. They can be changed in
 | Shift | Walk |
 | Mouse | Aim (stylus) |
 | Left click / Space | Fire (L) |
-| Hold right click | On foot (mode 3): put the stylus down and drag the aim |
+| Hold right click | On foot (mode 3): put the stylus down and drag, like the touch screen |
 | Mouse wheel / Q, E | Pick power (D-pad left/right) |
 | Middle click / F | Use power (D-pad down) |
 | C | D-pad up |
@@ -103,9 +105,10 @@ Defaults are laid out for this game. They can be changed in
 | P / M | Start / Select |
 | N / B | ZL / ZR |
 | Numpad | C-Stick |
+| 1, 2, 3 | Mouse aim, which also switches by itself: on foot, flying, or off in menus (a key picks one until the game changes mode) |
 | 1 | Mouse aim off |
-| 2 | Mouse aim for flying: the stylus follows the mouse, kept inside the screen |
-| 3 | Mouse aim on foot: hold right click to drag; letting go lifts the stylus without a flick, and long drags recenter horizontally |
+| 2 | Mouse aim for flying: the mouse moves the reticle directly (with the overrides; otherwise the stylus follows the mouse) |
+| 3 | Mouse aim on foot: the mouse turns the camera directly (mouse look); hold right click to drag the stylus instead |
 | Esc | Emulator menu |
 | F11 | Fullscreen |
 | F1 | Pause |
@@ -144,6 +147,29 @@ gameplay once warm.
 If you still see stutter, the log at `%APPDATA%\zakuro\zakuro.log` contains
 `hitch:` lines with a per-frame breakdown; include them in a bug report.
 
+## Single screen (work in progress)
+
+The goal is to play on the top screen alone. So far:
+
+- `ZAKURO_PORTRAITS=1` draws the dialogue portraits from the bottom screen
+  on the top screen as well: smaller, in the lower left or right corner on
+  the speaker's side, beside the subtitles, fading in, out and between
+  pictures. The game's own draws are reused, so expressions stay the
+  game's. It is off unless set, because it recognises portraits by their
+  shape (a 256x256 Etc1 picture on the bottom screen), which another game
+  could also draw.
+- Not done yet: the subtitles still show in the bottom screen's dialogue
+  box during battles, and the powers, hearts and other bottom-screen HUD
+  stay there.
+
+Tools used to work on it:
+
+- `ZAKURO_LOAD_SLOT=<1-9>` starts the game from that save-state slot, for
+  runs that should begin at the same place.
+- `ZAKURO_LOG_DRAWS=1` logs each texture drawn and the buffer it goes into,
+  named as `ZAKURO_DUMP_TEXTURES=<folder>` saves the pictures, to tell which
+  draws are which. It slows drawing.
+
 ## Status and known issues
 
 - The game runs with the recompiled code; about 99.4% of executed
@@ -153,8 +179,18 @@ If you still see stutter, the log at `%APPDATA%\zakuro\zakuro.log` contains
 - On some AMD integrated GPUs, five `zakuro-gpu` raster tests need
   `ZAKURO_GPU_SHADERS=1` to pass. This also happens without this project's
   changes.
-- The camera is still the game's own: true mouse camera control and
-  widescreen would need 3dsrecomp overrides and are not done.
+- Mouse look on foot, mouse aim while flying and the automatic aim mode
+  come from hand-written
+  overrides in `overrides/`, found for the European release
+  (`0004000000030200`) and not yet confirmed in real play. Builds made
+  before it was added need `scripts\setup.ps1 -Force` to get it.
+- For the USA release, `scripts\setup.ps1` writes a copy of the overrides to
+  `build/overrides-usa` with that release's addresses, listed in the script.
+  The functions were matched by their code but have not been tried in play.
+  A new override needs its USA address added there too:
+  `scripts\find-usa-addresses.ps1 -Europe <eur rom> -Usa <usa rom>` finds
+  them from both ROMs and checks the table. It prints only addresses.
+- Widescreen would need more 3dsrecomp overrides and is not done.
 - The changes to Zakuro in this repository were written with AI assistance.
   They have not been sent upstream; the Zakuro author does not accept fully
   AI-written contributions, so a human must review them first.

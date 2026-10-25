@@ -63,6 +63,12 @@ pub const CONFIG_MEM_SIZE: u32 = 0x1000;
 pub const SHARED_PAGE_VADDR: VAddr = 0x1FF8_1000;
 pub const SHARED_PAGE_SIZE: u32 = 0x1000;
 
+/// four words the host and hand-written overrides share, answered by the
+/// host where no title maps anything: the gap between the program image and
+/// the heap. see Memory::host_mailbox.
+pub const HOST_MAILBOX_VADDR: VAddr = 0x0700_0000;
+pub const HOST_MAILBOX_WORDS: usize = 4;
+
 /// per-thread local storage. Thread N gets TLS_AREA_VADDR + N * TLS_ENTRY_SIZE.
 pub const TLS_AREA_VADDR: VAddr = 0x1FF8_2000;
 pub const TLS_ENTRY_SIZE: u32 = 0x200;
