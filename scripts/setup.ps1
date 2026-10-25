@@ -143,6 +143,52 @@ Set-Content -Path (Join-Path $Port ".cargo\config.toml") -Value "[build]`nrustfl
 Run cargo @("build", "--release") $Port
 $Exe = Join-Path $Port "target\release\kid-icarus.exe"
 
+# --- the program's icon and name, the icon taken from your ROM ---------------
+Step "Giving the program the game's icon and name"
+$Resource = Join-Path $Port "program.res"
+$buildScript = Join-Path $Port "build.rs"
+# done only once the build script links what windres made
+$done = (Test-Path $Resource) -and (Get-Content -Raw $buildScript).Contains("program.res")
+if ($Force -or -not $done) {
+    Run $Exe @("--save-icon", (Join-Path $Port "icon.ico"), $Rom) $Port
+    # an unofficial build, so it names no company
+    Set-Content -Path (Join-Path $Port "program.rc") -Value @'
+1 ICON "icon.ico"
+1 VERSIONINFO
+FILEVERSION 0,1,0,0
+PRODUCTVERSION 0,1,0,0
+BEGIN
+  BLOCK "StringFileInfo"
+  BEGIN
+    BLOCK "040904B0"
+    BEGIN
+      VALUE "FileDescription", "Kid Icarus: Uprising"
+      VALUE "ProductName", "Kid Icarus: Uprising for PC"
+      VALUE "Comments", "Unofficial, built from your own copy of the game"
+      VALUE "InternalName", "kid-icarus"
+      VALUE "OriginalFilename", "kid-icarus.exe"
+      VALUE "FileVersion", "0.1.0"
+      VALUE "ProductVersion", "0.1.0"
+    END
+  END
+  BLOCK "VarFileInfo"
+  BEGIN
+    VALUE "Translation", 0x409, 1200
+  END
+END
+'@
+    Run windres @("program.rc", "-O", "coff", "-o", "program.res") $Port
+    # the build script 3dsrecomp wrote links it into the program
+    $text = Get-Content -Raw $buildScript
+    if (-not $text.Contains("program.res")) {
+        $link = 'println!("cargo:rerun-if-changed=program.res"); println!("cargo:rustc-link-arg-bins={}/program.res", var("CARGO_MANIFEST_DIR").unwrap());'
+        Set-Content -NoNewline -Path $buildScript -Value $text.Replace("fn main() {", "fn main() {`n    $link")
+    }
+    Run cargo @("build", "--release") $Port
+} else {
+    Write-Host "already done (-Force does it again)"
+}
+
 $Play = Join-Path $Root "Play.bat"
 Set-Content -Path $Play -Value "@echo off`r`n`"$Exe`" `"$Rom`""
 Step "Done"
