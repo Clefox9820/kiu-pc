@@ -999,18 +999,87 @@ fn controls_sections(k: &Keys) -> Vec<(&'static str, Vec<ControlRow>)> {
     ]
 }
 
-/// Kid Icarus' colours: gold trim on a night sky, with sky blue headings.
-const GOLD: Color32 = Color32::from_rgb(226, 188, 98);
-const GOLD_DIM: Color32 = Color32::from_rgb(140, 112, 56);
-const NIGHT: Color32 = Color32::from_rgba_premultiplied(9, 20, 48, 232);
-const NIGHT_LIGHT: Color32 = Color32::from_rgba_premultiplied(26, 52, 104, 120);
-const SKY: Color32 = Color32::from_rgb(150, 206, 255);
-const CAP: Color32 = Color32::from_rgb(246, 238, 214);
-const CAP_TEXT: Color32 = Color32::from_rgb(28, 38, 70);
-const TEXT: Color32 = Color32::from_rgb(236, 240, 250);
+/// Kid Icarus' menu colours: black ink on parchment, a red banner for what
+/// matters most and a magenta to cyan flourish under titles.
+const PAPER: Color32 = Color32::from_rgb(243, 235, 221);
+const PAPER_LINE: Color32 = Color32::from_rgb(234, 224, 207);
+const PAPER_SHADOW: Color32 = Color32::from_rgb(196, 183, 162);
+const INK: Color32 = Color32::from_rgb(26, 20, 18);
+const RED: Color32 = Color32::from_rgb(222, 32, 36);
+const ORANGE: Color32 = Color32::from_rgb(250, 164, 40);
+const MAGENTA: Color32 = Color32::from_rgb(232, 64, 196);
+const BLUE: Color32 = Color32::from_rgb(84, 110, 240);
+const CYAN: Color32 = Color32::from_rgb(64, 216, 232);
+const SHADOW: Color32 = Color32::from_black_alpha(110);
+
+/// `a` turned toward `b` by `t`, from 0 to 1.
+fn mix(a: Color32, b: Color32, t: f32) -> Color32 {
+    let m = |x: u8, y: u8| (x as f32 + (y as f32 - x as f32) * t).round() as u8;
+    Color32::from_rgb(m(a.r(), b.r()), m(a.g(), b.g()), m(a.b(), b.b()))
+}
+
+/// the flourish's colour at `t` across it: magenta, then blue, then cyan.
+fn rainbow(t: f32) -> Color32 {
+    if t < 0.5 { mix(MAGENTA, BLUE, t * 2.0) } else { mix(BLUE, CYAN, t * 2.0 - 1.0) }
+}
+
+/// a leaf: a lozenge from `base`, `length` long toward `dir`.
+fn leaf(painter: &egui::Painter, base: egui::Pos2, dir: Vec2, length: f32) {
+    let side = Vec2::new(-dir.y, dir.x) * length * 0.28;
+    let middle = base + dir * length * 0.5;
+    painter.add(egui::Shape::convex_polygon(vec![base, middle + side, base + dir * length, middle - side], INK, egui::Stroke::NONE));
+}
+
+/// a black vine curling out of a corner, as on the game's parchment menus:
+/// it grows from `at` along `along` and curls toward `inward`.
+fn vine(painter: &egui::Painter, at: egui::Pos2, along: Vec2, inward: Vec2, size: f32) {
+    // turning from `along` to `inward` is clockwise on screen when this is 1
+    let turn = along.x * inward.y - along.y * inward.x;
+    let width = size * 0.06;
+    // a spiral round `centre`, starting `radius` out toward `from` and
+    // winding in by `turn`; gives where it starts
+    let spiral = |centre: egui::Pos2, from: Vec2, radius: f32, turn: f32, width: f32| {
+        let start = from.y.atan2(from.x);
+        let points: Vec<_> = (0..=40)
+            .map(|i| {
+                let t = i as f32 / 40.0;
+                let angle = start + turn * t * std::f32::consts::TAU * 1.3;
+                centre + Vec2::new(angle.cos(), angle.sin()) * radius * (1.0 - 0.75 * t)
+            })
+            .collect();
+        painter.add(egui::Shape::line(points, egui::Stroke::new(width, INK)));
+        centre + from * radius
+    };
+    let stem = |from: egui::Pos2, to: egui::Pos2, bow: Vec2, width: f32| {
+        let points = [from, from + (to - from) * 0.4 + bow, to - (to - from) * 0.2 + bow, to];
+        painter.add(egui::epaint::CubicBezierShape::from_points_stroke(points, false, Color32::TRANSPARENT, egui::Stroke::new(width, INK)));
+    };
+    // the long arm along the edge, ending in a curl that turns inward
+    let curl = spiral(at + along * size * 0.95 + inward * size * 0.26, -inward, size * 0.26, turn, width);
+    stem(at, curl, inward * size * 0.06, width);
+    // a shorter arm down the side, curling the other way
+    let side = spiral(at + inward * size * 0.7 + along * size * 0.2, -along, size * 0.18, -turn, width * 0.8);
+    stem(at, side, along * size * 0.05, width * 0.8);
+    for (k, a, i) in [(0.35, 0.6, 0.8), (0.6, 0.9, -0.2), (0.2, 0.3, 1.0)] {
+        leaf(painter, at + along * size * k + inward * size * 0.03, (along * a + inward * i).normalized(), size * 0.26);
+    }
+    leaf(painter, at + inward * size * 0.35, (along * 0.9 + inward * 0.4).normalized(), size * 0.22);
+}
+
+/// a small heart, the game's coin, centred on `at`.
+fn heart(painter: &egui::Painter, at: egui::Pos2, size: f32) {
+    use egui::pos2;
+    painter.circle_filled(pos2(at.x - size * 0.5, at.y - size * 0.25), size * 0.56, RED);
+    painter.circle_filled(pos2(at.x + size * 0.5, at.y - size * 0.25), size * 0.56, RED);
+    let points = vec![pos2(at.x - size * 1.04, at.y - size * 0.1), pos2(at.x + size * 1.04, at.y - size * 0.1), pos2(at.x, at.y + size * 1.1)];
+    painter.add(egui::Shape::convex_polygon(points, RED, egui::Stroke::NONE));
+}
 
 /// lays the controls panel out at a scale, its sections in columns, painting
-/// it at `at` when given, and says how big it is.
+/// it at `at` when given, and says how big it is. it is drawn as the game's
+/// own menus are: ink on parchment with vines in the corners, a heavy title
+/// over a rainbow flourish, headings on slanted black plates, keys as white
+/// pills and a black strip of advice at the foot.
 fn controls_panel(
     painter: &egui::Painter,
     columns: &[&[(&str, Vec<ControlRow>)]],
@@ -1018,21 +1087,26 @@ fn controls_panel(
     at: Option<egui::Pos2>,
     active: &str,
 ) -> Vec2 {
-    use egui::{pos2, vec2, FontId, Rect, Shape, Stroke, StrokeKind};
+    use egui::{pos2, vec2, CornerRadius, FontId, Rect, Shape, Stroke, StrokeKind};
+    const TIP: &str = "The aim in use is lit in red";
     let unit = |v: f32| v * scale;
     let (pad, cap_h, cap_pad, gap, row_gap, section_gap, column_gap) =
-        (unit(14.0), unit(19.0), unit(6.0), unit(4.0), unit(5.0), unit(9.0), unit(18.0));
+        (unit(14.0), unit(19.0), unit(7.0), unit(4.0), unit(5.0), unit(10.0), unit(22.0));
+    let (plate_pad, slant, footer_h) = (unit(7.0), unit(4.0), unit(20.0));
     let layout = |text: &str, size: f32, color| painter.layout_no_wrap(text.to_owned(), FontId::proportional(unit(size)), color);
-    let title = layout("CONTROLS", 15.0, GOLD);
-    let heading_h = layout("MOVE", 10.0, SKY).size().y;
+    let title = layout("CONTROLS", 19.0, INK);
+    let tip = layout(TIP, 11.0, Color32::WHITE);
+    let plate = |name: &str| layout(name, 10.0, Color32::WHITE).size() + vec2(2.0 * plate_pad + slant, unit(4.0));
+    let plate_h = plate("MOVE").y;
     let row_width = |row: &ControlRow| {
-        let caps: f32 = row.keys.iter().map(|key| layout(key, 11.0, CAP_TEXT).size().x + 2.0 * cap_pad + gap).sum();
-        caps + unit(6.0) + layout(row.does, 12.0, TEXT).size().x
+        let caps: f32 = row.keys.iter().map(|key| layout(key, 11.0, INK).size().x + 2.0 * cap_pad + gap).sum();
+        caps + unit(6.0) + layout(row.does, 12.0, INK).size().x
     };
     let column_size = |sections: &[(&str, Vec<ControlRow>)]| {
-        let width = sections.iter().flat_map(|(_, rows)| rows).map(row_width).fold(0.0, f32::max);
+        let rows_width = sections.iter().flat_map(|(_, rows)| rows).map(row_width).fold(0.0, f32::max);
+        let width = sections.iter().map(|(name, _)| plate(name).x).fold(rows_width, f32::max);
         let rows = sections.iter().map(|(_, rows)| rows.len()).sum::<usize>() as f32;
-        let height = sections.len() as f32 * (heading_h + unit(3.0))
+        let height = sections.len() as f32 * (plate_h + unit(5.0))
             + rows * (cap_h + row_gap)
             + (sections.len() as f32 - 1.0).max(0.0) * section_gap;
         vec2(width, height)
@@ -1042,34 +1116,61 @@ fn controls_panel(
         sizes.iter().map(|size| size.x).sum::<f32>() + column_gap * (sizes.len() as f32 - 1.0),
         sizes.iter().map(|size| size.y).fold(0.0, f32::max),
     );
-    let inner_width = body.x.max(title.size().x + unit(60.0));
+    // room beside the title for the vines in the corners
+    let inner_width = body.x.max(title.size().x + unit(100.0)).max(tip.size().x + unit(16.0));
     let width = inner_width + 2.0 * pad;
-    let height = pad * 2.0 + title.size().y + unit(12.0) + body.y;
+    let height = pad + title.size().y + unit(17.0) + body.y + unit(10.0) + footer_h;
     let Some(at) = at else { return vec2(width, height) };
 
     let panel = Rect::from_min_size(at, vec2(width, height));
-    let corner = unit(10.0);
-    painter.rect_filled(panel, corner, NIGHT);
-    // a glow toward the top, as the game's skies have
-    painter.rect_filled(Rect::from_min_max(panel.min, pos2(panel.max.x, panel.min.y + height * 0.35)), corner, NIGHT_LIGHT);
-    painter.rect_stroke(panel, corner, Stroke::new(unit(1.6), GOLD), StrokeKind::Inside);
-    painter.rect_stroke(panel.shrink(unit(4.0)), unit(7.0), Stroke::new(unit(0.6), GOLD_DIM), StrokeKind::Inside);
+    let corner = unit(8.0);
+    painter.rect_filled(panel.translate(vec2(unit(3.0), unit(4.0))), corner, SHADOW);
+    painter.rect_filled(panel, corner, PAPER);
+    // the faint ruled lines of the game's parchment
+    let mut line = panel.min.y + corner;
+    while line < panel.max.y - footer_h {
+        painter.line_segment([pos2(panel.min.x + unit(2.0), line), pos2(panel.max.x - unit(2.0), line)], Stroke::new(unit(1.0), PAPER_LINE));
+        line += unit(5.0);
+    }
+    let vine_at = unit(7.0);
+    vine(painter, panel.min + vec2(vine_at, vine_at), vec2(1.0, 0.0), vec2(0.0, 1.0), unit(40.0));
+    vine(painter, pos2(panel.max.x - vine_at, panel.min.y + vine_at), vec2(-1.0, 0.0), vec2(0.0, 1.0), unit(40.0));
 
+    // the title, heavy: a white edge, then the ink twice a hair apart
     let middle = panel.center().x;
     let mut y = panel.min.y + pad;
-    painter.galley(pos2(middle - title.size().x / 2.0, y), title.clone(), GOLD);
-    y += title.size().y + unit(5.0);
-    // a gold rule with a diamond in the middle under the title
-    let half = inner_width / 2.0;
-    painter.line_segment([pos2(middle - half, y), pos2(middle - unit(7.0), y)], Stroke::new(unit(1.0), GOLD_DIM));
-    painter.line_segment([pos2(middle + unit(7.0), y), pos2(middle + half, y)], Stroke::new(unit(1.0), GOLD_DIM));
-    let d = unit(4.0);
-    painter.add(Shape::convex_polygon(
-        vec![pos2(middle, y - d), pos2(middle + d, y), pos2(middle, y + d), pos2(middle - d, y)],
-        GOLD,
-        Stroke::NONE,
-    ));
-    let top = y + unit(7.0);
+    let title_at = pos2(middle - title.size().x / 2.0, y);
+    let edge = layout("CONTROLS", 19.0, Color32::WHITE);
+    for (dx, dy) in [(-1.0, -1.0), (0.0, -1.0), (1.0, -1.0), (-1.0, 0.0), (1.6, 0.0), (-1.0, 1.0), (0.0, 1.0), (1.6, 1.0)] {
+        painter.galley(title_at + vec2(unit(dx * 1.4), unit(dy * 1.4)), edge.clone(), Color32::WHITE);
+    }
+    painter.galley(title_at, title.clone(), INK);
+    painter.galley(title_at + vec2(unit(0.7), 0.0), title.clone(), INK);
+    y += title.size().y + unit(7.0);
+
+    // the flourish: a ribbon thick in the middle and thin at the ends,
+    // magenta to cyan, curling at both ends round a heart
+    let half = title.size().x / 2.0 + unit(26.0);
+    let steps = 48;
+    for step in 0..steps {
+        let (t0, t1) = (step as f32 / steps as f32, (step + 1) as f32 / steps as f32);
+        let (x0, x1) = (middle - half + 2.0 * half * t0, middle - half + 2.0 * half * t1);
+        // a gap for the heart
+        if ((x0 + x1) / 2.0 - middle).abs() < unit(9.0) {
+            continue;
+        }
+        let swell = 1.0 - (t0 + t1 - 1.0).abs();
+        painter.line_segment([pos2(x0, y), pos2(x1, y)], Stroke::new(unit(0.8 + 2.4 * swell), rainbow((t0 + t1) / 2.0)));
+    }
+    for (end, side, color) in [(middle - half, -1.0, MAGENTA), (middle + half, 1.0, CYAN)] {
+        let up = [pos2(end, y), pos2(end + side * unit(9.0), y), pos2(end + side * unit(9.0), y - unit(7.0)), pos2(end + side * unit(3.0), y - unit(6.0))];
+        let down = [pos2(end, y), pos2(end + side * unit(6.0), y), pos2(end + side * unit(6.0), y + unit(5.0)), pos2(end + side * unit(2.0), y + unit(4.0))];
+        for points in [up, down] {
+            painter.add(egui::epaint::CubicBezierShape::from_points_stroke(points, false, Color32::TRANSPARENT, Stroke::new(unit(1.2), color)));
+        }
+    }
+    heart(painter, pos2(middle, y), unit(4.5));
+    let top = y + unit(10.0);
 
     let mut left = panel.min.x + pad + (inner_width - body.x) / 2.0;
     for (column, size) in columns.iter().zip(&sizes) {
@@ -1078,31 +1179,43 @@ fn controls_panel(
             if index > 0 {
                 y += section_gap;
             }
-            let heading = layout(name, 10.0, SKY);
-            let heading_size = heading.size();
-            painter.galley(pos2(left, y), heading, SKY);
-            y += heading_size.y + unit(3.0);
+            // the heading on a slanted plate, black, or a red banner for the attack
+            let label = layout(name, 10.0, Color32::WHITE);
+            let size = plate(name);
+            let points = vec![pos2(left + slant, y), pos2(left + size.x, y), pos2(left + size.x - slant, y + size.y), pos2(left, y + size.y)];
+            let (fill, edge) = if *name == "ATTACK" { (RED, Stroke::new(unit(1.4), ORANGE)) } else { (INK, Stroke::NONE) };
+            painter.add(Shape::convex_polygon(points, fill, edge));
+            painter.galley(pos2(left + plate_pad + slant / 2.0, y + (size.y - label.size().y) / 2.0), label, Color32::WHITE);
+            y += plate_h + unit(5.0);
             for row in rows {
                 let mut x = left;
                 for key in &row.keys {
-                    let label = layout(key, 11.0, CAP_TEXT);
+                    // a key: a white pill on its shadow, red for the aim in use
+                    let lit = *name == "AIM" && key == active;
+                    let label = layout(key, 11.0, if lit { Color32::WHITE } else { INK });
                     let cap = Rect::from_min_size(pos2(x, y), vec2(label.size().x + 2.0 * cap_pad, cap_h));
-                    // a key cap: a shadow under it, then cream with a gold edge,
-                    // gold all over for the aim in use
-                    let lit = name == &"AIM" && key == active;
-                    painter.rect_filled(cap.translate(vec2(0.0, unit(1.5))), unit(4.0), GOLD_DIM);
-                    painter.rect_filled(cap, unit(4.0), if lit { GOLD } else { CAP });
-                    painter.rect_stroke(cap, unit(4.0), Stroke::new(unit(if lit { 2.0 } else { 1.0 }), if lit { TEXT } else { GOLD }), StrokeKind::Inside);
-                    painter.galley(cap.center() - label.size() / 2.0, label, CAP_TEXT);
+                    let round = CornerRadius::same((cap_h / 2.0).round() as u8);
+                    painter.rect_filled(cap.translate(vec2(0.0, unit(1.8))), round, PAPER_SHADOW);
+                    painter.rect_filled(cap, round, if lit { RED } else { Color32::WHITE });
+                    let stroke = if lit { Stroke::new(unit(1.8), ORANGE) } else { Stroke::new(unit(1.1), INK) };
+                    painter.rect_stroke(cap, round, stroke, StrokeKind::Inside);
+                    painter.galley(cap.center() - label.size() / 2.0, label, INK);
                     x = cap.max.x + gap;
                 }
-                let does = layout(row.does, 12.0, TEXT);
-                painter.galley(pos2(x + unit(6.0), y + (cap_h - does.size().y) / 2.0), does, TEXT);
+                let does = layout(row.does, 12.0, INK);
+                painter.galley(pos2(x + unit(6.0), y + (cap_h - does.size().y) / 2.0), does, INK);
                 y += cap_h + row_gap;
             }
         }
         left += size.x + column_gap;
     }
+
+    // the black strip at the foot, as the game explains its menus
+    let c = corner.round() as u8;
+    let footer = Rect::from_min_max(pos2(panel.min.x, panel.max.y - footer_h), panel.max);
+    painter.rect_filled(footer, CornerRadius { nw: 0, ne: 0, sw: c, se: c }, INK);
+    painter.galley(footer.center() - tip.size() / 2.0, tip, Color32::WHITE);
+    painter.rect_stroke(panel, corner, Stroke::new(unit(1.5), INK), StrokeKind::Inside);
     vec2(width, height)
 }
 
@@ -1128,8 +1241,8 @@ fn split_columns<'a>(sections: &'a [(&'a str, Vec<ControlRow>)], count: usize) -
 /// rectangle, in points, and however many columns suit it, up to its full
 /// size, and nowhere when it would be too small to read. it only paints, so
 /// clicks go through to the screens.
-// ponytail: switched off for now, set true to bring the panel and its setting back.
-pub const CONTROLS_HINT_ENABLED: bool = false;
+// ponytail: a switch for the panel and its setting; set false to hide both.
+pub const CONTROLS_HINT_ENABLED: bool = true;
 
 pub fn controls_hint(ctx: &egui::Context, free: &[egui::Rect], keys: &Keys, active: &str) {
     const SMALLEST: f32 = 0.6;
