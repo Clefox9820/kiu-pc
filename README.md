@@ -139,6 +139,29 @@ gameplay once warm.
 If you still see stutter, the log at `%APPDATA%\zakuro\zakuro.log` contains
 `hitch:` lines with a per-frame breakdown; include them in a bug report.
 
+## Single screen (work in progress)
+
+The goal is to play on the top screen alone. So far:
+
+- `ZAKURO_PORTRAITS=1` draws the dialogue portraits from the bottom screen
+  on the top screen as well: smaller, in the lower left or right corner on
+  the speaker's side, beside the subtitles, fading in, out and between
+  pictures. The game's own draws are reused, so expressions stay the
+  game's. It is off unless set, because it recognises portraits by their
+  shape (a 256x256 Etc1 picture on the bottom screen), which another game
+  could also draw.
+- Not done yet: the subtitles still show in the bottom screen's dialogue
+  box during battles, and the powers, hearts and other bottom-screen HUD
+  stay there.
+
+Tools used to work on it:
+
+- `ZAKURO_LOAD_SLOT=<1-9>` starts the game from that save-state slot, for
+  runs that should begin at the same place.
+- `ZAKURO_LOG_DRAWS=1` logs each texture drawn and the buffer it goes into,
+  named as `ZAKURO_DUMP_TEXTURES=<folder>` saves the pictures, to tell which
+  draws are which. It slows drawing.
+
 ## Status and known issues
 
 - The game runs with the recompiled code; about 99.4% of executed
