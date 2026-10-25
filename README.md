@@ -91,7 +91,7 @@ Defaults are laid out for this game. They can be changed in
 | Shift | Walk |
 | Mouse | Aim (stylus) |
 | Left click / Space | Fire (L) |
-| Hold right click | Steady aim |
+| Hold right click | On foot (mode 3): put the stylus down and drag the aim |
 | Mouse wheel / Q, E | Pick power (D-pad left/right) |
 | Middle click / F | Use power (D-pad down) |
 | C | D-pad up |
@@ -103,7 +103,7 @@ Defaults are laid out for this game. They can be changed in
 | Numpad | C-Stick |
 | 1 | Mouse aim off |
 | 2 | Mouse aim for flying: the stylus follows the mouse, kept inside the screen |
-| 3 | Mouse aim on foot: dragging that holds still, then lifts and recenters horizontally |
+| 3 | Mouse aim on foot: hold right click to drag; letting go lifts the stylus without a flick, and long drags recenter horizontally |
 | Esc | Emulator menu |
 | F11 | Fullscreen |
 | F1 | Pause |

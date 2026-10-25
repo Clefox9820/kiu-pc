@@ -567,7 +567,7 @@ impl ApplicationHandler for App {
                     self.keyboard.mouse_button(PadState::DOWN, state == ElementState::Pressed);
                 }
                 if button == MouseButton::Right && self.keyboard.aiming() {
-                    self.keyboard.precise(state == ElementState::Pressed);
+                    self.keyboard.stylus(state == ElementState::Pressed);
                 } else if button == MouseButton::Right {
                     let pressed = state == ElementState::Pressed && !self.pointer_taken(consumed);
                     self.tilting_from = pressed.then_some(self.cursor);

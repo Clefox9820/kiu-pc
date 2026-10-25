@@ -25,8 +25,8 @@ pub struct Keyboard {
     /// meanwhile, put down once it is there.
     wrap: Option<Wrap>,
     pending: (f32, f32),
-    /// the right button, which stops land aim from jumping back.
-    precise: bool,
+    /// the right button, which holds land aim's stylus on the screen.
+    held: bool,
     /// the left button, which fires (L) while aiming.
     fire: bool,
     /// Shift, which pushes the circle pad halfway, to walk.
@@ -92,7 +92,7 @@ impl Keyboard {
         self.touch = None;
         self.tilt = [0.0; 2];
         self.fire = false;
-        self.precise = false;
+        self.held = false;
         self.walk = false;
         self.mouse_buttons = PadState::default();
         self.wheel = None;
@@ -105,7 +105,12 @@ impl Keyboard {
         self.wrap = None;
         self.pending = (0.0, 0.0);
         self.fire = false;
-        self.precise = false;
+        self.held = false;
+    }
+
+    /// land aim's stylus is off the screen, the right button not holding it.
+    fn up(&self) -> bool {
+        self.aim_mode == AimMode::Land && !self.held
     }
 
     pub fn aiming(&self) -> bool {
@@ -116,12 +121,16 @@ impl Keyboard {
     /// down stop at the edges; across, land aim goes back to the middle past
     /// its reach and the air's stops at the edges too.
     pub fn aim_by(&mut self, dx: f32, dy: f32) {
+        // land aim drags only while the right button holds the stylus down
+        if self.up() {
+            return;
+        }
         if self.wrap.is_some() {
             self.pending.0 += dx;
             self.pending.1 += dy;
             return;
         }
-        let wraps = self.aim_mode == AimMode::Land && !self.precise;
+        let wraps = self.aim_mode == AimMode::Land;
         let Some((x, y)) = &mut self.aim else { return };
         *y = (*y + dy).clamp(0.0, TOUCH_HEIGHT - 1.0);
         let middle = TOUCH_WIDTH / 2.0;
@@ -139,9 +148,27 @@ impl Keyboard {
         self.aiming().then_some(self.aim_mode)
     }
 
-    /// the right button, held for land aim that doesn't jump back.
-    pub fn precise(&mut self, held: bool) {
-        self.precise = held && self.aiming();
+    /// the right button, which puts land aim's stylus down in the middle and
+    /// drags it. letting go holds it still first, so lifting is no flick.
+    pub fn stylus(&mut self, held: bool) {
+        if !self.aiming() || self.aim_mode != AimMode::Land || held == self.held {
+            return;
+        }
+        self.held = held;
+        match (held, self.wrap) {
+            // pressed again before it lifted: it never left, the drag goes on
+            (true, Some(Wrap::Holding(_))) => self.wrap = None,
+            // still lifting: it comes down in the middle by itself
+            (true, Some(Wrap::Lifted(_))) => {}
+            (true, None) => {
+                if let Some((x, _)) = &mut self.aim {
+                    *x = TOUCH_WIDTH / 2.0;
+                }
+            }
+            // already on its way up
+            (false, Some(_)) => self.pending = (0.0, 0.0),
+            (false, None) => self.wrap = Some(Wrap::Holding(HOLD_FRAMES)),
+        }
     }
 
     pub fn fire(&mut self, pressed: bool) {
@@ -249,6 +276,7 @@ impl Keyboard {
         }
         let touch = match self.aim {
             Some(_) if matches!(self.wrap, Some(Wrap::Lifted(_))) => None,
+            Some(_) if self.wrap.is_none() && self.up() => None,
             Some((x, y)) => Some((x as u16, y as u16)),
             None => self.touch,
         };
@@ -308,6 +336,7 @@ mod tests {
     fn land_aim_holds_still_then_lifts_then_goes_on_from_the_middle() {
         let mut keyboard = Keyboard::new(Keys::default());
         keyboard.set_aim(Some(AimMode::Land));
+        keyboard.stylus(true);
         keyboard.aim_by(0.0, 20.0);
         keyboard.aim_by(150.0, 0.0);
         // still at the edge of its reach, so lifting is no flick
@@ -324,9 +353,36 @@ mod tests {
         assert_eq!(keyboard.state().touch, Some((190, 140)), "down in the middle, on by what came meanwhile, y kept");
         keyboard.aim_by(0.0, 500.0);
         assert_eq!(keyboard.state().touch, Some((190, 239)), "up and down stop at the edge");
-        keyboard.precise(true);
-        keyboard.aim_by(200.0, 0.0);
-        assert_eq!(keyboard.state().touch, Some((319, 239)), "held right button, no going back");
+    }
+
+    #[test]
+    fn land_aim_drags_only_while_the_right_button_holds_the_stylus() {
+        let mut keyboard = Keyboard::new(Keys::default());
+        keyboard.set_aim(Some(AimMode::Land));
+        keyboard.aim_by(30.0, 0.0);
+        assert_eq!(keyboard.state().touch, None, "up until the right button");
+        keyboard.stylus(true);
+        assert_eq!(keyboard.state().touch, Some((160, 120)), "down in the middle");
+        keyboard.aim_by(20.0, 10.0);
+        assert_eq!(keyboard.state().touch, Some((180, 130)));
+        keyboard.stylus(false);
+        keyboard.aim_by(40.0, 0.0);
+        for _ in 0..HOLD_FRAMES {
+            assert_eq!(keyboard.state().touch, Some((180, 130)), "holds still before lifting, no flick");
+            keyboard.frame_done();
+        }
+        for _ in 0..LIFT_FRAMES + 3 {
+            assert_eq!(keyboard.state().touch, None, "stays up");
+            keyboard.frame_done();
+        }
+        keyboard.stylus(true);
+        assert_eq!(keyboard.state().touch, Some((160, 130)), "down in the middle again, y kept");
+        keyboard.stylus(false);
+        keyboard.stylus(true);
+        keyboard.aim_by(5.0, 0.0);
+        assert_eq!(keyboard.state().touch, Some((165, 130)), "pressed again before lifting, the drag goes on");
+        keyboard.key(PhysicalKey::Code(KeyCode::Space), true);
+        assert!(keyboard.state().buttons.contains(PadState::L), "Space fires");
     }
 
     #[test]
