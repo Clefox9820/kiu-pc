@@ -1213,9 +1213,11 @@ fn onto_top(registers: &[u32], [address, format, dimensions]: [u32; 3], scale: f
 /// the lower corner on its side, beside the subtitles. flush_portraits
 /// draws it there.
 fn mirror_portrait(registers: &[u32], resources: &mut Resources, vertices: Vertices) {
-    /// how big the portrait is on the top screen, and how far from its side.
+    /// how big the portrait is on the top screen, and how far from its side:
+    /// none, the bottom screen's side edge cuts some, and that cut goes on
+    /// the top screen's side edge so it does not show either.
     const SCALE: f32 = 0.4;
-    const MARGIN: f32 = 4.0;
+    const MARGIN: f32 = 0.0;
     let Some(top) = resources.portraits.top else { return };
     let Some(vertices) = shaded_in_order(registers, vertices) else { return };
     // the screen's edge cuts it, so that edge goes on the top screen's
@@ -6098,10 +6100,10 @@ mod tests {
             assert_eq!(draw.registers[REG_DEPTH_COLOR_MASK] & (1 | 1 << 12), 0, "no depth");
             (signed10(xy), signed10(xy >> 16))
         };
-        // the cut edge at 0, the side 4 pixels in: 4 - 40 * 0.4
-        assert_eq!(placed(0), (0, -12));
-        // 60 * 0.4 below, and 400 - 4 - 280 * 0.4 along
-        assert_eq!(placed(1), (-24, 284));
+        // the cut edge at 0, the side against its edge: -40 * 0.4
+        assert_eq!(placed(0), (0, -16));
+        // 60 * 0.4 below, and 400 - 280 * 0.4 along
+        assert_eq!(placed(1), (-24, 288));
     }
 
     /// a draw inside the counters' island goes under the score on the top
