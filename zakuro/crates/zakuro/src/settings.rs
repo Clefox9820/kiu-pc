@@ -27,10 +27,13 @@ pub enum Screens {
     TopOnly,
     BottomOnly,
     LargeTop,
+    /// the top screen alone while the game is in play, the bottom one over
+    /// it in menus, where the game is played on the bottom screen.
+    Auto,
 }
 
 impl Screens {
-    pub const ALL: [Screens; 5] = [Screens::Stacked, Screens::SideBySide, Screens::LargeTop, Screens::TopOnly, Screens::BottomOnly];
+    pub const ALL: [Screens; 6] = [Screens::Stacked, Screens::SideBySide, Screens::LargeTop, Screens::TopOnly, Screens::BottomOnly, Screens::Auto];
 
     pub fn name(self) -> &'static str {
         match self {
@@ -39,11 +42,22 @@ impl Screens {
             Screens::TopOnly => "Top screen only",
             Screens::BottomOnly => "Bottom screen only",
             Screens::LargeTop => "Big top screen, small bottom one",
+            Screens::Auto => "Top screen, the bottom one over it in menus",
+        }
+    }
+
+    /// the screens shown, in play or in a menu, which only Auto tells apart.
+    pub fn screens_in(self, in_play: bool) -> ScreenLayout {
+        match self {
+            Screens::Auto if in_play => ScreenLayout::TopOnly,
+            Screens::Auto => ScreenLayout::BottomOverTop,
+            other => other.screens(),
         }
     }
 
     pub fn screens(self) -> ScreenLayout {
         match self {
+            Screens::Auto => ScreenLayout::TopOnly,
             Screens::Stacked => ScreenLayout::Stacked,
             Screens::SideBySide => ScreenLayout::SideBySide,
             Screens::TopOnly => ScreenLayout::TopOnly,

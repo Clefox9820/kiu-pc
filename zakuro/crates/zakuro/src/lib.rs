@@ -310,6 +310,11 @@ fn run_headless(system: &mut System, frames: u64) {
     }
 }
 
+/// frames without a game override saying the game is in play before it is
+/// taken to be in a menu. the overrides say it once a tick, every second
+/// frame for Kid Icarus.
+const IN_PLAY_QUIET: u32 = 10;
+
 /// a game being played.
 struct Running {
     system: System,
@@ -557,7 +562,7 @@ impl ApplicationHandler for App {
         match backend {
             Ok((window, mut backend)) => {
                 log::info!("presenting with the {} backend", backend.name());
-                backend.set_layout(self.layout.screens());
+                backend.set_layout(self.screens());
                 backend.set_top_width(self.settings.top_shape.width());
                 backend.set_scaling(self.settings.filter.screens(), self.settings.integer_scale);
                 backend.set_stereo(self.settings.stereo());
@@ -960,7 +965,7 @@ impl App {
     fn touch(&mut self) {
         let Some(window) = &self.window else { return };
         let size = window.inner_size();
-        let (_, bottom) = layout(size.width, size.height, self.layout.screens(), self.top_shape.width(), self.settings.integer_scale);
+        let (_, bottom) = layout(size.width, size.height, self.screens(), self.top_shape.width(), self.settings.integer_scale);
         // with the top screen alone there is nothing to touch
         let Some(bottom) = bottom else {
             self.keyboard.touch(None);
@@ -1064,6 +1069,13 @@ impl App {
 
     /// puts the screens' arrangement and the window scale to use, sizing
     /// the window to them.
+    /// the screens shown now, the automatic layout's by whether the game is
+    /// in play; before a game runs, as in menus.
+    fn screens(&self) -> zakuro_gpu::ScreenLayout {
+        let in_play = self.game.as_ref().is_some_and(|game| game.out_of_play <= IN_PLAY_QUIET);
+        self.layout.screens_in(in_play)
+    }
+
     fn apply_layout(&mut self) {
         if let Some(backend) = &mut self.backend {
             backend.set_top_width(self.settings.top_shape.width());
@@ -1075,8 +1087,9 @@ impl App {
             self.scale = scale;
             self.layout = self.settings.layout;
             self.top_shape = self.settings.top_shape;
+            let screens = self.screens();
             if let Some(backend) = &mut self.backend {
-                backend.set_layout(self.layout.screens());
+                backend.set_layout(screens);
             }
             // a full screen or maximized window keeps its size, resizing
             // it would take it out of that, full screen fits it on leaving
@@ -1446,10 +1459,18 @@ impl App {
             }
         }
         let Some(game) = &mut self.game else { return };
-        // in play while the overrides say so, once a tick, every second
-        // frame for Kid Icarus; ten frames quiet is a menu
+        // in play while the overrides say so, see IN_PLAY_QUIET
+        let was_in_play = game.out_of_play <= IN_PLAY_QUIET;
         game.out_of_play = if said != 0 { 0 } else { game.out_of_play.saturating_add(1) };
-        game.system.gpu.set_in_play(game.out_of_play <= 10);
+        let in_play = game.out_of_play <= IN_PLAY_QUIET;
+        game.system.gpu.set_in_play(in_play);
+        // the automatic layout shows the bottom screen over the top one in
+        // menus, where the game is played on it
+        if in_play != was_in_play && self.layout == Screens::Auto {
+            if let Some(backend) = &mut self.backend {
+                backend.set_layout(self.layout.screens_in(in_play));
+            }
+        }
         let input = match &mut game.replay {
             Some(replay) => replay.input(game.frame),
             None => self.gamepads.apply(self.keyboard.state()),
@@ -1734,11 +1755,12 @@ impl App {
         });
         // where the controls can go, the window's pixels no screen covers, while
         // a game runs without the 3D, which places the screens otherwise
+        let screens = self.layout.screens_in(self.game.as_ref().is_some_and(|game| game.out_of_play <= IN_PLAY_QUIET));
         let free = (menus::CONTROLS_HINT_ENABLED && self.game.is_some() && self.settings.show_controls &&self.settings.stereo == settings::Stereo3d::Off)
             .then(|| {
                 let size = window.inner_size();
                 let (top, bottom) =
-                    layout(size.width, size.height, self.layout.screens(), self.top_shape.width(), self.settings.integer_scale);
+                    layout(size.width, size.height, screens, self.top_shape.width(), self.settings.integer_scale);
                 free_regions(size.width as f32, size.height as f32, &[top, bottom].into_iter().flatten().collect::<Vec<_>>())
             })
             .unwrap_or_default();

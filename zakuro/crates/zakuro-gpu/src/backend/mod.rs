@@ -103,6 +103,9 @@ pub enum ScreenLayout {
     BottomOnly,
     /// the top screen big, the bottom one small at its lower right.
     LargeTop,
+    /// the top screen, with the bottom one over its middle, for menus played
+    /// on the bottom screen while the window keeps the top screen's shape.
+    BottomOverTop,
 }
 
 /// how the screens' pixels are drawn when scaled to the window.
@@ -141,7 +144,7 @@ impl ScreenLayout {
         match self {
             ScreenLayout::Stacked => (top_width.max(320.0), 480.0),
             ScreenLayout::SideBySide => (top_width + 320.0, 240.0),
-            ScreenLayout::TopOnly => (top_width, 240.0),
+            ScreenLayout::TopOnly | ScreenLayout::BottomOverTop => (top_width, 240.0),
             ScreenLayout::BottomOnly => (320.0, 240.0),
             ScreenLayout::LargeTop => (top_width + LARGE_TOP_BOTTOM.0 as f32, 240.0),
         }
@@ -155,6 +158,9 @@ pub const TOP_WIDTH: f32 = 400.0;
 
 /// the bottom screen's size next to the big top one, half the console's.
 const LARGE_TOP_BOTTOM: (u32, u32) = (160, 120);
+
+/// how big the bottom screen is over the top one, for the top's scale.
+const BOTTOM_OVER_TOP: f32 = 0.9;
 
 /// works out where the screens go inside a window, keeping the 3DS's
 /// aspect ratio, or the top screen top_w wide, and centring them, scaled by
@@ -203,6 +209,17 @@ pub fn layout(window_width: u32, window_height: u32, arrangement: ScreenLayout, 
             Some(Viewport {
                 x: offset_x + top_w * scale,
                 y: offset_y + 240.0 * scale - 240.0 * small,
+                width: 320.0 * small,
+                height: 240.0 * small,
+            })
+        }
+        ScreenLayout::BottomOverTop => {
+            // nine tenths of the top screen's height, in its middle, so its
+            // edges still show around it
+            let small = BOTTOM_OVER_TOP * scale;
+            Some(Viewport {
+                x: offset_x + (top_w * scale - 320.0 * small) / 2.0,
+                y: offset_y + (240.0 * scale - 240.0 * small) / 2.0,
                 width: 320.0 * small,
                 height: 240.0 * small,
             })
@@ -358,6 +375,21 @@ mod tests {
         let top = layout(1000, 480, ScreenLayout::Stacked, TOP_WIDTH, false).0.unwrap();
         assert_eq!(top.width, 400.0);
         assert_eq!(top.x, 300.0);
+    }
+
+    /// the bottom screen over the top one: the window keeps the top screen's
+    /// shape, and the bottom screen sits in its middle at nine tenths of its
+    /// height, drawn after it so it shows on top.
+    #[test]
+    fn the_bottom_screen_goes_over_the_middle_of_the_top_one() {
+        assert_eq!(ScreenLayout::BottomOverTop.size(TOP_WIDTH), (400, 240));
+        let (top, bottom) = layout(800, 480, ScreenLayout::BottomOverTop, TOP_WIDTH, false);
+        let (top, bottom) = (top.unwrap(), bottom.unwrap());
+        assert_eq!((top.x, top.y, top.width, top.height), (0.0, 0.0, 800.0, 480.0));
+        assert_eq!((bottom.width, bottom.height), (576.0, 432.0));
+        assert_eq!((bottom.x, bottom.y), (112.0, 24.0));
+        let shown: Vec<Shown> = place(800, 480, ScreenLayout::BottomOverTop, TOP_WIDTH, false, Stereo::default(), false).into_iter().map(|(_, shown)| shown).collect();
+        assert_eq!(shown, [Shown::Top, Shown::Bottom]);
     }
 
     #[test]

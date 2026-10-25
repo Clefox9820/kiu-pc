@@ -160,6 +160,12 @@ The goal is to play on the top screen alone. So far:
   the top screen's subtitles a dark drop shadow so they read over bright
   scenes. It is off unless set, because it recognises portraits and
   subtitles by their shape, which another game could also draw.
+- The screen layout "Top screen, the bottom one over it in menus" (`auto`
+  in `settings.toml`) shows the top screen alone in battle and the bottom
+  screen over its middle when the game is not in play: the title, the
+  temple's menus, results and the pause menu. The mouse touches it there.
+  It follows the same in-play signal, so it also shows during cutscenes
+  and loading.
 - Subtitles on the top screen are the game's own option. The game applies
   it when a chapter starts, so a save state from the middle of a chapter
   keeps what was set then.
