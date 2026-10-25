@@ -14,7 +14,8 @@ Load when building the game for the first time, rebuilding after a change in `za
 ## Hard Rules
 
 - Never commit or share anything under `build/` or `tools/`; it is game code or machine-specific. Load `kiu-publish-guard` before any commit.
-- Never start `3dsrecomp port` or a full build while the user is playing; it evicts the game's preloaded RAM and causes hitches.
+- Never start `3dsrecomp port` while the user is playing; it evicts the game's preloaded RAM and causes hitches. A `cargo build` is fine through `build\compilar.ps1`, which drops to idle priority while they play.
+- On the maintainer's PC the game they play is built from `E:\3dsrecomp-work\kid-icarus`, which links `E:\3dsrecomp-work\zakuro-latest`, not this repo's `zakuro/` (`build/port` holds only `code/`). Copy each changed `zakuro/` file there with CRLF line endings (`sed 's/\r$//; s/$/\r/'`), back up the original first, then run `build\compilar.ps1`.
 - Close RAM-heavy apps before `3dsrecomp port`: it measures free RAM once at start to size parallel gcc jobs. Closing apps mid-run does not help; restart it instead.
 - Keep the GNU toolchain: Rust `x86_64-pc-windows-gnu` with MinGW gcc (`CC=gcc`, `AR=ar`). Do not mix with MSVC.
 - Never edit `build/port/code/` by hand; it is generated. Change game behaviour with overrides (`kiu-override-re`).
@@ -27,7 +28,7 @@ Load when building the game for the first time, rebuilding after a change in `za
 |---|---|
 | First build | `scripts\setup.ps1 -Rom <rom>` (about 1 h) |
 | ROM unsure | `scripts\setup.ps1 -Rom <rom> -CheckOnly` |
-| Only `zakuro/` changed | `cargo build --release` in `build/port` and in `build/port-usa` (2-10 min each) |
+| Only `zakuro/` changed | `cargo build --release` in `build/port` and in `build/port-usa` (2-10 min each); on the maintainer's PC, copy to `zakuro-latest` and run `build\compilar.ps1` (3-4 min at full speed) |
 | An override changed or was added, or 3dsrecomp/hints changed | `find-usa-addresses.ps1` first, then `scripts\setup.ps1 -Rom <rom> -Force` once with each ROM (about 1 h each) |
 
 ## Execution Steps
