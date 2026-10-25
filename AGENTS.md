@@ -22,3 +22,6 @@ Always:
 - Reply to the maintainer in Spanish; write code, comments and docs in English.
 - Use Conventional Commits without AI attribution lines.
 - Measure before changing performance code, and report what was not verified.
+- Keep both releases working: Europe (`build/port`) and USA (`build/port-usa`).
+  A change to `overrides/` needs its USA addresses (`scripts/find-usa-addresses.ps1`)
+  and a rebuild of both; see `kiu-build`.

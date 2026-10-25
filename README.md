@@ -1,7 +1,8 @@
 # kiu-pc
 
-A PC build of the Nintendo 3DS game *Kid Icarus: Uprising* (title ID
-`0004000000030200`), made from your own copy of the game.
+A PC build of the Nintendo 3DS game *Kid Icarus: Uprising* (European
+release `0004000000030200` or USA release `0004000000030100`), made from your
+own copy of the game.
 
 The game's ARM CPU code is statically recompiled to C with
 [3dsrecomp](https://github.com/fearkov/3dsrecomp) (pinned at commit
@@ -67,7 +68,8 @@ The script:
 1. Checks that the ROM is *Kid Icarus: Uprising* and is decrypted.
 2. Installs gcc and Rust into `tools/`.
 3. Clones and builds 3dsrecomp at the pinned commit.
-4. Translates the game's code into `build/port`.
+4. Translates the game's code into `build/port` (`build/port-usa` for the
+   USA release).
 5. Builds the port against `zakuro/` with optimizations for your CPU.
 6. Writes `Play.bat` in the repository root.
 
@@ -76,7 +78,7 @@ Options:
 | Switch | Effect |
 | --- | --- |
 | `-CheckOnly` | Only verify that the ROM is the right game and decrypted, then stop |
-| `-Force` | Translate the game again even if `build/port` already exists |
+| `-Force` | Translate the game again even if `build/port` (or `build/port-usa`) already exists |
 
 When it finishes, start the game with `Play.bat`.
 
@@ -151,6 +153,12 @@ If you still see stutter, the log at `%APPDATA%\zakuro\zakuro.log` contains
   overrides in `overrides/`, found for the European release
   (`0004000000030200`) and not yet confirmed in real play. Builds made
   before it was added need `scripts\setup.ps1 -Force` to get it.
+- For the USA release, `scripts\setup.ps1` writes a copy of the overrides to
+  `build/overrides-usa` with that release's addresses, listed in the script.
+  The functions were matched by their code but have not been tried in play.
+  A new override needs its USA address added there too:
+  `scripts\find-usa-addresses.ps1 -Europe <eur rom> -Usa <usa rom>` finds
+  them from both ROMs and checks the table. It prints only addresses.
 - Widescreen would need more 3dsrecomp overrides and is not done.
 - The changes to Zakuro in this repository were written with AI assistance.
   They have not been sent upstream; the Zakuro author does not accept fully

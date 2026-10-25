@@ -34,7 +34,19 @@ $ErrorActionPreference = "Stop"
 $ProgressPreference = "SilentlyContinue"
 
 # the versions this port was made and tested with
-$Title = "0004000000030200"
+$Europe = "0004000000030200"
+$Usa = "0004000000030100"
+# the overrides in overrides\ name the European release's addresses; these are
+# the same functions in the USA one, found by matching their code
+$UsaAddresses = @{
+    "0x006EA18C" = "0x006EA040"
+    "0x00A3F050" = "0x00A3EDCC"
+    "0x0074643C" = "0x007462A4"
+    "0x006D2C08" = "0x006D2ABC"
+    "0x00A426AC" = "0x00A42428"
+    "0x0070419C" = "0x00704004"
+    "0x00606534" = "0x006063E8"
+}
 $RecompRepo = "https://github.com/fearkov/3dsrecomp"
 $RecompCommit = "c3f21f94ba50d688025febc8974ff348d471b587"
 $WinLibsUrl = "https://github.com/brechtsanders/winlibs_mingw/releases/download/16.2.0posix-23.1.3-14.0.0-ucrt-r3/winlibs-x86_64-posix-seh-gcc-16.2.0-mingw-w64ucrt-14.0.0-r3.zip"
@@ -73,10 +85,15 @@ try {
     [void]$stream.Read($ncch, 0, 0x200)
 } finally { $stream.Close() }
 $programId = ([BitConverter]::ToUInt64($ncch, 0x118)).ToString("X16")
-if ($programId -ne $Title) { Fail "this ROM is $programId, not Kid Icarus Uprising ($Title)" }
+if ($programId -ne $Europe -and $programId -ne $Usa) {
+    Fail "this ROM is $programId, not Kid Icarus Uprising (Europe $Europe or USA $Usa)"
+}
+$Region = if ($programId -eq $Usa) { "USA" } else { "Europe" }
+# each release in its own folder, so building one keeps the other
+if ($programId -eq $Usa) { $Port = Join-Path $Build "port-usa" }
 # NCCH flags byte 7, bit 2: no encryption
 if (($ncch[0x18F] -band 4) -eq 0) { Fail "the ROM is encrypted; dump it decrypted from your own console" }
-Write-Host "Kid Icarus Uprising, decrypted: OK"
+Write-Host "Kid Icarus Uprising ($Region), decrypted: OK"
 if ($CheckOnly) { exit 0 }
 
 # --- tools, inside the repository so nothing else on the system changes ----
@@ -122,6 +139,26 @@ Step "Translating the game's code (the first time takes about an hour)"
 if ($Force -and (Test-Path $Port)) { Remove-Item -Recurse -Force $Port }
 if (-not (Test-Path (Join-Path $Port "code\librecomp.a"))) {
     $Overrides = Join-Path $Root "overrides"
+    if ($programId -eq $Usa) {
+        # a copy of the overrides with the USA release's addresses
+        $moved = Join-Path $Build "overrides-usa"
+        New-Item -ItemType Directory -Force -Path $moved | Out-Null
+        Get-ChildItem -Path $moved -Filter *.c | Remove-Item
+        foreach ($file in Get-ChildItem -Path $Overrides -Filter *.c) {
+            $source = Get-Content -Raw $file.FullName
+            foreach ($mark in [regex]::Matches($source, 'RECOMP_(?:OVERRIDE|ORIGINAL)\((0x[0-9A-Fa-f]+)\)')) {
+                $address = $mark.Groups[1].Value
+                if (-not $UsaAddresses.ContainsKey($address)) {
+                    Fail "$($file.Name) overrides $address, which has no USA address in setup.ps1 yet"
+                }
+            }
+            $source = [regex]::Replace($source, '0x[0-9A-Fa-f]{8}', {
+                param($m) if ($UsaAddresses.ContainsKey($m.Value)) { $UsaAddresses[$m.Value] } else { $m.Value }
+            })
+            Set-Content -NoNewline -Path (Join-Path $moved $file.Name) -Value $source
+        }
+        $Overrides = $moved
+    }
     Run $RecompExe @("port", $Rom, $Port, "--name", "kid-icarus", "--overrides", $Overrides) $Build
 } else {
     Write-Host "already translated, in build\port (-Force translates again)"
