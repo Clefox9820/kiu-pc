@@ -91,10 +91,10 @@ pub const GAME_FLYING: u32 = 2;
 /// overrides say it once per tick, every second frame for Kid Icarus.
 const QUIET_FRAMES: u8 = 10;
 
-/// flying, the mouse moves the reticle straight across a 400 pixel screen, so
-/// slow movement is eased for small, precise corrections while a quick sweep
-/// still crosses the screen: the gain goes smoothly from AIM_SLOW_GAIN at
-/// rest to 1 at AIM_KNEE pixels a frame (after the speed setting).
+/// the mouse moves the reticle or turns the camera straight, so slow movement
+/// is eased for small, precise corrections while a quick sweep still goes
+/// far: the gain goes smoothly from AIM_SLOW_GAIN at rest to 1 at AIM_KNEE
+/// pixels a frame (after the speed setting).
 const AIM_SLOW_GAIN: f32 = 0.5;
 const AIM_KNEE: f32 = 8.0;
 
@@ -198,7 +198,7 @@ impl Keyboard {
             }
         };
         let (dx, dy) = self.take_look();
-        let (dx, dy) = if mark == MOUSE_AIM { eased(dx, dy) } else { (dx, dy) };
+        let (dx, dy) = eased(dx, dy);
         let waiting = mailbox[0] == mark && (mailbox[1] != 0 || mailbox[2] != 0);
         self.untaken = if waiting { self.untaken.saturating_add(1) } else { 0 };
         let keep = waiting && self.untaken <= STALE_FRAMES;
@@ -524,22 +524,23 @@ mod tests {
         keyboard.aim_by(10.0, -2.0);
         keyboard.feed_mailbox(&mut mailbox);
         assert_eq!(mailbox[..3], [MOUSE_LOOK, 10f32.to_bits(), (-2f32).to_bits()]);
-        keyboard.aim_by(5.0, 0.0);
+        // quick movement, past the easing curve's knee, so the numbers stay
+        keyboard.aim_by(AIM_KNEE, 0.0);
         keyboard.feed_mailbox(&mut mailbox);
-        assert_eq!(f32::from_bits(mailbox[1]), 15.0, "not taken yet, so it adds up");
+        assert_eq!(f32::from_bits(mailbox[1]), 10.0 + AIM_KNEE, "not taken yet, so it adds up");
         mailbox[1] = 0;
         mailbox[2] = 0;
         keyboard.aim_by(500.0, 0.0);
         keyboard.feed_mailbox(&mut mailbox);
         assert_eq!(f32::from_bits(mailbox[1]), 500.0, "fast movement is not cut short");
         for _ in 0..STALE_FRAMES {
-            keyboard.aim_by(1.0, 0.0);
+            keyboard.aim_by(AIM_KNEE, 0.0);
             keyboard.feed_mailbox(&mut mailbox);
         }
-        assert_eq!(f32::from_bits(mailbox[1]), 500.0 + STALE_FRAMES as f32, "a game tick can take a few frames");
-        keyboard.aim_by(1.0, 0.0);
+        assert_eq!(f32::from_bits(mailbox[1]), 500.0 + AIM_KNEE * STALE_FRAMES as f32, "a game tick can take a few frames");
+        keyboard.aim_by(AIM_KNEE, 0.0);
         keyboard.feed_mailbox(&mut mailbox);
-        assert_eq!(f32::from_bits(mailbox[1]), 1.0, "left untaken longer, as in a menu, it is dropped");
+        assert_eq!(f32::from_bits(mailbox[1]), AIM_KNEE, "left untaken longer, as in a menu, it is dropped");
         keyboard.set_aim(Some(AimMode::Air));
         keyboard.feed_mailbox(&mut mailbox);
         assert_eq!(mailbox, [0, 0, 0, 7], "only on foot");
@@ -599,7 +600,7 @@ mod tests {
         keyboard.set_aim(Some(AimMode::Land));
         keyboard.aim_by(1.0, 0.0);
         keyboard.feed_mailbox(&mut mailbox);
-        assert_eq!(f32::from_bits(mailbox[1]), 1.0, "on foot it is not eased");
+        assert_eq!(f32::from_bits(mailbox[1]), eased(1.0, 0.0).0, "on foot the camera eases the same way");
     }
 
     #[test]
