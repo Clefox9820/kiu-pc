@@ -304,9 +304,46 @@ fn decode_icon(data: &[u8]) -> Vec<u8> {
     rgba
 }
 
+/// writes the game's icon as a Windows icon file, for a program made of the
+/// game to carry.
+pub fn save_icon(game: &Path, to: &Path) -> Result<(), String> {
+    let icon = read_game(game, None).icon.ok_or_else(|| format!("{} has no icon", game.display()))?;
+    std::fs::write(to, ico(&icon)?).map_err(|error| format!("could not write {}, {error}", to.display()))
+}
+
+/// an icon file of the icon at its own 48 pixels and at four times that, each
+/// pixel a square, as big as Windows shows a program's.
+fn ico(rgba: &[u8]) -> Result<Vec<u8>, String> {
+    use image::codecs::ico::{IcoEncoder, IcoFrame};
+    let side = ICON_SIZE as u32;
+    let small = image::RgbaImage::from_raw(side, side, rgba.to_vec()).ok_or("not an icon's size")?;
+    let large = image::imageops::resize(&small, side * 4, side * 4, image::imageops::FilterType::Nearest);
+    let frame = |picture: &image::RgbaImage| {
+        IcoFrame::as_png(picture.as_raw(), picture.width(), picture.height(), image::ExtendedColorType::Rgba8).map_err(|error| error.to_string())
+    };
+    let mut file = Vec::new();
+    IcoEncoder::new(&mut file).encode_images(&[frame(&small)?, frame(&large)?]).map_err(|error| error.to_string())?;
+    Ok(file)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_icon_becomes_a_windows_icon_at_two_sizes() {
+        let mut rgba = vec![0u8; ICON_SIZE * ICON_SIZE * 4];
+        rgba[..4].copy_from_slice(&[200, 10, 20, 255]);
+        let file = ico(&rgba).unwrap();
+        // an icon file of two pictures, the small one first
+        assert_eq!(file[..6], [0, 0, 1, 0, 2, 0]);
+        assert_eq!((file[6], file[7]), (48, 48));
+        assert_eq!((file[22], file[23]), (192, 192));
+        let decoded = image::load_from_memory_with_format(&file, image::ImageFormat::Ico).unwrap().to_rgba8();
+        assert_eq!(decoded.dimensions(), (192, 192), "the largest picture is read");
+        assert_eq!(decoded.get_pixel(3, 3).0, [200, 10, 20, 255], "each pixel a square of four");
+        assert!(ico(&rgba[1..]).is_err(), "not an icon's size");
+    }
 
     #[test]
     fn files_that_cant_be_played_say_why() {

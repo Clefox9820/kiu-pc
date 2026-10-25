@@ -495,6 +495,12 @@ pub struct Settings {
     /// mouse's, flying and on foot.
     pub air_aim_speed: f32,
     pub land_aim_speed: f32,
+    /// mouse aim moves up for the mouse moved down, as in flight games.
+    pub invert_aim_y: bool,
+    /// the game stops while another window has the focus.
+    pub pause_unfocused: bool,
+    /// mouse aim comes back as it was when the window gets the focus back.
+    pub recapture_mouse: bool,
     /// a picture behind the library.
     pub background: Option<PathBuf>,
     /// how much of it shows, 0 to 1.
@@ -543,6 +549,9 @@ impl Default for Settings {
             show_controls: true,
             air_aim_speed: 0.5,
             land_aim_speed: 1.5,
+            invert_aim_y: false,
+            pause_unfocused: true,
+            recapture_mouse: true,
             background: None,
             background_opacity: 0.35,
             keys: Keys::default(),

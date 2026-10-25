@@ -8,6 +8,7 @@ mod cli;
 mod gamepad;
 mod gui;
 mod input;
+mod kiu_options;
 mod library;
 mod menus;
 mod present;
@@ -53,6 +54,15 @@ pub fn run(linked: Option<Linked>) {
             std::process::exit(2);
         }
     };
+    // the game's icon for a port's program to carry, without playing it
+    if let Some(file) = &options.save_icon {
+        let saved = options.rom.as_deref().ok_or_else(|| "--save-icon needs a game".to_owned());
+        if let Err(message) = saved.and_then(|rom| library::save_icon(Path::new(rom), Path::new(file))) {
+            eprintln!("zakuro: {message}");
+            std::process::exit(1);
+        }
+        return;
+    }
     // the code and the game into memory before play reaches them
     warm::start(options.rom.as_deref());
     let mut settings = Settings::load();
@@ -104,6 +114,7 @@ pub fn run(linked: Option<Linked>) {
         shown: 0,
         spent: Spent::default(),
         paused: false,
+        away: Away::default(),
         fast_forward_key: false,
         fast_forwarding: false,
         next_shown: Instant::now(),
@@ -389,6 +400,8 @@ struct App {
     spent: Spent,
     /// stopped with F1, without the menu.
     paused: bool,
+    /// what to undo when the window gets the focus back.
+    away: Away,
     /// Tab is held down, for fast forward.
     fast_forward_key: bool,
     /// the game runs as fast as it can, its sound left out.
@@ -483,6 +496,37 @@ fn skips_showing(playing: bool, behind: bool, waits: bool, skipped: u32) -> bool
     playing && behind && waits && skipped < MAX_SKIPPED
 }
 
+/// the window's title: the game's name and how it runs, which a port made of
+/// one game shows alone.
+fn window_title(port: bool, game: Option<(&str, &str)>) -> String {
+    match game {
+        Some((name, status)) if port => format!("{name} - {status}"),
+        Some((name, status)) => format!("Zakuro - {name} - {status}"),
+        None => "Zakuro".to_owned(),
+    }
+}
+
+/// the mouse's raw movement as aim, at a speed, its vertical turned round
+/// when inverted.
+fn aim_delta(delta: (f64, f64), speed: f32, invert_y: bool) -> (f32, f32) {
+    let y = if invert_y { -delta.1 } else { delta.1 };
+    (delta.0 as f32 * speed, y as f32 * speed)
+}
+
+/// what the window losing the focus leaves to undo when it gets it back: a
+/// pause it made, and the mouse aim it let go of.
+#[derive(Debug, Default, Clone, Copy, PartialEq)]
+struct Away {
+    paused: bool,
+    aim: Option<AimMode>,
+}
+
+/// pauses only a game the player had not paused, and keeps the aim when the
+/// mouse is to be taken back.
+fn leave(pause: bool, already_paused: bool, aim: Option<AimMode>, recapture: bool) -> Away {
+    Away { paused: pause && !already_paused, aim: aim.filter(|_| recapture) }
+}
+
 impl ApplicationHandler for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.window.is_some() {
@@ -545,9 +589,22 @@ impl ApplicationHandler for App {
             WindowEvent::CloseRequested => event_loop.exit(),
             // keys let go while another window has the keyboard never come
             WindowEvent::Focused(false) => {
+                // a room's others keep playing, so it never pauses there
+                let pause = self.settings.pause_unfocused && self.game.is_some() && self.room.is_none();
+                self.away = leave(pause, self.paused, self.keyboard.aim_mode(), self.settings.recapture_mouse);
+                self.paused |= self.away.paused;
                 self.fast_forward_key = false;
                 self.set_mouse_aim(None);
                 self.keyboard.release();
+            }
+            WindowEvent::Focused(true) => {
+                let away = std::mem::take(&mut self.away);
+                if away.paused {
+                    self.paused = false;
+                }
+                if away.aim.is_some() && self.game.is_some() && !self.menus.menu_open {
+                    self.set_mouse_aim(away.aim);
+                }
             }
             WindowEvent::Resized(size) => {
                 if let Some(backend) = &mut self.backend {
@@ -599,7 +656,8 @@ impl ApplicationHandler for App {
                 Some(AimMode::Air) => self.settings.air_aim_speed,
                 _ => self.settings.land_aim_speed,
             };
-            self.keyboard.aim_by(delta.0 as f32 * speed, delta.1 as f32 * speed);
+            let (x, y) = aim_delta(delta, speed, self.settings.invert_aim_y);
+            self.keyboard.aim_by(x, y);
         }
     }
 
@@ -697,13 +755,19 @@ impl App {
         };
         let system = loader::load(path, config).map_err(|error| format!("could not open {}, {error}", path.display()))?;
         let outdated = system.recompiled.as_ref().is_some_and(|code| code.outdated());
+        let smdh = system.title.as_ref().and_then(|title| library::Smdh::parse(title.exefs_file("icon")?));
+        // the window and the taskbar show the game's own icon
+        if let Some(window) = &self.window {
+            let side = library::ICON_SIZE as u32;
+            window.set_window_icon(smdh.as_ref().and_then(|smdh| winit::window::Icon::from_rgba(smdh.icon.clone(), side, side).ok()));
+        }
         let name = self
             .library
             .games
             .iter()
             .find(|game| game.path == path)
             .map(|game| game.name.clone())
-            .or_else(|| Some(library::Smdh::parse(system.title.as_ref()?.exefs_file("icon")?)?.name).filter(|name| !name.is_empty()))
+            .or_else(|| smdh.map(|smdh| smdh.name).filter(|name| !name.is_empty()))
             .or_else(|| path.file_stem().map(|stem| stem.to_string_lossy().into_owned()))
             .unwrap_or_default();
         let mut game = Running::new(system, path.to_owned(), name);
@@ -738,6 +802,9 @@ impl App {
 
     fn back_to_library(&mut self) {
         self.game = None;
+        if let Some(window) = &self.window {
+            window.set_window_icon(None);
+        }
         if let Some(room) = &self.room {
             room.playing("");
         }
@@ -745,6 +812,7 @@ impl App {
             audio.clear();
         }
         self.menus.menu_open = false;
+        self.menus.options_open = false;
         self.keyboard.release();
     }
 
@@ -772,6 +840,11 @@ impl App {
         }
         if pressed && !event.repeat {
             match code {
+                // the options go back to the menu they came from
+                KeyCode::Escape if self.menus.options_open => {
+                    self.menus.options_open = false;
+                    return;
+                }
                 KeyCode::Escape if self.game.is_some() => {
                     self.menus.menu_open = !self.menus.menu_open;
                     self.set_mouse_aim(None);
@@ -837,6 +910,7 @@ impl App {
                 self.apply_settings();
             } else if button == gilrs::Button::Mode && self.game.is_some() {
                 self.menus.menu_open = !self.menus.menu_open;
+                self.menus.options_open = false;
                 self.keyboard.release();
             }
         }
@@ -1325,11 +1399,9 @@ impl App {
                 );
             }
             if let Some(window) = &self.window {
-                let title = match &self.game {
-                    Some(game) => format!("Zakuro - {} - {}", game.name, game.system.status_line()),
-                    None => "Zakuro".to_owned(),
-                };
-                window.set_title(&title);
+                let status = self.game.as_ref().map(|game| game.system.status_line());
+                let game = self.game.as_ref().zip(status.as_deref()).map(|(game, status)| (game.name.as_str(), status));
+                window.set_title(&window_title(self.linked.is_some(), game));
             }
             let underruns = self.audio.as_ref().map_or(0, |audio| audio.take_underruns());
             if underruns > 0 && playing {
@@ -1671,6 +1743,7 @@ impl App {
                 }
                 None => actions.extend(menus.library(ui, library, settings, jobs)),
             }
+            actions.extend(menus.options(ui.ctx(), settings));
             actions.extend(menus.settings(ui.ctx(), settings));
             if menus.multiplayer_open {
                 actions.extend(menus.multiplayer(ui.ctx(), settings, room.as_ref()));
@@ -1826,5 +1899,28 @@ mod tests {
         assert!(!skips_showing(true, true, false, 0), "mailbox shows every frame");
         assert!(!skips_showing(true, false, true, 0), "on time");
         assert!(!skips_showing(false, true, true, 0), "paused");
+    }
+
+    #[test]
+    fn a_port_is_called_by_its_game_alone() {
+        assert_eq!(window_title(true, Some(("Kid Icarus: Uprising", "60 fps"))), "Kid Icarus: Uprising - 60 fps");
+        assert_eq!(window_title(false, Some(("Kid Icarus: Uprising", "60 fps"))), "Zakuro - Kid Icarus: Uprising - 60 fps");
+        assert_eq!(window_title(false, None), "Zakuro");
+    }
+
+    #[test]
+    fn inverted_aim_turns_only_the_vertical_round() {
+        assert_eq!(aim_delta((4.0, 2.0), 1.5, false), (6.0, 3.0));
+        assert_eq!(aim_delta((4.0, 2.0), 1.5, true), (6.0, -3.0));
+    }
+
+    #[test]
+    fn leaving_the_window_pauses_and_keeps_the_aim_as_the_settings_say() {
+        let land = Some(AimMode::Land);
+        assert_eq!(leave(true, false, land, true), Away { paused: true, aim: land });
+        assert_eq!(leave(false, false, land, true), Away { paused: false, aim: land }, "no pause asked for");
+        assert_eq!(leave(true, true, land, true), Away { paused: false, aim: land }, "a pause of the player's own stays theirs");
+        assert_eq!(leave(true, false, land, false), Away { paused: true, aim: None }, "no mouse taken back");
+        assert_eq!(leave(true, false, None, true), Away { paused: true, aim: None }, "no aim to take back");
     }
 }

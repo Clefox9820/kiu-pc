@@ -71,6 +71,8 @@ pub struct Menus {
     cheat_name: String,
     cheat_code: String,
     pub settings_open: bool,
+    /// Kid Icarus' own options, over the menu of the running game.
+    pub options_open: bool,
     /// the binding waiting for a key, by its place in Keys::all_mut.
     pub rebinding: Option<usize>,
     /// the controller binding waiting for a button, by its place in
@@ -402,7 +404,8 @@ impl Menus {
                 });
             });
         }
-        if !self.menu_open {
+        // the options take the menu's place while open
+        if !self.menu_open || self.options_open {
             return actions;
         }
         egui::Window::new("Paused")
@@ -416,6 +419,9 @@ impl Menus {
                 let wide = |ui: &mut egui::Ui, text: &str| ui.add_sized([200.0, 28.0], egui::Button::new(text)).clicked();
                 if wide(ui, "Resume") {
                     actions.push(Action::Resume);
+                }
+                if wide(ui, "Options") {
+                    self.options_open = true;
                 }
                 if wide(ui, "Reset") {
                     actions.push(Action::Reset);
@@ -1001,16 +1007,16 @@ fn controls_sections(k: &Keys) -> Vec<(&'static str, Vec<ControlRow>)> {
 
 /// Kid Icarus' menu colours: black ink on parchment, a red banner for what
 /// matters most and a magenta to cyan flourish under titles.
-const PAPER: Color32 = Color32::from_rgb(243, 235, 221);
-const PAPER_LINE: Color32 = Color32::from_rgb(234, 224, 207);
-const PAPER_SHADOW: Color32 = Color32::from_rgb(196, 183, 162);
-const INK: Color32 = Color32::from_rgb(26, 20, 18);
-const RED: Color32 = Color32::from_rgb(222, 32, 36);
-const ORANGE: Color32 = Color32::from_rgb(250, 164, 40);
+pub(crate) const PAPER: Color32 = Color32::from_rgb(243, 235, 221);
+pub(crate) const PAPER_LINE: Color32 = Color32::from_rgb(234, 224, 207);
+pub(crate) const PAPER_SHADOW: Color32 = Color32::from_rgb(196, 183, 162);
+pub(crate) const INK: Color32 = Color32::from_rgb(26, 20, 18);
+pub(crate) const RED: Color32 = Color32::from_rgb(222, 32, 36);
+pub(crate) const ORANGE: Color32 = Color32::from_rgb(250, 164, 40);
 const MAGENTA: Color32 = Color32::from_rgb(232, 64, 196);
 const BLUE: Color32 = Color32::from_rgb(84, 110, 240);
 const CYAN: Color32 = Color32::from_rgb(64, 216, 232);
-const SHADOW: Color32 = Color32::from_black_alpha(110);
+pub(crate) const SHADOW: Color32 = Color32::from_black_alpha(110);
 
 /// `a` turned toward `b` by `t`, from 0 to 1.
 fn mix(a: Color32, b: Color32, t: f32) -> Color32 {
@@ -1032,7 +1038,7 @@ fn leaf(painter: &egui::Painter, base: egui::Pos2, dir: Vec2, length: f32) {
 
 /// a black vine curling out of a corner, as on the game's parchment menus:
 /// it grows from `at` along `along` and curls toward `inward`.
-fn vine(painter: &egui::Painter, at: egui::Pos2, along: Vec2, inward: Vec2, size: f32) {
+pub(crate) fn vine(painter: &egui::Painter, at: egui::Pos2, along: Vec2, inward: Vec2, size: f32) {
     // turning from `along` to `inward` is clockwise on screen when this is 1
     let turn = along.x * inward.y - along.y * inward.x;
     let width = size * 0.06;
@@ -1073,6 +1079,47 @@ fn heart(painter: &egui::Painter, at: egui::Pos2, size: f32) {
     painter.circle_filled(pos2(at.x + size * 0.5, at.y - size * 0.25), size * 0.56, RED);
     let points = vec![pos2(at.x - size * 1.04, at.y - size * 0.1), pos2(at.x + size * 1.04, at.y - size * 0.1), pos2(at.x, at.y + size * 1.1)];
     painter.add(egui::Shape::convex_polygon(points, RED, egui::Stroke::NONE));
+}
+
+/// a title as the game's menus draw it, centred on `middle` from `top`: heavy
+/// ink with a white edge, over a ribbon thick in the middle and thin at the
+/// ends, magenta to cyan, curling at both ends round a heart. gives the
+/// ribbon's height.
+pub(crate) fn heavy_title(painter: &egui::Painter, text: &str, middle: f32, top: f32, scale: f32) -> f32 {
+    use egui::{pos2, vec2, FontId, Stroke};
+    let unit = |v: f32| v * scale;
+    let layout = |color| painter.layout_no_wrap(text.to_owned(), FontId::proportional(unit(19.0)), color);
+    let (title, edge) = (layout(INK), layout(Color32::WHITE));
+    // a white edge, then the ink twice a hair apart
+    let title_at = pos2(middle - title.size().x / 2.0, top);
+    for (dx, dy) in [(-1.0, -1.0), (0.0, -1.0), (1.0, -1.0), (-1.0, 0.0), (1.6, 0.0), (-1.0, 1.0), (0.0, 1.0), (1.6, 1.0)] {
+        painter.galley(title_at + vec2(unit(dx * 1.4), unit(dy * 1.4)), edge.clone(), Color32::WHITE);
+    }
+    painter.galley(title_at, title.clone(), INK);
+    painter.galley(title_at + vec2(unit(0.7), 0.0), title.clone(), INK);
+    let y = top + title.size().y + unit(7.0);
+
+    let half = title.size().x / 2.0 + unit(26.0);
+    let steps = 48;
+    for step in 0..steps {
+        let (t0, t1) = (step as f32 / steps as f32, (step + 1) as f32 / steps as f32);
+        let (x0, x1) = (middle - half + 2.0 * half * t0, middle - half + 2.0 * half * t1);
+        // a gap for the heart
+        if ((x0 + x1) / 2.0 - middle).abs() < unit(9.0) {
+            continue;
+        }
+        let swell = 1.0 - (t0 + t1 - 1.0).abs();
+        painter.line_segment([pos2(x0, y), pos2(x1, y)], Stroke::new(unit(0.8 + 2.4 * swell), rainbow((t0 + t1) / 2.0)));
+    }
+    for (end, side, color) in [(middle - half, -1.0, MAGENTA), (middle + half, 1.0, CYAN)] {
+        let up = [pos2(end, y), pos2(end + side * unit(9.0), y), pos2(end + side * unit(9.0), y - unit(7.0)), pos2(end + side * unit(3.0), y - unit(6.0))];
+        let down = [pos2(end, y), pos2(end + side * unit(6.0), y), pos2(end + side * unit(6.0), y + unit(5.0)), pos2(end + side * unit(2.0), y + unit(4.0))];
+        for points in [up, down] {
+            painter.add(egui::epaint::CubicBezierShape::from_points_stroke(points, false, Color32::TRANSPARENT, Stroke::new(unit(1.2), color)));
+        }
+    }
+    heart(painter, pos2(middle, y), unit(4.5));
+    y
 }
 
 /// lays the controls panel out at a scale, its sections in columns, painting
@@ -1136,41 +1183,8 @@ fn controls_panel(
     vine(painter, panel.min + vec2(vine_at, vine_at), vec2(1.0, 0.0), vec2(0.0, 1.0), unit(40.0));
     vine(painter, pos2(panel.max.x - vine_at, panel.min.y + vine_at), vec2(-1.0, 0.0), vec2(0.0, 1.0), unit(40.0));
 
-    // the title, heavy: a white edge, then the ink twice a hair apart
     let middle = panel.center().x;
-    let mut y = panel.min.y + pad;
-    let title_at = pos2(middle - title.size().x / 2.0, y);
-    let edge = layout("CONTROLS", 19.0, Color32::WHITE);
-    for (dx, dy) in [(-1.0, -1.0), (0.0, -1.0), (1.0, -1.0), (-1.0, 0.0), (1.6, 0.0), (-1.0, 1.0), (0.0, 1.0), (1.6, 1.0)] {
-        painter.galley(title_at + vec2(unit(dx * 1.4), unit(dy * 1.4)), edge.clone(), Color32::WHITE);
-    }
-    painter.galley(title_at, title.clone(), INK);
-    painter.galley(title_at + vec2(unit(0.7), 0.0), title.clone(), INK);
-    y += title.size().y + unit(7.0);
-
-    // the flourish: a ribbon thick in the middle and thin at the ends,
-    // magenta to cyan, curling at both ends round a heart
-    let half = title.size().x / 2.0 + unit(26.0);
-    let steps = 48;
-    for step in 0..steps {
-        let (t0, t1) = (step as f32 / steps as f32, (step + 1) as f32 / steps as f32);
-        let (x0, x1) = (middle - half + 2.0 * half * t0, middle - half + 2.0 * half * t1);
-        // a gap for the heart
-        if ((x0 + x1) / 2.0 - middle).abs() < unit(9.0) {
-            continue;
-        }
-        let swell = 1.0 - (t0 + t1 - 1.0).abs();
-        painter.line_segment([pos2(x0, y), pos2(x1, y)], Stroke::new(unit(0.8 + 2.4 * swell), rainbow((t0 + t1) / 2.0)));
-    }
-    for (end, side, color) in [(middle - half, -1.0, MAGENTA), (middle + half, 1.0, CYAN)] {
-        let up = [pos2(end, y), pos2(end + side * unit(9.0), y), pos2(end + side * unit(9.0), y - unit(7.0)), pos2(end + side * unit(3.0), y - unit(6.0))];
-        let down = [pos2(end, y), pos2(end + side * unit(6.0), y), pos2(end + side * unit(6.0), y + unit(5.0)), pos2(end + side * unit(2.0), y + unit(4.0))];
-        for points in [up, down] {
-            painter.add(egui::epaint::CubicBezierShape::from_points_stroke(points, false, Color32::TRANSPARENT, Stroke::new(unit(1.2), color)));
-        }
-    }
-    heart(painter, pos2(middle, y), unit(4.5));
-    let top = y + unit(10.0);
+    let top = heavy_title(painter, "CONTROLS", middle, panel.min.y + pad, scale) + unit(10.0);
 
     let mut left = panel.min.x + pad + (inner_width - body.x) / 2.0;
     for (column, size) in columns.iter().zip(&sizes) {

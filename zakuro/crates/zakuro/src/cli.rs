@@ -28,6 +28,8 @@ pub struct Options {
     pub interpreter: bool,
     /// play no sound.
     pub mute: bool,
+    /// write the game's icon to this .ico file and quit.
+    pub save_icon: Option<String>,
 }
 
 const USAGE: &str = "\
@@ -58,6 +60,8 @@ options:
   --interpreter                    interpret everything, even with recompiled
                                    code around
   --mute                           play no sound
+  --save-icon <file.ico>           write the game's icon as a Windows icon
+                                   file and quit, for a port to carry
   --data <dir>                     where saves live (default: the system's
                                    place for data, ~/.local/share/zakuro or
                                    %APPDATA%\\zakuro)
@@ -82,6 +86,7 @@ pub fn parse() -> Result<Options, String> {
         data: None,
         interpreter: false,
         mute: false,
+        save_icon: None,
     };
 
     let mut args = std::env::args().skip(1);
@@ -123,6 +128,9 @@ pub fn parse() -> Result<Options, String> {
             }
             "--data" => {
                 options.data = Some(args.next().ok_or("--data needs a directory")?);
+            }
+            "--save-icon" => {
+                options.save_icon = Some(args.next().ok_or("--save-icon needs a file")?);
             }
             "--interpreter" => options.interpreter = true,
             "--mute" => options.mute = true,
