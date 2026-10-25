@@ -1036,8 +1036,11 @@ pub(crate) struct Portraits {
     /// the top screen's color buffer registers, address, format and size,
     /// from the last draw into the buffer that transfer read.
     top: Option<[u32; 3]>,
-    /// the left corner's portrait and the right one's.
+    /// the right corner's portrait and the left one's.
     sides: [Side; 2],
+    /// the battle display's draws the bottom screen made this frame that lie
+    /// in an island, see ISLANDS.
+    hud: Vec<PortraitDraw>,
     /// whether the game is in play, a battle, where its bottom screen's
     /// portraits are dialogue; in menus the same kind of picture is not.
     pub(crate) in_play: bool,
@@ -1093,11 +1096,17 @@ pub(crate) fn portraits_on() -> bool {
 // draws the same way.
 fn is_portrait(registers: &[u32]) -> bool {
     let base = TEXTURE_UNIT_BASES[0];
+    on_bottom(registers)
+        && registers[base + 1] == (256 << 16 | 256)
+        && TextureFormat::from_raw(registers[base + 13]) == TextureFormat::Etc1
+}
+
+/// a textured draw over the whole bottom screen's 240x320, the way the
+/// title draws its pictures there.
+fn on_bottom(registers: &[u32]) -> bool {
     read_float24(registers, REG_VIEWPORT_WIDTH) == 120.0
         && read_float24(registers, REG_VIEWPORT_HEIGHT) == 160.0
         && registers[REG_TEXTURE_CONFIG] & 1 != 0
-        && registers[base + 1] == (256 << 16 | 256)
-        && TextureFormat::from_raw(registers[base + 13]) == TextureFormat::Etc1
 }
 
 /// Kid Icarus Uprising's subtitles: its 512x128 RGBA8 text buffer drawn on
@@ -1153,30 +1162,26 @@ fn note_top_buffer(registers: &[u32], resources: &mut Resources) {
     }
 }
 
-/// takes a bottom-screen portrait for the top screen's buffer, smaller, in
-/// the lower corner on its side, beside the subtitles. flush_portraits
-/// draws it there.
-fn mirror_portrait(registers: &[u32], resources: &mut Resources, vertices: Vertices) {
-    /// how big the portrait is on the top screen, and how far from its side.
-    const SCALE: f32 = 0.4;
-    const MARGIN: f32 = 4.0;
-    let Some([address, format, dimensions]) = resources.portraits.top else { return };
-    // the vertices in the order the draw takes them, shaded
-    let vertices = match vertices {
+/// a draw's vertices in the order it takes them, shaded on the CPU.
+fn shaded_in_order(registers: &[u32], vertices: Vertices) -> Option<Vec<Vertex>> {
+    match vertices {
         Vertices::Unshaded { vertex_shader, geometry_shader, inputs, order } => {
             let (shaded, order) = process_vertices(registers, vertex_shader, geometry_shader, inputs, order);
-            match order {
+            Some(match order {
                 Some(order) => order.iter().map(|&i| shaded[i]).collect(),
                 None => shaded,
-            }
+            })
         }
-        Vertices::Shaded(shaded) => shaded.to_vec(),
+        Vertices::Shaded(shaded) => Some(shaded.to_vec()),
         #[cfg(feature = "vulkan")]
-        Vertices::Raw { .. } => return,
-    };
-    // the part of it on the bottom screen, x across its 240 rows, y along
-    // them. the screen's edge cuts it, so that edge goes on the top
-    // screen's bottom edge and the cut does not show
+        Vertices::Raw { .. } => None,
+    }
+}
+
+/// the part of a draw on the bottom screen, lowest and highest corners, x
+/// across its 240 rows from the screen's bottom edge, y along them from its
+/// left edge; none when none of it is on the screen.
+fn bottom_box(vertices: &[Vertex]) -> Option<([f32; 2], [f32; 2])> {
     let viewport = (0.0, 0.0, 240.0, 320.0);
     let (mut low, mut high) = ([f32::MAX; 2], [f32::MIN; 2]);
     for screen in vertices.iter().filter(|vertex| inside(vertex)).filter_map(|vertex| to_screen(vertex, viewport)) {
@@ -1184,38 +1189,111 @@ fn mirror_portrait(registers: &[u32], resources: &mut Resources, vertices: Verti
         high = [high[0].max(screen.x), high[1].max(screen.y)];
     }
     let (low, high) = ([low[0].max(0.0), low[1].max(0.0)], [high[0].min(240.0), high[1].min(320.0)]);
-    if low[0] >= high[0] || low[1] >= high[1] {
-        return;
-    }
-    // the bottom screen scaled down, placed so the portrait sits in the
-    // corner of the top screen's 240x400: its lowest x on the bottom edge,
-    // and its y against the end of its own side
-    let left = (low[1] + high[1]) / 2.0 < 160.0;
-    let x = -low[0] * SCALE;
-    let y = match left {
-        true => MARGIN - low[1] * SCALE,
-        false => 400.0 - MARGIN - high[1] * SCALE,
-    };
+    (low[0] < high[0] && low[1] < high[1]).then_some((low, high))
+}
+
+/// a bottom-screen draw's registers pointed at the top screen's buffer, the
+/// whole bottom screen scaled by scale with its corner at x, y there, and
+/// no depth, the top screen's buffer has none of the bottom one's.
+fn onto_top(registers: &[u32], [address, format, dimensions]: [u32; 3], scale: f32, x: f32, y: f32) -> Vec<u32> {
     let mut patched = registers.to_vec();
     patched[REG_COLOR_BUFFER_ADDRESS] = address;
     patched[REG_COLOR_BUFFER_FORMAT] = format;
     patched[REG_FRAMEBUFFER_DIMENSIONS] = dimensions;
-    patched[REG_VIEWPORT_WIDTH] = float24(120.0 * SCALE);
-    patched[REG_VIEWPORT_HEIGHT] = float24(160.0 * SCALE);
+    patched[REG_VIEWPORT_WIDTH] = float24(120.0 * scale);
+    patched[REG_VIEWPORT_HEIGHT] = float24(160.0 * scale);
     patched[REG_VIEWPORT_XY] = (x.round() as i32 as u32 & 0x3FF) | ((y.round() as i32 as u32 & 0x3FF) << 16);
-    // no depth, the top screen's buffer has none of the bottom one's
     patched[REG_DEPTH_COLOR_MASK] &= !(1 | 1 << 12);
     patched[REG_DEPTH_STENCIL_WRITE] = 0;
     patched[REG_DEPTH_BUFFER_FORMAT] &= !3;
-    static ONCE: std::sync::Once = std::sync::Once::new();
-    ONCE.call_once(|| {
-        log::info!(
-            "portraits go to the top screen, the game's draw has color operation 0x{:08X}, blend 0x{:08X}",
-            registers[REG_COLOR_OPERATION],
-            registers[REG_BLEND_FUNC]
-        )
-    });
-    resources.portraits.sides[!left as usize].incoming.push(PortraitDraw { registers: patched, vertices });
+    patched
+}
+
+/// takes a bottom-screen portrait for the top screen's buffer, smaller, in
+/// the lower corner on its side, beside the subtitles. flush_portraits
+/// draws it there.
+fn mirror_portrait(registers: &[u32], resources: &mut Resources, vertices: Vertices) {
+    /// how big the portrait is on the top screen, and how far from its side.
+    const SCALE: f32 = 0.4;
+    const MARGIN: f32 = 4.0;
+    let Some(top) = resources.portraits.top else { return };
+    let Some(vertices) = shaded_in_order(registers, vertices) else { return };
+    // the screen's edge cuts it, so that edge goes on the top screen's
+    // bottom edge and the cut does not show
+    let Some((low, high)) = bottom_box(&vertices) else { return };
+    // its lowest x on the bottom edge, and its y against the end of its own
+    // side of the top screen's 400; y runs leftward from the screen's right
+    // edge on both screens, so a low y is on the right
+    let right = (low[1] + high[1]) / 2.0 < 160.0;
+    let x = -low[0] * SCALE;
+    let y = match right {
+        true => MARGIN - low[1] * SCALE,
+        false => 400.0 - MARGIN - high[1] * SCALE,
+    };
+    let registers = onto_top(registers, top, SCALE, x, y);
+    resources.portraits.sides[!right as usize].incoming.push(PortraitDraw { registers, vertices });
+}
+
+/// a part of the bottom screen's battle display shown on the top screen:
+/// where it is on the bottom screen, left, top, right and bottom from its
+/// top left, where its top left goes on the top screen, and its scale.
+struct Island {
+    from: [f32; 4],
+    to: [f32; 2],
+    scale: f32,
+}
+
+/// Kid Icarus Uprising's battle display: the counters (intensity, enemies
+/// defeated, hearts) under the score, and the powers (the orbs in the air,
+/// the power palette on foot) under the health bar.
+// ponytail: fixed places for this one title, a per-title table when another
+// game needs islands.
+const ISLANDS: [Island; 2] = [
+    // against the screen's edges, as on the bottom screen
+    Island { from: [196.0, 0.0, 320.0, 52.0], to: [400.0 - 124.0 * 0.6, 44.0], scale: 0.6 },
+    // the orbs and the palette sit in the island's lower half, from 194 down,
+    // so it starts above the health bar's foot for them to land just below it
+    Island { from: [0.0, 150.0, 170.0, 240.0], to: [0.0, 16.0], scale: 0.5 },
+];
+
+/// takes a bottom-screen draw that lies in one of the islands for the top
+/// screen's buffer, where that island goes, for flush_portraits to draw.
+fn mirror_hud(registers: &[u32], resources: &mut Resources, vertices: Vertices) {
+    let Some(top) = resources.portraits.top else { return };
+    let Some(vertices) = shaded_in_order(registers, vertices) else { return };
+    let Some((low, high)) = bottom_box(&vertices) else { return };
+    // in screen terms, left, top, right and bottom, y down: the buffer's
+    // rows run up from the screen's bottom edge and leftward from its right
+    let [left, upper, right, lower] = [320.0 - high[1], 240.0 - high[0], 320.0 - low[1], 240.0 - low[0]];
+    const SLACK: f32 = 2.0;
+    let Some(island) = ISLANDS.iter().find(|island| {
+        let [x0, y0, x1, y1] = island.from;
+        left >= x0 - SLACK && upper >= y0 - SLACK && right <= x1 + SLACK && lower <= y1 + SLACK
+    }) else {
+        return;
+    };
+    // the island's top left on the bottom screen lands on its place on the
+    // top screen; in buffer terms x runs up from the screen's bottom edge
+    // and y leftward from its right edge, 320 wide below and 400 above
+    let [x0, y0, x1, y1] = island.from;
+    let [to_x, to_y] = island.to;
+    let (width, height) = ((x1 - x0) * island.scale, (y1 - y0) * island.scale);
+    let x = (240.0 - to_y - height) - (240.0 - y1) * island.scale;
+    let y = (400.0 - to_x - width) - (320.0 - x1) * island.scale;
+    // the vertices move rather than the viewport, which would reach past
+    // the top screen's buffer for an island moved up from the bottom, and
+    // the GPU draws such a viewport wrong; it covers the whole top screen
+    let mut vertices = vertices;
+    for vertex in &mut vertices {
+        let w = vertex.clip[3];
+        let below = [(vertex.clip[0] / w * 0.5 + 0.5) * 240.0, (vertex.clip[1] / w * 0.5 + 0.5) * 320.0];
+        let above = [x + below[0] * island.scale, y + below[1] * island.scale];
+        vertex.clip[0] = (above[0] / 120.0 - 1.0) * w;
+        vertex.clip[1] = (above[1] / 200.0 - 1.0) * w;
+    }
+    let mut registers = onto_top(registers, top, 1.0, 0.0, 0.0);
+    registers[REG_VIEWPORT_HEIGHT] = float24(200.0);
+    resources.portraits.hud.push(PortraitDraw { registers, vertices });
 }
 
 /// draws the portraits the bottom screen took last frame into the top
@@ -1260,6 +1338,13 @@ pub(crate) fn flush_portraits<M: GpuMemory>(memory: &mut M, resources: &mut Reso
         }
     }
     resources.portraits.sides = sides;
+    // the battle display as the bottom screen had it, no fading, it is
+    // there whenever the game draws it
+    let hud = std::mem::take(&mut resources.portraits.hud);
+    for draw in hud {
+        rasterize(&draw.registers, memory, resources, Vertices::Shaded(&draw.vertices));
+        drew = true;
+    }
     drew
 }
 
@@ -2771,13 +2856,16 @@ fn rasterize<M: GpuMemory>(registers: &[u32], memory: &mut M, resources: &mut Re
                 draw_subtitle_shadow(registers, memory, resources, vertices);
                 resources.portraits.adding = false;
             }
-        } else if resources.portraits.in_play && is_portrait(registers) {
+        } else if resources.portraits.in_play && on_bottom(registers) {
             // the CPU decodes its arrays then, and its vertices say where it is
             #[cfg(feature = "vulkan")]
             if matches!(vertices, Vertices::Raw { .. }) {
                 return None;
             }
-            mirror_portrait(registers, resources, vertices);
+            match is_portrait(registers) {
+                true => mirror_portrait(registers, resources, vertices),
+                false => mirror_hud(registers, resources, vertices),
+            }
         }
     }
     let vertex_count = vertices.len();
@@ -5984,9 +6072,10 @@ mod tests {
         [(x.0, y.0), (x.1, y.0), (x.1, y.1), (x.0, y.0), (x.1, y.1), (x.0, y.1)].into_iter().map(|(x, y)| vertex(x, y)).collect()
     }
 
-    /// a portrait on the left of the bottom screen goes to the top screen's
-    /// left corner, one on the right to its right corner, scaled by 0.4,
-    /// with the edge the bottom screen cuts on the top screen's bottom edge.
+    /// a portrait on one side of the bottom screen goes to the top screen's
+    /// corner on that side, scaled by 0.4, with the edge the bottom screen
+    /// cuts on the top screen's bottom edge. y runs leftward from the right
+    /// edge on both screens, so a low y is the right side.
     #[test]
     fn a_portrait_goes_to_the_bottom_corner_of_its_side() {
         let mut registers = target_registers();
@@ -6013,6 +6102,31 @@ mod tests {
         assert_eq!(placed(0), (0, -12));
         // 60 * 0.4 below, and 400 - 4 - 280 * 0.4 along
         assert_eq!(placed(1), (-24, 284));
+    }
+
+    /// a draw inside the counters' island goes under the score on the top
+    /// screen; one over the whole bottom screen, a background, stays there.
+    #[test]
+    fn the_battle_display_goes_to_its_island_on_the_top_screen() {
+        let mut registers = target_registers();
+        sized(&mut registers, 240, 320);
+        let mut resources = Resources::default();
+        resources.portraits.top = Some([0x1F08_0000 >> 3, 0, 256 | (511 << 12)]);
+        // across 200 to 300 and down 5 to 40 of the bottom screen's 320x240,
+        // whose buffer runs up from its bottom edge and left from its right
+        mirror_hud(&registers, &mut resources, Vertices::Shaded(&quad((0.6667, 0.9583), (-0.875, -0.25), RED)));
+        mirror_hud(&registers, &mut resources, Vertices::Shaded(&quad((-1.0, 1.0), (-1.0, 1.0), RED)));
+        let [draw] = &resources.portraits.hud[..] else { panic!("one draw taken, not the background") };
+        // drawn over the whole top screen, its vertices moved there
+        assert_eq!(draw.registers[REG_VIEWPORT_XY], 0);
+        assert_eq!((read_float24(&draw.registers, REG_VIEWPORT_WIDTH), read_float24(&draw.registers, REG_VIEWPORT_HEIGHT)), (120.0, 200.0));
+        // the island, 196 to 320 across and 0 to 52 down, lands 325.6 to 400
+        // across, against the right edge, and 44 to 75.2 down the top screen,
+        // scaled by 0.6: the corner 300 across and 40 down goes to 388 across
+        // and 68 down, which in the top screen's buffer is 172 up from its
+        // bottom edge and 12 left of its right one
+        let screen = to_screen(&draw.vertices[0], (0.0, 0.0, 240.0, 400.0)).unwrap();
+        assert!((screen.x - 172.0).abs() < 0.1 && (screen.y - 12.0).abs() < 0.1, "at {}, {}", screen.x, screen.y);
     }
 
     /// a portrait fades in over 8 frames, the next picture fades in over it

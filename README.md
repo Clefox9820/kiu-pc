@@ -169,8 +169,12 @@ The goal is to play on the top screen alone. So far:
 - Subtitles on the top screen are the game's own option. The game applies
   it when a chapter starts, so a save state from the middle of a chapter
   keeps what was set then.
-- Not done yet: the powers, hearts and other bottom-screen HUD stay on the
-  bottom screen.
+- With `ZAKURO_PORTRAITS=1`, the bottom screen's battle display shows on the
+  top screen too, a frame behind: the counters (intensity, enemies
+  defeated, hearts) under the score, and the powers (the orbs in the air,
+  the power palette on foot) under the health bar, both against the
+  screen's edge. The game's own draws are moved there, picked by where
+  they are on the bottom screen.
 
 Tools used to work on it:
 
