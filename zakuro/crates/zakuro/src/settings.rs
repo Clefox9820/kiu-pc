@@ -515,6 +515,8 @@ pub struct Settings {
     pub pause_unfocused: bool,
     /// mouse aim comes back as it was when the window gets the focus back.
     pub recapture_mouse: bool,
+    /// show what the game is doing on the player's Discord profile.
+    pub discord_presence: bool,
     /// a picture behind the library.
     pub background: Option<PathBuf>,
     /// how much of it shows, 0 to 1.
@@ -566,6 +568,7 @@ impl Default for Settings {
             invert_aim_y: false,
             pause_unfocused: true,
             recapture_mouse: true,
+            discord_presence: false,
             background: None,
             background_opacity: 0.35,
             keys: Keys::default(),

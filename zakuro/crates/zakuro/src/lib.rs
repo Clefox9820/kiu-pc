@@ -5,6 +5,7 @@
 mod audio;
 mod camera;
 mod cli;
+mod discord;
 mod gamepad;
 mod gui;
 mod input;
@@ -124,6 +125,7 @@ pub fn run(linked: Option<Linked>) {
         room_server: None,
         room: None,
         dlp_guest: None,
+        presence: discord::Presence::new(),
         dlp_own: None,
         wireless_reboot: None,
         maximized_before_full_screen: false,
@@ -333,6 +335,10 @@ struct Running {
     fps: f32,
     /// frames since a game override last said the title is in play.
     out_of_play: u32,
+    /// the game override last said the player is flying, not on foot.
+    flying: bool,
+    /// when the game started, in seconds since 1970, for Discord.
+    started: u64,
 }
 
 impl Running {
@@ -348,6 +354,8 @@ impl Running {
             counting_since: Instant::now(),
             fps: 0.0,
             out_of_play: u32::MAX,
+            flying: false,
+            started: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |since| since.as_secs()),
         }
     }
 
@@ -429,6 +437,8 @@ struct App {
     room: Option<zakuro_core::room::Connection>,
     /// Download Play as a guest, while in a room with no game running.
     dlp_guest: Option<zakuro_core::download_play::Guest>,
+    /// what the game is doing, on the player's Discord profile.
+    presence: discord::Presence,
     /// the player's own copy of the child joined for, played in place of
     /// one sent.
     dlp_own: Option<PathBuf>,
@@ -1354,6 +1364,15 @@ impl App {
             self.menus.message = Some("The room closed, or the connection to it was lost.".into());
         }
         self.download_play();
+        let activity = self.game.as_ref().filter(|_| self.settings.discord_presence).map(|game| discord::Activity {
+            doing: match (game.out_of_play <= IN_PLAY_QUIET, game.flying) {
+                (false, _) => discord::Doing::Menus,
+                (true, false) => discord::Doing::OnFoot,
+                (true, true) => discord::Doing::Flying,
+            },
+            since: game.started,
+        });
+        self.presence.show(activity);
 
         // a game waiting on its keyboard waits for the user, not running
         let typing = self.game.as_ref().is_some_and(|game| game.system.keyboard_request().is_some());
@@ -1462,6 +1481,9 @@ impl App {
         // in play while the overrides say so, see IN_PLAY_QUIET
         let was_in_play = game.out_of_play <= IN_PLAY_QUIET;
         game.out_of_play = if said != 0 { 0 } else { game.out_of_play.saturating_add(1) };
+        if said != 0 {
+            game.flying = said == input::GAME_FLYING;
+        }
         let in_play = game.out_of_play <= IN_PLAY_QUIET;
         game.system.gpu.set_in_play(in_play);
         // the automatic layout shows the bottom screen over the top one in

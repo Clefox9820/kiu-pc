@@ -117,8 +117,10 @@ Defaults are laid out for this game. They can be changed in
 **Esc > Options** gathers what makes the game nicer to play, in the game's
 own menu style: resolution, smoother motion, screens, filter, sound, the
 mouse aim speeds, inverting the vertical aim, pausing while another window
-is in front, and taking the mouse aim back when you return to the window.
-Everything else is under **All settings**.
+is in front, taking the mouse aim back when you return to the window, and
+a Discord status (off by default) that shows whether you are in the menus,
+on foot or flying, and for how long, when the Discord app is open on the
+same computer. Everything else is under **All settings**.
 
 A short notice is shown when the aim mode changes. Mode 3 recenters the
 stylus instead of letting it reach the screen edge, which avoids the game's

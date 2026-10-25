@@ -148,6 +148,9 @@ fn mouse(ui: &mut Ui, settings: &mut Settings, actions: &mut Vec<Action>) {
         row(ui, "Take the mouse back", "Coming back to the window brings back the mouse aim it had, 2 or 3, without pressing it again.", |ui| {
             ui.checkbox(&mut settings.recapture_mouse, "")
         });
+        row(ui, "Discord status", "Shows on your Discord profile whether you are in the menus, on foot or flying, and for how long. Needs the Discord app open on this computer.", |ui| {
+            ui.checkbox(&mut settings.discord_presence, "")
+        });
         row(ui, "Fullscreen", "F11 does it too.", |ui| {
             let response = ui.button("Switch");
             if response.clicked() {
