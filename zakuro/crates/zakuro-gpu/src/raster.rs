@@ -1038,6 +1038,15 @@ pub(crate) struct Portraits {
     top: Option<[u32; 3]>,
     /// the left corner's portrait and the right one's.
     sides: [Side; 2],
+    /// whether the game is in play, a battle, where its bottom screen's
+    /// portraits are dialogue; in menus the same kind of picture is not.
+    pub(crate) in_play: bool,
+    /// whether this frame's portraits already went into the top screen,
+    /// under the subtitles; else they go in before it goes out.
+    pub(crate) flushed: bool,
+    /// while the portraits or a shadow are being drawn, which are not the
+    /// game's draws to look at.
+    adding: bool,
 }
 
 /// a corner of the top screen and the portraits fading in and out there.
@@ -1090,6 +1099,42 @@ fn is_portrait(registers: &[u32]) -> bool {
         && registers[base + 1] == (256 << 16 | 256)
         && TextureFormat::from_raw(registers[base + 13]) == TextureFormat::Etc1
 }
+
+/// Kid Icarus Uprising's subtitles: its 512x128 RGBA8 text buffer drawn on
+/// the top screen.
+fn is_subtitle(registers: &[u32]) -> bool {
+    let base = TEXTURE_UNIT_BASES[0];
+    registers[REG_TEXTURE_CONFIG] & 1 != 0
+        && registers[base + 1] == (512 << 16 | 128)
+        && TextureFormat::from_raw(registers[base + 13]) == TextureFormat::Rgba8
+}
+
+/// draws the subtitles' text again first, black and partly see-through, a
+/// pixel down and right of it, a shadow that keeps it readable over bright
+/// scenes and the portraits.
+fn draw_subtitle_shadow<M: GpuMemory>(registers: &[u32], memory: &mut M, resources: &mut Resources, vertices: Vertices) {
+    /// how dark the shadow is, out of 255.
+    const SHADOW_ALPHA: u32 = 0xC0;
+    let mut shadow = registers.to_vec();
+    // the first stage: constant black, with the text's alpha times the
+    // constant's; the rest pass it on
+    for (stage, &base) in TEV_STAGES.iter().enumerate() {
+        let (source, combiner) = match stage {
+            0 => (0xE | 3 << 16 | 0xE << 20, 1 << 16),
+            _ => (0xF | 0xF << 16, 0),
+        };
+        shadow[base..base + 5].copy_from_slice(&[source, 0, combiner, SHADOW_ALPHA << 24, 0]);
+    }
+    // the top screen's buffer runs across its rows from the screen's
+    // bottom, so a row lower is x - 1 and a column right y + 1
+    let xy = registers[REG_VIEWPORT_XY];
+    let shifted = |value: u32, by: i32| ((((value & 0x3FF) << 22) as i32 >> 22) + by) as u32 & 0x3FF;
+    shadow[REG_VIEWPORT_XY] = shifted(xy, -1) | shifted(xy >> 16, 1) << 16;
+    rasterize(&shadow, memory, resources, vertices);
+}
+
+/// the texture combiner's six stages, each five registers from there.
+const TEV_STAGES: [usize; 6] = [0x0C0, 0x0C8, 0x0D0, 0x0D8, 0x0F0, 0x0F8];
 
 /// remembers the top screen's color buffer, the one the last transfer to
 /// the top screen read from, as a draw into it shows it.
@@ -1173,9 +1218,10 @@ fn mirror_portrait(registers: &[u32], resources: &mut Resources, vertices: Verti
     resources.portraits.sides[!left as usize].incoming.push(PortraitDraw { registers: patched, vertices });
 }
 
-/// draws the portraits taken this frame into the top screen's buffer,
-/// fading in a new one over the one before, and out one the game stopped
-/// drawing. whether it drew any, and the top screen has to go out again.
+/// draws the portraits the bottom screen took last frame into the top
+/// screen's buffer, fading in a new one over the one before, and out one the
+/// game stopped drawing. whether it drew any. once a frame: under the
+/// subtitles when there are any, else just before the top screen goes out.
 pub(crate) fn flush_portraits<M: GpuMemory>(memory: &mut M, resources: &mut Resources) -> bool {
     // how much of a portrait fades in or out each frame, 8 frames in all
     let step = 1.0 / 8.0;
@@ -2710,10 +2756,22 @@ fn assemble(topology: u32, count: usize) -> Vec<(usize, usize, usize)> {
 /// the triangles drawn, none for arrays the GPU could not decode, which the
 /// CPU decodes then.
 fn rasterize<M: GpuMemory>(registers: &[u32], memory: &mut M, resources: &mut Resources, vertices: Vertices) -> Option<u32> {
-    if portraits_on() {
+    if portraits_on() && !resources.portraits.adding {
         if read_float24(registers, REG_VIEWPORT_WIDTH) == 120.0 && read_float24(registers, REG_VIEWPORT_HEIGHT) == 200.0 {
             note_top_buffer(registers, resources);
-        } else if is_portrait(registers) {
+            if is_subtitle(registers) {
+                resources.portraits.adding = true;
+                // the portraits go under the subtitles, in the buffer that
+                // goes out, once a frame
+                let top = resources.portraits.top.map(|[address, ..]| address);
+                if top == Some(registers[REG_COLOR_BUFFER_ADDRESS]) && !resources.portraits.flushed {
+                    resources.portraits.flushed = true;
+                    flush_portraits(memory, resources);
+                }
+                draw_subtitle_shadow(registers, memory, resources, vertices);
+                resources.portraits.adding = false;
+            }
+        } else if resources.portraits.in_play && is_portrait(registers) {
             // the CPU decodes its arrays then, and its vertices say where it is
             #[cfg(feature = "vulkan")]
             if matches!(vertices, Vertices::Raw { .. }) {

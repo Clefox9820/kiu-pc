@@ -326,6 +326,8 @@ struct Running {
     frames: u32,
     counting_since: Instant,
     fps: f32,
+    /// frames since a game override last said the title is in play.
+    out_of_play: u32,
 }
 
 impl Running {
@@ -340,6 +342,7 @@ impl Running {
             frames: 0,
             counting_since: Instant::now(),
             fps: 0.0,
+            out_of_play: u32::MAX,
         }
     }
 
@@ -1443,6 +1446,10 @@ impl App {
             }
         }
         let Some(game) = &mut self.game else { return };
+        // in play while the overrides say so, once a tick, every second
+        // frame for Kid Icarus; ten frames quiet is a menu
+        game.out_of_play = if said != 0 { 0 } else { game.out_of_play.saturating_add(1) };
+        game.system.gpu.set_in_play(game.out_of_play <= 10);
         let input = match &mut game.replay {
             Some(replay) => replay.input(game.frame),
             None => self.gamepads.apply(self.keyboard.state()),

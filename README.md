@@ -153,14 +153,18 @@ The goal is to play on the top screen alone. So far:
 
 - `ZAKURO_PORTRAITS=1` draws the dialogue portraits from the bottom screen
   on the top screen as well: smaller, in the lower left or right corner on
-  the speaker's side, beside the subtitles, fading in, out and between
+  the speaker's side, under the subtitles, fading in, out and between
   pictures. The game's own draws are reused, so expressions stay the
-  game's. It is off unless set, because it recognises portraits by their
-  shape (a 256x256 Etc1 picture on the bottom screen), which another game
-  could also draw.
-- Not done yet: the subtitles still show in the bottom screen's dialogue
-  box during battles, and the powers, hearts and other bottom-screen HUD
-  stay there.
+  game's. Portraits are only taken while the game overrides say a battle
+  is on, so menu pictures of the same kind are left alone. It also gives
+  the top screen's subtitles a dark drop shadow so they read over bright
+  scenes. It is off unless set, because it recognises portraits and
+  subtitles by their shape, which another game could also draw.
+- Subtitles on the top screen are the game's own option. The game applies
+  it when a chapter starts, so a save state from the middle of a chapter
+  keeps what was set then.
+- Not done yet: the powers, hearts and other bottom-screen HUD stay on the
+  bottom screen.
 
 Tools used to work on it:
 
