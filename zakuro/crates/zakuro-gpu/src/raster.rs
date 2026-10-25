@@ -1050,6 +1050,131 @@ pub(crate) struct Portraits {
     /// while the portraits or a shadow are being drawn, which are not the
     /// game's draws to look at.
     adding: bool,
+    /// the lines of text the title last wrote into its text buffer, which
+    /// the subtitles show, see note_text.
+    text_lines: Vec<TextLine>,
+}
+
+/// a line of text in the title's 512x128 text buffer, in its pixels, rows
+/// up from its bottom: the rows its letters take and how far across they go.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct TextLine {
+    bottom: f32,
+    top: f32,
+    left: f32,
+    right: f32,
+}
+
+/// a draw into Kid Icarus Uprising's 512x128 text buffer, where it writes
+/// the letters its subtitles and dialogue box show.
+fn is_text_buffer(registers: &[u32]) -> bool {
+    read_float24(registers, REG_VIEWPORT_WIDTH) == 256.0 && read_float24(registers, REG_VIEWPORT_HEIGHT) == 64.0
+}
+
+/// keeps where the title writes letters into its text buffer, line by
+/// line: a letter from its A4 font joins the line its rows overlap, and a
+/// draw of anything else, the clearing that comes before new text, forgets
+/// the lines it covers.
+fn note_text(registers: &[u32], resources: &mut Resources, vertices: Vertices) {
+    let Some(vertices) = shaded_in_order(registers, vertices) else { return };
+    let viewport = (0.0, 0.0, 512.0, 128.0);
+    let base = TEXTURE_UNIT_BASES[0];
+    let letters = registers[REG_TEXTURE_CONFIG] & 1 != 0 && TextureFormat::from_raw(registers[base + 13]) == TextureFormat::A4;
+    let boxes = vertices.chunks_exact(3).filter_map(|triangle| {
+        let corners: Vec<Screen> = triangle.iter().filter_map(|vertex| to_screen(vertex, viewport)).collect();
+        (corners.len() == 3).then(|| {
+            let (xs, ys) = (corners.iter().map(|c| c.x), corners.iter().map(|c| c.y));
+            TextLine {
+                bottom: ys.clone().fold(f32::MAX, f32::min),
+                top: ys.fold(f32::MIN, f32::max),
+                left: xs.clone().fold(f32::MAX, f32::min),
+                right: xs.fold(f32::MIN, f32::max),
+            }
+        })
+    });
+    let lines = &mut resources.portraits.text_lines;
+    for found in boxes {
+        if !letters {
+            lines.retain(|line| line.top <= found.bottom || line.bottom >= found.top);
+            continue;
+        }
+        let overlap = |line: &TextLine| line.top.min(found.top) - line.bottom.max(found.bottom);
+        match lines.iter_mut().find(|line| overlap(line) * 2.0 >= found.top - found.bottom) {
+            Some(line) => {
+                *line = TextLine {
+                    bottom: line.bottom.min(found.bottom),
+                    top: line.top.max(found.top),
+                    left: line.left.min(found.left),
+                    right: line.right.max(found.right),
+                }
+            }
+            None => lines.push(found),
+        }
+    }
+}
+
+/// the subtitles' vertices with each line of text in the middle of the top
+/// screen: every quad of the draw, the text and the title's own shadow, cut
+/// into one slice per line across the text buffer's rows, each slid along
+/// the screen by what its line needs. none when the draw is not quads
+/// across the lines the buffer holds.
+fn centered_subtitle(vertices: &[Vertex], lines: &[TextLine]) -> Option<Vec<Vertex>> {
+    if lines.is_empty() || vertices.is_empty() || vertices.len() % 6 != 0 {
+        return None;
+    }
+    let near = |a: f32, b: f32| (a - b).abs() < 1e-4;
+    // the quads' corners, by their texture coordinates, low and high u and v
+    let corners = |quad: &[Vertex]| -> Option<[[Vertex; 2]; 2]> {
+        let (us, vs) = (quad.iter().map(|v| v.texcoords[0][0]), quad.iter().map(|v| v.texcoords[0][1]));
+        let (u0, u1) = (us.clone().fold(f32::MAX, f32::min), us.fold(f32::MIN, f32::max));
+        let (v0, v1) = (vs.clone().fold(f32::MAX, f32::min), vs.fold(f32::MIN, f32::max));
+        let at = |u: f32, v: f32| quad.iter().find(|x| near(x.texcoords[0][0], u) && near(x.texcoords[0][1], v)).copied();
+        Some([[at(u0, v0)?, at(u0, v1)?], [at(u1, v0)?, at(u1, v1)?]])
+    };
+    let first = corners(&vertices[..6])?;
+    let [u0, v0] = first[0][0].texcoords[0];
+    let [u1, v1] = first[1][1].texcoords[0];
+    // the lines the quads show, low rows first, in texture terms
+    let mut shown: Vec<TextLine> = lines
+        .iter()
+        .map(|line| TextLine { bottom: line.bottom / 128.0, top: line.top / 128.0, left: line.left / 512.0, right: line.right / 512.0 })
+        .filter(|line| (line.bottom + line.top) / 2.0 > v0 && (line.bottom + line.top) / 2.0 < v1)
+        .collect();
+    if shown.is_empty() {
+        return None;
+    }
+    shown.sort_by(|a, b| a.bottom.total_cmp(&b.bottom));
+    // each line's slide, in clip-space units of the top screen's 400 across,
+    // which a vertex's clip y holds: its middle goes to the screen's middle
+    let ndc_y = |vertex: &Vertex| vertex.clip[1] / vertex.clip[3];
+    let slides: Vec<f32> = shown
+        .iter()
+        .map(|line| {
+            let middle = ((line.left + line.right) / 2.0 - u0) / (u1 - u0);
+            let low = ndc_y(&first[0][0]) + (ndc_y(&first[1][0]) - ndc_y(&first[0][0])) * middle;
+            -low
+        })
+        .collect();
+    // where each slice starts and ends in v: the quad's ends, and halfway
+    // between one line and the next
+    let mut cuts = vec![v0];
+    cuts.extend(shown.windows(2).map(|pair| (pair[0].top + pair[1].bottom) / 2.0));
+    cuts.push(v1);
+    let mut out = Vec::with_capacity(vertices.len() * shown.len());
+    for quad in vertices.chunks_exact(6) {
+        let edges = corners(quad)?;
+        for (slice, slide) in slides.iter().enumerate() {
+            let (from, to) = ((cuts[slice] - v0) / (v1 - v0), (cuts[slice + 1] - v0) / (v1 - v0));
+            for vertex in quad {
+                let side = &edges[!near(vertex.texcoords[0][0], edges[0][0].texcoords[0][0]) as usize];
+                let high = !near(vertex.texcoords[0][1], side[0].texcoords[0][1]);
+                let mut moved = side[0].lerp(&side[1], if high { to } else { from });
+                moved.clip[1] += slide * moved.clip[3];
+                out.push(moved);
+            }
+        }
+    }
+    Some(out)
 }
 
 /// a corner of the top screen and the portraits fading in and out there.
@@ -2847,6 +2972,11 @@ fn rasterize<M: GpuMemory>(registers: &[u32], memory: &mut M, resources: &mut Re
         if read_float24(registers, REG_VIEWPORT_WIDTH) == 120.0 && read_float24(registers, REG_VIEWPORT_HEIGHT) == 200.0 {
             note_top_buffer(registers, resources);
             if is_subtitle(registers) {
+                // the CPU decodes its arrays, so its lines can be centered
+                #[cfg(feature = "vulkan")]
+                if matches!(vertices, Vertices::Raw { .. }) {
+                    return None;
+                }
                 resources.portraits.adding = true;
                 // the portraits go under the subtitles, in the buffer that
                 // goes out, once a frame
@@ -2855,9 +2985,30 @@ fn rasterize<M: GpuMemory>(registers: &[u32], memory: &mut M, resources: &mut Re
                     resources.portraits.flushed = true;
                     flush_portraits(memory, resources);
                 }
-                draw_subtitle_shadow(registers, memory, resources, vertices);
+                let centered = shaded_in_order(registers, vertices)
+                    .and_then(|shaded| centered_subtitle(&shaded, &resources.portraits.text_lines));
+                let drawn = match &centered {
+                    Some(centered) => {
+                        draw_subtitle_shadow(registers, memory, resources, Vertices::Shaded(centered));
+                        Some(rasterize(registers, memory, resources, Vertices::Shaded(centered)).unwrap_or(0))
+                    }
+                    None => {
+                        draw_subtitle_shadow(registers, memory, resources, vertices);
+                        None
+                    }
+                };
                 resources.portraits.adding = false;
+                if drawn.is_some() {
+                    return drawn;
+                }
             }
+        } else if is_text_buffer(registers) {
+            // the CPU decodes its arrays, so its letters say where they are
+            #[cfg(feature = "vulkan")]
+            if matches!(vertices, Vertices::Raw { .. }) {
+                return None;
+            }
+            note_text(registers, resources, vertices);
         } else if resources.portraits.in_play && on_bottom(registers) {
             // the CPU decodes its arrays then, and its vertices say where it is
             #[cfg(feature = "vulkan")]
@@ -6129,6 +6280,77 @@ mod tests {
         // bottom edge and 12 left of its right one
         let screen = to_screen(&draw.vertices[0], (0.0, 0.0, 240.0, 400.0)).unwrap();
         assert!((screen.x - 172.0).abs() < 0.1 && (screen.y - 12.0).abs() < 0.1, "at {}, {}", screen.x, screen.y);
+    }
+
+    /// a vertex at x, y of a viewport w by h, with texture coordinates u, v.
+    fn at(x: f32, y: f32, (w, h): (f32, f32), [u, v]: [f32; 2]) -> Vertex {
+        let clip = [x / w * 2.0 - 1.0, y / h * 2.0 - 1.0, -0.5, 1.0];
+        Vertex { clip, color: RED, texcoords: [[u, v], [0.0; 2], [0.0; 2]], quaternion: [0.0, 0.0, 0.0, 1.0], view: [0.0; 3] }
+    }
+
+    /// a quad from x0, y0 to x1, y1 of a viewport, as two triangles.
+    fn rect(x0: f32, y0: f32, x1: f32, y1: f32, size: (f32, f32)) -> Vec<Vertex> {
+        [(x0, y0), (x1, y0), (x1, y1), (x0, y0), (x1, y1), (x0, y1)].into_iter().map(|(x, y)| at(x, y, size, [0.0; 2])).collect()
+    }
+
+    /// letters written into the text buffer make its lines, row bands with
+    /// how far across they go, and the clearing before new text forgets them.
+    #[test]
+    fn the_text_buffer_lines_follow_the_letters_written() {
+        let mut registers = target_registers();
+        sized(&mut registers, 512, 128);
+        let base = TEXTURE_UNIT_BASES[0];
+        registers[REG_TEXTURE_CONFIG] = 1;
+        registers[base + 13] = 11; // A4, the font
+        let mut resources = Resources::default();
+        let size = (512.0, 128.0);
+        // two batches of letters, the second on both lines
+        let mut letters = rect(17.0, 35.0, 108.0, 50.0, size);
+        letters.extend(rect(17.0, 19.0, 60.0, 34.0, size));
+        note_text(&registers, &mut resources, Vertices::Shaded(&letters));
+        note_text(&registers, &mut resources, Vertices::Shaded(&rect(113.0, 35.0, 215.0, 50.0, size)));
+        let mut lines = resources.portraits.text_lines.clone();
+        lines.sort_by(|a, b| a.bottom.total_cmp(&b.bottom));
+        assert_eq!(
+            lines,
+            [
+                TextLine { bottom: 19.0, top: 34.0, left: 17.0, right: 60.0 },
+                TextLine { bottom: 35.0, top: 50.0, left: 17.0, right: 215.0 }
+            ]
+        );
+        // the clearing, no font, over the text
+        registers[base + 13] = 0;
+        note_text(&registers, &mut resources, Vertices::Shaded(&rect(3.0, 15.0, 287.0, 58.0, size)));
+        assert!(resources.portraits.text_lines.is_empty());
+    }
+
+    /// each line of the subtitles slides so its middle is the top screen's
+    /// middle, the quads cut into one slice per line. the quad is the one
+    /// Kid Icarus Uprising draws: across 97.6 to 361 of the top screen's
+    /// buffer, its text buffer's u 0.522 to 0.008 that way.
+    #[test]
+    fn each_subtitle_line_goes_to_the_middle_of_the_screen() {
+        let size = (240.0, 400.0);
+        let corner = |x: f32, y: f32, u: f32, v: f32| at(x, y, size, [u, v]);
+        let (a, b, c, d) = (corner(56.0, 361.0, 0.008, 0.445), corner(56.0, 97.6, 0.522, 0.445), corner(15.1, 361.0, 0.008, 0.126), corner(15.1, 97.6, 0.522, 0.126));
+        let quad = [a, b, c, b, d, c];
+        let lines = [TextLine { bottom: 35.0, top: 50.0, left: 17.0, right: 215.0 }, TextLine { bottom: 19.0, top: 34.0, left: 17.0, right: 183.0 }];
+        let centered = centered_subtitle(&quad, &lines).expect("centered");
+        assert_eq!(centered.len(), 12, "two slices of the quad");
+        for (slice, line) in centered.chunks_exact(6).zip([lines[1], lines[0]]) {
+            // where the line's middle is now, between the slice's ends in u
+            let low_u = slice.iter().find(|v| (v.texcoords[0][0] - 0.008).abs() < 1e-4).unwrap();
+            let high_u = slice.iter().find(|v| (v.texcoords[0][0] - 0.522).abs() < 1e-4).unwrap();
+            let middle = ((line.left + line.right) / 2.0 / 512.0 - 0.008) / (0.522 - 0.008);
+            let y = low_u.clip[1] + (high_u.clip[1] - low_u.clip[1]) * middle;
+            assert!(y.abs() < 1e-4, "line {line:?} at {y}");
+            // and it covers its own rows of the text buffer
+            let vs: Vec<f32> = slice.iter().map(|v| v.texcoords[0][1] * 128.0).collect();
+            let (low_v, high_v) = (vs.iter().copied().fold(f32::MAX, f32::min), vs.iter().copied().fold(f32::MIN, f32::max));
+            assert!(low_v <= line.bottom && high_v >= line.top, "{line:?} in {low_v}..{high_v}");
+        }
+        // no lines known: the subtitles are left as the title drew them
+        assert!(centered_subtitle(&quad, &[]).is_none());
     }
 
     /// a portrait fades in over 8 frames, the next picture fades in over it

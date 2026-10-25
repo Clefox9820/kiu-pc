@@ -160,7 +160,9 @@ The goal is to play on the top screen alone. So far:
   game's. Portraits are only taken while the game overrides say a battle
   is on, so menu pictures of the same kind are left alone. It also gives
   the top screen's subtitles a dark drop shadow so they read over bright
-  scenes. It is off unless set, because it recognises portraits and
+  scenes, and centers each of their lines on the screen: the game writes
+  them left-aligned into its text buffer, and the letters it writes there
+  say how wide each line is. It is off unless set, because it recognises portraits and
   subtitles by their shape, which another game could also draw.
 - The screen layout "Top screen, the bottom one over it in menus" (`auto`
   in `settings.toml`) shows the top screen alone in battle and the bottom
