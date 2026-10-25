@@ -14,7 +14,7 @@ Load before claiming a change works, after any edit under `zakuro/`, and for any
 ## Hard Rules
 
 - Run the suites for every crate you touched; report failures, never hide them.
-- On integrated GPUs, run zakuro-gpu with `ZAKURO_GPU_SHADERS=1`; without it 5 raster tests fail (known, not a regression).
+- Vertices are shaded on the GPU by default; with `ZAKURO_CPU_SHADERS=1` 5 raster tests fail on integrated GPUs (known, not a regression).
 - Never judge performance from one run: automated runs varied 4–188 hitches. Use interleaved A/B (a1 b1 a2 b2) with an env switch.
 - Never measure during the boot cinematic or the white title screen; measure in real battles.
 - Behaviour changes need a test that fails before the fix (RED) and passes after (GREEN) when a deterministic test is possible.
@@ -25,7 +25,7 @@ Load before claiming a change works, after any edit under `zakuro/`, and for any
 |---|---|
 | `crates/zakuro` | `cargo test -p zakuro --release --lib` |
 | `crates/zakuro-core` | `cargo test -p zakuro-core --release --lib` |
-| `crates/zakuro-gpu` (incl. Vulkan) | `ZAKURO_GPU_SHADERS=1 cargo test -p zakuro-gpu --release --features vulkan --lib` |
+| `crates/zakuro-gpu` (incl. Vulkan) | `cargo test -p zakuro-gpu --release --features vulkan --lib` |
 | Performance | headless benchmark, then A/B in real play |
 
 ## Execution Steps

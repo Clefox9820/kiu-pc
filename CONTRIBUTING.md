@@ -56,11 +56,11 @@ Then:
 cd zakuro
 cargo test -p zakuro --release --lib
 cargo test -p zakuro-core --release --lib
-ZAKURO_GPU_SHADERS=1 cargo test -p zakuro-gpu --release --features vulkan --lib
+cargo test -p zakuro-gpu --release --features vulkan --lib
 ```
 
-`ZAKURO_GPU_SHADERS=1` is needed on some AMD integrated GPUs, where five
-raster tests fail without it.
+Vertices are shaded on the GPU by default; `ZAKURO_CPU_SHADERS=1` shades them
+on the CPU instead, where five raster tests fail on some AMD integrated GPUs.
 
 ## Reading the diagnostics
 

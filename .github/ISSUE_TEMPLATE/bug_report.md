@@ -25,7 +25,7 @@ Issues that do are closed.
 - Windows version:
 - GPU (model and driver version):
 - Game and build on: HDD / SSD
-- `ZAKURO_GPU_SHADERS` or `ZAKURO_NO_WARM` set? (yes/no)
+- `ZAKURO_CPU_SHADERS` or `ZAKURO_NO_WARM` set? (yes/no)
 
 **Log**
 

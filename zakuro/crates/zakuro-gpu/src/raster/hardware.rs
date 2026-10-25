@@ -1714,16 +1714,13 @@ impl Hardware {
                 fragment_shader,
                 depth_fragment_shader,
                 shade_shader,
-                // shading on the CPU instead, to tell the two apart. an
-                // integrated GPU does worse at it than the CPU, its draws
-                // read each vertex's inputs and uniforms out of storage
-                // buffers, a load after another. ZAKURO_GPU_SHADERS=1 has
-                // it shade all the same
-                shades: match (std::env::var_os("ZAKURO_CPU_SHADERS"), std::env::var_os("ZAKURO_GPU_SHADERS")) {
-                    (Some(_), _) => false,
-                    (None, Some(_)) => true,
-                    (None, None) => properties.device_type != vk::PhysicalDeviceType::INTEGRATED_GPU,
-                },
+                // shading on the CPU instead, ZAKURO_CPU_SHADERS=1, to tell
+                // the two apart. integrated GPUs shade too: on a Ryzen 5600G
+                // the CPU's shading was most of each hitch, and the GPU's
+                // halved the hitches in battle, 22 against 48 over four runs
+                // ponytail: one integrated GPU measured, ZAKURO_CPU_SHADERS
+                // for one that does worse
+                shades: std::env::var_os("ZAKURO_CPU_SHADERS").is_none(),
                 // interpreting them all instead, to tell the two apart
                 translates: std::env::var_os("ZAKURO_INTERPRET_SHADERS").is_none(),
                 scratch: Vec::new(),
