@@ -27,6 +27,14 @@ pub struct Keyboard {
     pending: (f32, f32),
     /// the right button, which holds land aim's stylus on the screen.
     held: bool,
+    /// land aim's movement while the stylus is up, in bottom screen pixels,
+    /// for a game override that turns the camera with it, see take_look.
+    look: (f32, f32),
+    /// frames in a row the mailbox still held movement the game had not taken.
+    untaken: u8,
+    /// the kind of play the game last said it was in, and frames since.
+    game: Option<AimMode>,
+    quiet: u8,
     /// the left button, which fires (L) while aiming.
     fire: bool,
     /// Shift, which pushes the circle pad halfway, to walk.
@@ -67,6 +75,41 @@ enum Wrap {
     Lifted(u8),
 }
 
+/// the host mailbox's first word while mouse look is on foot, "MLK1"; the
+/// next two are the movement not yet taken, across and down, as f32 bottom
+/// screen pixels. a game override takes them and writes zeros back.
+pub const MOUSE_LOOK: u32 = u32::from_le_bytes(*b"MLK1");
+/// the same while flying with a game override that moves the reticle, "MAM1".
+pub const MOUSE_AIM: u32 = u32::from_le_bytes(*b"MAM1");
+
+/// the host mailbox's fourth word, which game overrides set every tick to the
+/// kind of play going on, and the frontend reads and clears every frame.
+pub const GAME_ON_FOOT: u32 = 1;
+pub const GAME_FLYING: u32 = 2;
+
+/// frames with no word from the game before aim goes off, as in a menu. the
+/// overrides say it once per tick, every second frame for Kid Icarus.
+const QUIET_FRAMES: u8 = 10;
+
+/// flying, the mouse moves the reticle straight across a 400 pixel screen, so
+/// slow movement is eased for small, precise corrections while a quick sweep
+/// still crosses the screen: the gain goes smoothly from AIM_SLOW_GAIN at
+/// rest to 1 at AIM_KNEE pixels a frame (after the speed setting).
+const AIM_SLOW_GAIN: f32 = 0.5;
+const AIM_KNEE: f32 = 8.0;
+
+/// a frame's movement through the flying aim's curve, its direction kept.
+fn eased(dx: f32, dy: f32) -> (f32, f32) {
+    let t = ((dx * dx + dy * dy).sqrt() / AIM_KNEE).min(1.0);
+    let gain = AIM_SLOW_GAIN + (1.0 - AIM_SLOW_GAIN) * t * t * (3.0 - 2.0 * t);
+    (dx * gain, dy * gain)
+}
+
+/// frames movement may wait in the mailbox untaken before it is dropped, so a
+/// menu that never takes it does not spin the camera once play goes on. a
+/// game takes it once per tick, every second frame for Kid Icarus Uprising.
+const STALE_FRAMES: u8 = 4;
+
 /// frames the stylus holds still, then stays up, going back.
 const HOLD_FRAMES: u8 = 2;
 const LIFT_FRAMES: u8 = 2;
@@ -94,6 +137,9 @@ impl Keyboard {
         self.fire = false;
         self.held = false;
         self.walk = false;
+        // the game's mode is told again once the keyboard is back
+        self.game = None;
+        self.quiet = 0;
         self.mouse_buttons = PadState::default();
         self.wheel = None;
     }
@@ -106,11 +152,72 @@ impl Keyboard {
         self.pending = (0.0, 0.0);
         self.fire = false;
         self.held = false;
+        self.look = (0.0, 0.0);
     }
 
-    /// land aim's stylus is off the screen, the right button not holding it.
+    /// the movement saved for mouse look since it was last taken.
+    pub fn take_look(&mut self) -> (f32, f32) {
+        std::mem::take(&mut self.look)
+    }
+
+    /// the aim mode to change to, when what the game says it is doing (a
+    /// GAME_ word, 0 for nothing this frame) has changed: on foot, flying,
+    /// or off once it has been quiet a while. a mode the player picked stands
+    /// until the game changes.
+    pub fn game_mode(&mut self, said: u32) -> Option<Option<AimMode>> {
+        let mode = match said {
+            GAME_ON_FOOT => Some(AimMode::Land),
+            GAME_FLYING => Some(AimMode::Air),
+            _ => None,
+        };
+        if let Some(mode) = mode {
+            self.quiet = 0;
+            return (self.game.replace(mode) != Some(mode)).then_some(Some(mode));
+        }
+        if self.game.is_none() {
+            return None;
+        }
+        self.quiet += 1;
+        (self.quiet > QUIET_FRAMES).then(|| {
+            self.game = None;
+            self.quiet = 0;
+            None
+        })
+    }
+
+    /// fills the host mailbox for mouse look: on foot, the movement since the
+    /// last frame added to what the game has not taken; otherwise zeros. the
+    /// game's mode word is left alone.
+    pub fn feed_mailbox(&mut self, mailbox: &mut [u32]) {
+        let mark = match self.aim_mode() {
+            Some(AimMode::Land) => MOUSE_LOOK,
+            Some(AimMode::Air) if self.flying() => MOUSE_AIM,
+            _ => {
+                mailbox[..3].fill(0);
+                return;
+            }
+        };
+        let (dx, dy) = self.take_look();
+        let (dx, dy) = if mark == MOUSE_AIM { eased(dx, dy) } else { (dx, dy) };
+        let waiting = mailbox[0] == mark && (mailbox[1] != 0 || mailbox[2] != 0);
+        self.untaken = if waiting { self.untaken.saturating_add(1) } else { 0 };
+        let keep = waiting && self.untaken <= STALE_FRAMES;
+        let carried = |word: u32| if keep { f32::from_bits(word) } else { 0.0 };
+        let across = carried(mailbox[1]) + dx;
+        let down = carried(mailbox[2]) + dy;
+        mailbox[..3].copy_from_slice(&[mark, across.to_bits(), down.to_bits()]);
+    }
+
+    /// flying, as the game itself said, so an override moves the reticle and
+    /// the stylus is not needed.
+    fn flying(&self) -> bool {
+        self.aim_mode == AimMode::Air && self.game == Some(AimMode::Air)
+    }
+
+    /// the stylus is off the screen: on foot when the right button is not
+    /// holding it, and flying when an override aims.
     fn up(&self) -> bool {
-        self.aim_mode == AimMode::Land && !self.held
+        (self.aim_mode == AimMode::Land && !self.held) || self.flying()
     }
 
     pub fn aiming(&self) -> bool {
@@ -121,8 +228,13 @@ impl Keyboard {
     /// down stop at the edges; across, land aim goes back to the middle past
     /// its reach and the air's stops at the edges too.
     pub fn aim_by(&mut self, dx: f32, dy: f32) {
-        // land aim drags only while the right button holds the stylus down
+        // land aim drags only while the right button holds the stylus down;
+        // otherwise the movement is kept for mouse look
         if self.up() {
+            if self.aiming() {
+                self.look.0 += dx;
+                self.look.1 += dy;
+            }
             return;
         }
         if self.wrap.is_some() {
@@ -383,6 +495,111 @@ mod tests {
         assert_eq!(keyboard.state().touch, Some((165, 130)), "pressed again before lifting, the drag goes on");
         keyboard.key(PhysicalKey::Code(KeyCode::Space), true);
         assert!(keyboard.state().buttons.contains(PadState::L), "Space fires");
+    }
+
+    #[test]
+    fn land_aim_without_the_stylus_saves_the_movement_for_mouse_look() {
+        let mut keyboard = Keyboard::new(Keys::default());
+        keyboard.set_aim(Some(AimMode::Land));
+        keyboard.aim_by(10.0, -4.0);
+        keyboard.aim_by(5.0, 1.0);
+        assert_eq!(keyboard.state().touch, None, "the stylus stays up");
+        assert_eq!(keyboard.take_look(), (15.0, -3.0));
+        assert_eq!(keyboard.take_look(), (0.0, 0.0), "taken once");
+        keyboard.stylus(true);
+        keyboard.aim_by(10.0, 0.0);
+        assert_eq!(keyboard.take_look(), (0.0, 0.0), "a held stylus drags instead");
+        keyboard.set_aim(Some(AimMode::Air));
+        keyboard.aim_by(10.0, 0.0);
+        assert_eq!(keyboard.take_look(), (0.0, 0.0), "only on foot");
+    }
+
+    #[test]
+    fn mouse_look_waits_in_the_mailbox_until_the_game_takes_it() {
+        let mut keyboard = Keyboard::new(Keys::default());
+        let mut mailbox = [7u32; 4];
+        keyboard.feed_mailbox(&mut mailbox);
+        assert_eq!(mailbox, [0, 0, 0, 7], "aim off writes nothing, the game's word is left");
+        keyboard.set_aim(Some(AimMode::Land));
+        keyboard.aim_by(10.0, -2.0);
+        keyboard.feed_mailbox(&mut mailbox);
+        assert_eq!(mailbox[..3], [MOUSE_LOOK, 10f32.to_bits(), (-2f32).to_bits()]);
+        keyboard.aim_by(5.0, 0.0);
+        keyboard.feed_mailbox(&mut mailbox);
+        assert_eq!(f32::from_bits(mailbox[1]), 15.0, "not taken yet, so it adds up");
+        mailbox[1] = 0;
+        mailbox[2] = 0;
+        keyboard.aim_by(500.0, 0.0);
+        keyboard.feed_mailbox(&mut mailbox);
+        assert_eq!(f32::from_bits(mailbox[1]), 500.0, "fast movement is not cut short");
+        for _ in 0..STALE_FRAMES {
+            keyboard.aim_by(1.0, 0.0);
+            keyboard.feed_mailbox(&mut mailbox);
+        }
+        assert_eq!(f32::from_bits(mailbox[1]), 500.0 + STALE_FRAMES as f32, "a game tick can take a few frames");
+        keyboard.aim_by(1.0, 0.0);
+        keyboard.feed_mailbox(&mut mailbox);
+        assert_eq!(f32::from_bits(mailbox[1]), 1.0, "left untaken longer, as in a menu, it is dropped");
+        keyboard.set_aim(Some(AimMode::Air));
+        keyboard.feed_mailbox(&mut mailbox);
+        assert_eq!(mailbox, [0, 0, 0, 7], "only on foot");
+    }
+
+    #[test]
+    fn the_game_mode_override_picks_the_aim_mode() {
+        let mut keyboard = Keyboard::new(Keys::default());
+        assert_eq!(keyboard.game_mode(0), None, "no override, nothing changes");
+        assert_eq!(keyboard.game_mode(GAME_ON_FOOT), Some(Some(AimMode::Land)));
+        assert_eq!(keyboard.game_mode(0), None, "between ticks");
+        assert_eq!(keyboard.game_mode(GAME_ON_FOOT), None, "already on foot, a key the player pressed stands");
+        assert_eq!(keyboard.game_mode(GAME_FLYING), Some(Some(AimMode::Air)));
+        for _ in 0..QUIET_FRAMES {
+            assert_eq!(keyboard.game_mode(0), None);
+        }
+        assert_eq!(keyboard.game_mode(0), Some(None), "quiet for long, a menu: aim off");
+        assert_eq!(keyboard.game_mode(0), None, "said once");
+        assert_eq!(keyboard.game_mode(GAME_FLYING), Some(Some(AimMode::Air)), "back in play");
+    }
+
+    #[test]
+    fn flying_aims_through_the_mailbox_once_the_game_says_it_flies() {
+        let mut keyboard = Keyboard::new(Keys::default());
+        keyboard.set_aim(Some(AimMode::Air));
+        keyboard.aim_by(10.0, 0.0);
+        assert_eq!(keyboard.state().touch, Some((170, 120)), "without the game's word, the stylus as before");
+        assert_eq!(keyboard.game_mode(GAME_FLYING), Some(Some(AimMode::Air)));
+        keyboard.set_aim(Some(AimMode::Air));
+        keyboard.aim_by(10.0, -4.0);
+        assert_eq!(keyboard.state().touch, None, "the stylus stays up");
+        let mut mailbox = [0u32; 4];
+        keyboard.feed_mailbox(&mut mailbox);
+        assert_eq!(mailbox[..3], [MOUSE_AIM, 10f32.to_bits(), (-4f32).to_bits()]);
+    }
+
+    #[test]
+    fn flying_aim_eases_slow_movement_and_keeps_quick_sweeps() {
+        let (x, y) = eased(1.0, 0.0);
+        assert!(x >= AIM_SLOW_GAIN && x < AIM_SLOW_GAIN + 0.05 && y == 0.0, "slow: about the slow gain, {x}");
+        assert_eq!(eased(AIM_KNEE * 2.0, 0.0), (AIM_KNEE * 2.0, 0.0), "quick: untouched");
+        let (x, y) = eased(3.0, 4.0);
+        assert!((y / x - 4.0 / 3.0).abs() < 1e-5, "the direction is kept");
+        let mut previous = 0.0;
+        for step in 1..=40 {
+            let moved = eased(step as f32 * 0.5, 0.0).0;
+            assert!(moved > previous, "more movement always moves further");
+            previous = moved;
+        }
+        let mut keyboard = Keyboard::new(Keys::default());
+        keyboard.game_mode(GAME_FLYING);
+        keyboard.set_aim(Some(AimMode::Air));
+        keyboard.aim_by(1.0, 0.0);
+        let mut mailbox = [0u32; 4];
+        keyboard.feed_mailbox(&mut mailbox);
+        assert_eq!(f32::from_bits(mailbox[1]), eased(1.0, 0.0).0, "flying feeds eased movement");
+        keyboard.set_aim(Some(AimMode::Land));
+        keyboard.aim_by(1.0, 0.0);
+        keyboard.feed_mailbox(&mut mailbox);
+        assert_eq!(f32::from_bits(mailbox[1]), 1.0, "on foot it is not eased");
     }
 
     #[test]

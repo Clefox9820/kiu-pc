@@ -987,7 +987,8 @@ fn controls_sections(k: &Keys) -> Vec<(&'static str, Vec<ControlRow>)> {
         ]),
         ("AIM", vec![
             row(vec![text("1"), text("2"), text("3")], "Off, air, land"),
-            row(vec![text("Right click")], "Hold to drag the aim on land"),
+            row(vec![text("Mouse")], "Turns the camera on land"),
+            row(vec![text("Right click")], "Hold to drag the stylus on land"),
         ]),
         ("MENUS", vec![
             row(vec![n(k.a), n(k.b)], "A, B"),

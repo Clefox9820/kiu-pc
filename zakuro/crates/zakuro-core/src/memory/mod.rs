@@ -95,6 +95,11 @@ pub struct Memory {
     /// produce a gigabyte of log.
     faults: BTreeMap<VAddr, u32>,
 
+    /// what the guest reads and writes at HOST_MAILBOX_VADDR, for an override
+    /// to take something from the host, such as mouse movement. not part of
+    /// a saved state.
+    pub host_mailbox: [u32; HOST_MAILBOX_WORDS],
+
     /// while a loop is watched for changing nothing, what each byte the CPU
     /// wrote held before its first write, see crate::idle.
     write_log: Option<Box<WriteLog>>,
@@ -211,8 +216,15 @@ impl Memory {
             gpu_sync: None,
             mappings: BTreeMap::new(),
             faults: BTreeMap::new(),
+            host_mailbox: [0; HOST_MAILBOX_WORDS],
             write_log: None,
         }
+    }
+
+    /// the mailbox word at addr, when it is one.
+    fn mailbox_word(addr: VAddr) -> Option<usize> {
+        let index = addr.wrapping_sub(HOST_MAILBOX_VADDR) as usize / 4;
+        (addr >= HOST_MAILBOX_VADDR && addr % 4 == 0 && index < HOST_MAILBOX_WORDS).then_some(index)
     }
 
     /// starts noting what the CPU's writes write over, forgetting what was
@@ -801,10 +813,13 @@ impl Bus for Memory {
                     page[offset + 2],
                     page[offset + 3],
                 ]),
-                None => {
-                    self.note_fault(addr);
-                    0
-                }
+                None => match Self::mailbox_word(addr) {
+                    Some(index) => self.host_mailbox[index],
+                    None => {
+                        self.note_fault(addr);
+                        0
+                    }
+                },
             }
         } else {
             self.unguard(addr, 4);
@@ -851,7 +866,10 @@ impl Bus for Memory {
         if offset <= PAGE_SIZE as usize - 4 {
             match self.cpu_page_write(addr, 4) {
                 Some(page) => page[offset..offset + 4].copy_from_slice(&value.to_le_bytes()),
-                None => self.note_fault(addr),
+                None => match Self::mailbox_word(addr) {
+                    Some(index) => self.host_mailbox[index] = value,
+                    None => self.note_fault(addr),
+                },
             }
         } else {
             self.unguard_writes(addr, 4);
@@ -863,6 +881,18 @@ impl Bus for Memory {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_host_mailbox_answers_where_nothing_is_mapped() {
+        let mut memory = Memory::new(false, 0);
+        memory.host_mailbox = [1, 2, 3, 4];
+        assert_eq!(memory.read32(HOST_MAILBOX_VADDR + 4), 2);
+        memory.write32(HOST_MAILBOX_VADDR + 8, 0);
+        assert_eq!(memory.host_mailbox, [1, 2, 0, 4]);
+        assert!(memory.fault_summary().is_empty(), "the mailbox is no fault");
+        assert_eq!(memory.read32(HOST_MAILBOX_VADDR + 0x10), 0, "past it is unmapped as ever");
+        assert_eq!(memory.fault_summary(), vec![(HOST_MAILBOX_VADDR, 1)]);
+    }
 
     /// a GPU that writes back 0xAB over what it is asked for, counting.
     struct Drawn {

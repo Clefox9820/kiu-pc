@@ -91,7 +91,7 @@ Defaults are laid out for this game. They can be changed in
 | Shift | Walk |
 | Mouse | Aim (stylus) |
 | Left click / Space | Fire (L) |
-| Hold right click | On foot (mode 3): put the stylus down and drag the aim |
+| Hold right click | On foot (mode 3): put the stylus down and drag, like the touch screen |
 | Mouse wheel / Q, E | Pick power (D-pad left/right) |
 | Middle click / F | Use power (D-pad down) |
 | C | D-pad up |
@@ -101,9 +101,10 @@ Defaults are laid out for this game. They can be changed in
 | P / M | Start / Select |
 | N / B | ZL / ZR |
 | Numpad | C-Stick |
+| 1, 2, 3 | Mouse aim, which also switches by itself: on foot, flying, or off in menus (a key picks one until the game changes mode) |
 | 1 | Mouse aim off |
-| 2 | Mouse aim for flying: the stylus follows the mouse, kept inside the screen |
-| 3 | Mouse aim on foot: hold right click to drag; letting go lifts the stylus without a flick, and long drags recenter horizontally |
+| 2 | Mouse aim for flying: the mouse moves the reticle directly (with the overrides; otherwise the stylus follows the mouse) |
+| 3 | Mouse aim on foot: the mouse turns the camera directly (mouse look); hold right click to drag the stylus instead |
 | Esc | Emulator menu |
 | F11 | Fullscreen |
 | F1 | Pause |
@@ -145,8 +146,12 @@ If you still see stutter, the log at `%APPDATA%\zakuro\zakuro.log` contains
 - On some AMD integrated GPUs, five `zakuro-gpu` raster tests need
   `ZAKURO_GPU_SHADERS=1` to pass. This also happens without this project's
   changes.
-- The camera is still the game's own: true mouse camera control and
-  widescreen would need 3dsrecomp overrides and are not done.
+- Mouse look on foot, mouse aim while flying and the automatic aim mode
+  come from hand-written
+  overrides in `overrides/`, found for the European release
+  (`0004000000030200`) and not yet confirmed in real play. Builds made
+  before it was added need `scripts\setup.ps1 -Force` to get it.
+- Widescreen would need more 3dsrecomp overrides and is not done.
 - The changes to Zakuro in this repository were written with AI assistance.
   They have not been sent upstream; the Zakuro author does not accept fully
   AI-written contributions, so a human must review them first.

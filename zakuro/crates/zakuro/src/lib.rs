@@ -105,6 +105,7 @@ pub fn run(linked: Option<Linked>) {
         spent: Spent::default(),
         paused: false,
         fast_forward_key: false,
+        focused: true,
         fast_forwarding: false,
         next_shown: Instant::now(),
         stop: false,
@@ -391,6 +392,8 @@ struct App {
     paused: bool,
     /// Tab is held down, for fast forward.
     fast_forward_key: bool,
+    /// the window has the keyboard, so mouse aim may take the pointer.
+    focused: bool,
     /// the game runs as fast as it can, its sound left out.
     fast_forwarding: bool,
     /// when fast forward shows its next frame, on a grid at the console's
@@ -482,7 +485,6 @@ fn free_regions(width: f32, height: f32, screens: &[Viewport]) -> Vec<[f32; 4]> 
 fn skips_showing(playing: bool, behind: bool, waits: bool, skipped: u32) -> bool {
     playing && behind && waits && skipped < MAX_SKIPPED
 }
-
 impl ApplicationHandler for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.window.is_some() {
@@ -544,7 +546,9 @@ impl ApplicationHandler for App {
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
             // keys let go while another window has the keyboard never come
-            WindowEvent::Focused(false) => {
+            WindowEvent::Focused(focused) if focused => self.focused = true,
+            WindowEvent::Focused(_) => {
+                self.focused = false;
                 self.fast_forward_key = false;
                 self.set_mouse_aim(None);
                 self.keyboard.release();
@@ -802,13 +806,7 @@ impl App {
                         KeyCode::Digit3 => Some(AimMode::Land),
                         _ => None,
                     };
-                    self.set_mouse_aim(mode);
-                    let said = match mode {
-                        Some(AimMode::Air) => "Mouse aim: flying",
-                        Some(AimMode::Land) => "Mouse aim: on foot",
-                        None => "Mouse aim off",
-                    };
-                    self.menus.toast = Some((said.to_owned(), Instant::now()));
+                    self.pick_aim(mode);
                 }
                 KeyCode::F5 if self.game.is_some() => self.save_state(),
                 KeyCode::F8 if self.game.is_some() => self.load_state(),
@@ -845,6 +843,17 @@ impl App {
     /// whether the pointer is busy with something other than the game.
     fn pointer_taken(&self, consumed: bool) -> bool {
         consumed || self.game.is_none() || self.menus.menu_open || self.gui.as_ref().is_some_and(Gui::wants_pointer)
+    }
+
+    /// changes the mouse aim mode and says so.
+    fn pick_aim(&mut self, mode: Option<AimMode>) {
+        self.set_mouse_aim(mode);
+        let said = match mode {
+            Some(AimMode::Air) => "Mouse aim: flying",
+            Some(AimMode::Land) => "Mouse aim: on foot",
+            None => "Mouse aim off",
+        };
+        self.menus.toast = Some((said.to_owned(), Instant::now()));
     }
 
     /// mouse aim: the mouse drags the stylus with the pointer hidden and held
@@ -1345,6 +1354,14 @@ impl App {
 
     /// runs one frame of the game.
     fn emulate(&mut self) {
+        // what game overrides say the game is doing picks the mouse aim mode,
+        // see input::GAME_ON_FOOT; not while the window or a menu has it
+        let said = self.game.as_mut().map_or(0, |game| std::mem::take(&mut game.system.memory.host_mailbox[3]));
+        if self.focused && !self.menus.menu_open {
+            if let Some(mode) = self.keyboard.game_mode(said) {
+                self.pick_aim(mode);
+            }
+        }
         let Some(game) = &mut self.game else { return };
         let input = match &mut game.replay {
             Some(replay) => replay.input(game.frame),
@@ -1356,7 +1373,9 @@ impl App {
             recorder.record(input);
         }
         game.system.set_input(input);
-        let interpreted = |system: &System| system.interpreted_instructions + system.recompiled.as_ref().map_or(0, |library| library.fallbacks());
+        // mouse look on foot, for a game override to take, see input::MOUSE_LOOK
+        self.keyboard.feed_mailbox(&mut game.system.memory.host_mailbox);
+        let interpreted =|system: &System| system.interpreted_instructions + system.recompiled.as_ref().map_or(0, |library| library.fallbacks());
         let before = interpreted(&game.system);
         let faults = warm::page_faults();
         let started = Instant::now();

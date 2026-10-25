@@ -121,7 +121,8 @@ $RecompExe = Join-Path $Recomp "target\release\3dsrecomp.exe"
 Step "Translating the game's code (the first time takes about an hour)"
 if ($Force -and (Test-Path $Port)) { Remove-Item -Recurse -Force $Port }
 if (-not (Test-Path (Join-Path $Port "code\librecomp.a"))) {
-    Run $RecompExe @("port", $Rom, $Port, "--name", "kid-icarus") $Build
+    $Overrides = Join-Path $Root "overrides"
+    Run $RecompExe @("port", $Rom, $Port, "--name", "kid-icarus", "--overrides", $Overrides) $Build
 } else {
     Write-Host "already translated, in build\port (-Force translates again)"
 }
