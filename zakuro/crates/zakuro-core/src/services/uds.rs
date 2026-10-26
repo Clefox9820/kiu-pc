@@ -237,6 +237,7 @@ pub fn handle(system: &mut System, buffer: &CommandBuffer, header: Header) -> bo
         return false;
     }
     let command = header.command_id();
+    log::trace!("uds: command 0x{command:04X}");
     let word = |system: &mut System, index: u32| buffer.get(&mut system.memory, index);
     match command {
         // Initialize(size, node, block) / InitializeWithVersion(size, node,
@@ -395,6 +396,7 @@ pub fn handle(system: &mut System, buffer: &CommandBuffer, header: Header) -> bo
             system.kernel.objects.add_ref(event);
             system.services.uds.binds.retain(|bind| bind.id != id);
             system.services.uds.binds.push(Bind { id, channel, from, event, queue: VecDeque::new() });
+            log::debug!("uds: bind {id} on channel {channel} from node {from:04X}, {size} bytes");
             let handle = system.kernel.handles.create(&mut system.kernel.objects, event, "UDS bind event");
             buffer.set(&mut system.memory, 0, Header::new(command, 1, 2).0);
             buffer.set(&mut system.memory, 1, 0);
@@ -406,6 +408,8 @@ pub fn handle(system: &mut System, buffer: &CommandBuffer, header: Header) -> bo
             let id = word(system, 1);
             if let Some(index) = system.services.uds.binds.iter().position(|bind| bind.id == id) {
                 let bind = system.services.uds.binds.remove(index);
+                // a thread waiting to receive on it wakes and sees it gone
+                system.kernel.signal_event(bind.event);
                 system.kernel.objects.release(bind.event);
             }
             reply_result(system, buffer, command, 0);
@@ -425,6 +429,7 @@ pub fn handle(system: &mut System, buffer: &CommandBuffer, header: Header) -> bo
                 }
                 Some(_) => {
                     let (from, payload) = bind.queue.pop_front().unwrap();
+                    log::debug!("uds: bind {id} pulled {} bytes from node {from:04X}", payload.len());
                     reply_static(system, buffer, command, &[payload.len() as u32, from as u32], &payload, room);
                 }
                 None => {
@@ -437,6 +442,7 @@ pub fn handle(system: &mut System, buffer: &CommandBuffer, header: Header) -> bo
             let (to, channel, size, flags) = (word(system, 2) as u16, word(system, 3) as u8, word(system, 5), word(system, 6) as u8);
             let pointer = word(system, 8);
             let code = send_to(system, to, channel, size, flags, pointer);
+            log::debug!("uds: send {size} bytes to node {to:04X} on channel {channel}, flags {flags:02X}, result {code:08X}");
             reply_result(system, buffer, command, code);
         }
         // GetChannel
@@ -983,6 +989,13 @@ fn take(system: &mut System, from: Mac, message: Wireless) {
             // networks may share an id, the sender has to be one of this one's
             let ours = uds.peers.iter().any(|peer| peer.mac == from) || uds.host == Some(from);
             if !uds.connected() || !ours || network_id != uds.network_id() || (to != BROADCAST_NODE && to != uds.status.node_id) {
+                log::debug!(
+                    "uds: dropped {} bytes from node {node:04X} to {to:04X} on channel {channel}: connected {}, ours {ours}, network {network_id:08X} vs {:08X}, this node {:04X}",
+                    payload.len(),
+                    uds.connected(),
+                    uds.network_id(),
+                    uds.status.node_id
+                );
                 return;
             }
             let mut events = Vec::new();
@@ -993,6 +1006,11 @@ fn take(system: &mut System, from: Mac, message: Wireless) {
                 }
                 bind.queue.push_back((node, payload.clone()));
                 events.push(bind.event);
+            }
+            log::debug!("uds: received {} bytes from node {node:04X} to {to:04X} on channel {channel}, for {} binds", payload.len(), events.len());
+            if log::log_enabled!(log::Level::Trace) {
+                let hex: String = payload.iter().take(128).map(|byte| format!("{byte:02X}")).collect();
+                log::trace!("uds: payload {hex}");
             }
             for event in events {
                 system.kernel.signal_event(event);
@@ -1166,6 +1184,23 @@ mod tests {
         settle(&mut [&mut host, &mut client]);
         assert_eq!(host.services.uds.status.total, 1);
         assert_eq!(client.services.uds.status.status, NOT_CONNECTED);
+    }
+
+    /// Unbind signals the bind's event, which wakes a thread waiting on it
+    /// to see the bind is gone. Kid Icarus: Uprising rebinds when a battle
+    /// starts and waits for its receiving thread to end first, forever when
+    /// nothing wakes it.
+    #[test]
+    fn unbinding_wakes_what_waits_on_the_bind() {
+        let (mut system, buffer) = system_with_thread();
+        system.services.uds.initialized = true;
+        assert_eq!(request(&mut system, &buffer, &[0x0012_0100, 7, 0x5F4, 1, BROADCAST_NODE as u32]), 0);
+        let event = system.services.uds.binds[0].event;
+        let signaled = |system: &System| matches!(system.kernel.objects.get(event), Some(KObject::Event(e)) if e.signaled);
+        assert!(!signaled(&system));
+        assert_eq!(request(&mut system, &buffer, &[0x0013_0040, 7]), 0);
+        assert!(system.services.uds.binds.is_empty());
+        assert!(signaled(&system), "the title's handle still holds the event, signaled");
     }
 
     /// with no room, wireless is off as it was.
