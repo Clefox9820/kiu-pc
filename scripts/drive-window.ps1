@@ -4,6 +4,8 @@ param(
     # steps separated by ';':
     #   key:<Keys name or 0xVK> [ms]   holds a key (default 120 ms)
     #   click:<x>,<y>                  touches at window client pixels
+    #   rclick:<x>,<y>                 real cursor click there, for the emulator's
+    #                                  menus, which ignore posted clicks
     #   mouse:<dx>,<dy>,<count>        real relative mouse motion, for mouse aim
     #   lmb:down | lmb:up              real left button, which fires while aiming
     #   front                          brings the window in front, for mouse and lmb
@@ -30,6 +32,7 @@ public static class Drv {
     [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
     [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr h, int cmd);
     [DllImport("user32.dll")] public static extern bool IsIconic(IntPtr h);
+    [DllImport("user32.dll")] public static extern bool SetCursorPos(int x, int y);
     [DllImport("user32.dll")] public static extern void mouse_event(uint flags, int dx, int dy, uint data, UIntPtr extra);
     [DllImport("kernel32.dll")] public static extern uint SetThreadExecutionState(uint f);
 }
@@ -97,6 +100,19 @@ foreach ($step in $Steps -split ';') {
             Key $vk ($(if ($ms) { [int]$ms } else { 120 }))
         }
         'click' { $x, $y = $arg -split ','; Click ([int]$x) ([int]$y) }
+        'rclick' {
+            $x, $y = $arg -split ','
+            $p = New-Object Drv+POINT; $p.X = [int]$x; $p.Y = [int]$y
+            [void][Drv]::ClientToScreen($h, [ref]$p)
+            # a real click lands on whatever is on top, which could be a
+            # security prompt the user must answer themselves
+            if ([Drv]::GetAncestor([Drv]::WindowFromPoint($p), 2) -ne $h) {
+                throw "the window is covered at $($p.X),$($p.Y); not clicking"
+            }
+            [void][Drv]::SetCursorPos($p.X, $p.Y); Start-Sleep -Milliseconds 80
+            [Drv]::mouse_event(2, 0, 0, 0, [UIntPtr]::Zero); Start-Sleep -Milliseconds 80
+            [Drv]::mouse_event(4, 0, 0, 0, [UIntPtr]::Zero)
+        }
         # raw input needs the window in front, which a shot step puts there
         'mouse' {
             $dx, $dy, $n = $arg -split ','
