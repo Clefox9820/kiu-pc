@@ -46,14 +46,25 @@ function by address.
 ## Requirements
 
 - Windows 10 or newer, 64-bit.
-- About 6 GB of free disk space.
-- About one hour for the first build.
-- A Vulkan-capable GPU.
+- [Git](https://git-scm.com/download/win), to clone this repository; the
+  setup script also uses it to fetch 3dsrecomp.
+- **A GPU with Vulkan 1.3 drivers.** The game is drawn on the GPU through
+  Vulkan. Without it, Zakuro still starts, but it shows the screens with
+  OpenGL 3.3 and draws the 3D on the CPU. That is much slower: in a measured
+  run on light scenes, drawing took four times as long. Frame interpolation
+  also needs Vulkan.
+- Free disk space for the repository folder: about 6 GB for one release
+  (2.4 GB of tools plus 3.5 GB for the build), about 9.4 GB for both.
+- Time: about 75 minutes per release, measured on a Ryzen 5 5600G (6 cores)
+  with 16 GB of RAM, plus about 10 minutes the first time to download the
+  tools and build 3dsrecomp.
 - Close memory-heavy programs before building: 3dsrecomp decides how many
   compilers to run in parallel from the free RAM, measured once at the start.
 
 The setup script downloads its own toolchain into `tools/` (WinLibs gcc 16.2
 and Rust for the GNU target), so nothing needs to be installed system-wide.
+Apart from small temporary files, it only writes inside the repository
+folder.
 
 ## Building
 
@@ -83,6 +94,33 @@ Options:
 | `-Force` | Translate the game again even if `build/port` (or `build/port-usa`) already exists |
 
 When it finishes, start the game with `Play.bat`.
+
+### Updating
+
+```powershell
+git pull
+powershell -ExecutionPolicy Bypass -File scripts\setup.ps1 -Rom "D:\path\to\your\dump.cci"
+```
+
+Without `-Force` the game's code is not translated again, so only Zakuro
+is rebuilt, which takes a few minutes. When an update changes `overrides/`,
+add `-Force`: it translates the game again, which takes the full build time.
+
+### Uninstalling
+
+Delete the repository folder. The emulator keeps its settings, saves and
+log in `%APPDATA%\zakuro\` and its shader cache in `%LOCALAPPDATA%\zakuro\`;
+delete those too if you do not want to keep your saves.
+
+### Troubleshooting
+
+| Message or symptom | What to do |
+| --- | --- |
+| `the ROM is encrypted` | The script reads the NoCrypto flag in the game's header. Some files named "decrypted" do not have it set. Make a decrypted dump from your console again, for example with GodMode9. |
+| `this ROM is ..., not Kid Icarus Uprising` | Only the European and USA cartridge releases are supported. |
+| `running scripts is disabled on this system` | Start the script with `powershell -ExecutionPolicy Bypass -File ...` as shown above. |
+| The build fails near the end with `os error 5` (access denied) | `kid-icarus.exe` is still running. Close the game and run the script again. |
+| The game runs very slowly | Check `%APPDATA%\zakuro\zakuro.log` for `drawing in software`, which means Vulkan did not start. Update your GPU driver. |
 
 ## Controls
 
@@ -128,7 +166,7 @@ quick "flick" camera spin.
 
 ## Performance
 
-The recompiled program is large (the executable is around 424 MiB). When it
+The recompiled program is large (the executable is around 435 MiB). When it
 and the ROM are loaded on demand from a hard disk, the game stutters every
 time it touches code or data it has not used yet.
 
