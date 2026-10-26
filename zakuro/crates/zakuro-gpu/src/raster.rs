@@ -5185,6 +5185,76 @@ mod tests {
         Some((read, held, waits))
     }
 
+    /// a buffer whose drawing a 24x8 one over it took on the GPU, then drawn
+    /// into other rows, which took memory's bytes for the rest, does not have
+    /// a texture of its own shape copied from its image over the rows the
+    /// other holds: they come from that one, as memory would have them. the
+    /// other takes them by being sampled, or drawn.
+    #[cfg(feature = "vulkan")]
+    #[test]
+    fn a_texture_comes_from_the_buffer_that_drew_its_rows_last() {
+        const BUFFER: u32 = COLOR + 512;
+        const TARGET: u32 = 0x20_0000;
+        for sampled in [true, false] {
+            let Some([old, new]) = both_ways(1, (COLOR, TARGET + 0x1000 - COLOR), |memory, resources| {
+                rasterize_shaded(&over_rows(BUFFER, (16, 16), (0, 8)), memory, resources, &cover(-0.5, RED));
+                // over its first row of tiles and the 256 bytes before it
+                match sampled {
+                    true => rasterize_shaded(&sampling(COLOR + 256, (24, 8), TARGET), memory, resources, &spread()),
+                    false => rasterize_shaded(&over_rows(COLOR + 256, (24, 8), (0, 8)), memory, resources, &cover(-0.5, GREEN)),
+                };
+                rasterize_shaded(&over_rows(BUFFER, (16, 16), (8, 8)), memory, resources, &cover(-0.5, BLUE));
+                rasterize_shaded(&sampling(BUFFER, (16, 16), TARGET + 0x800), memory, resources, &spread());
+            }) else {
+                return;
+            };
+            assert!(old == new, "the 24x8 buffer {}", if sampled { "sampled" } else { "drawn" });
+        }
+    }
+
+    /// what a CPU read of a depth buffer's memory finds after a draw over all
+    /// of a buffer replaced some of what the depth buffer drew, the depth
+    /// buffers alone or every buffer there written back first, see
+    /// draws_over_depth.
+    #[cfg(feature = "vulkan")]
+    fn depth_read_after_a_draw_over_it(depth_only: bool) -> Option<Vec<u8>> {
+        const DEPTH_BUFFER: u32 = 0x10_0000;
+        const SCENE: u32 = 0x20_0000;
+        let hardware = hardware::Hardware::new().ok()?;
+        let mut resources = Resources { hardware: Some(hardware), ..Default::default() };
+        let mut memory = ConsoleMemory::default();
+        let mut scene = over_rows(SCENE, (256, 512), (112, 400));
+        scene[REG_DEPTH_BUFFER_ADDRESS] = DEPTH_BUFFER >> 3;
+        scene[REG_DEPTH_COLOR_MASK] |= 1 << 12;
+        scene[REG_VIEWPORT_DEPTH_RANGE] = float24(-1.0);
+        scene[REG_DEPTHMAP_ENABLE] = 1;
+        rasterize_shaded(&scene, &mut memory, &mut resources, &cover(-0.25, BLUE));
+        rasterize_shaded(&over_rows(DEPTH_BUFFER, (128, 256), (0, 256)), &mut memory, &mut resources, &rectangle(-1.0, -1.0, 1.0, 1.0));
+        let hardware = resources.hardware.as_mut().unwrap();
+        let len = 256 * 512 * 4;
+        match depth_only {
+            true => hardware.sync_depth(&mut memory, DEPTH_BUFFER, len).unwrap(),
+            false => hardware.sync(&mut memory, DEPTH_BUFFER, len).unwrap(),
+        }
+        let mut read = vec![0u8; len as usize];
+        memory.read(DEPTH_BUFFER, &mut read);
+        Some(read)
+    }
+
+    /// a CPU read of a depth buffer's memory, part of which a draw over all
+    /// of a buffer since replaced, finds what that draw wrote there, as the
+    /// console's memory would hold, not what memory held before the depth
+    /// buffer drew there.
+    #[cfg(feature = "vulkan")]
+    #[test]
+    fn a_depth_read_finds_the_draw_that_replaced_its_bytes() {
+        let Some(depth_only) = depth_read_after_a_draw_over_it(true) else { return };
+        let every = depth_read_after_a_draw_over_it(false).unwrap();
+        // the 128x256 buffer's bytes, the first 128 KB
+        assert!(depth_only[..0x2_0000] == every[..0x2_0000], "the draw's colors");
+        assert!(depth_only == every, "and the depth drawn past them");
+    }
+
     /// two draws over whole buffers at two places in what a depth buffer
     /// drew, as Kid Icarus Uprising's two bloom buffers lie in its scene's
     /// depth, each leave the bytes under them stale in it, apart, neither

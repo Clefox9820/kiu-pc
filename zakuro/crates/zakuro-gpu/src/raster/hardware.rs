@@ -4765,10 +4765,24 @@ impl Hardware {
 
     /// the same over the depth buffers alone, for the CPU reading where a
     /// depth buffer was drawn. the color buffers there it reads as memory
-    /// holds them, see draw, even over memory a depth buffer had before.
+    /// holds them, see draw, even over memory a depth buffer had before. but
+    /// where a color buffer replaced what a depth buffer drew, a draw over
+    /// all of it, those bytes are the color buffer's, as on the console, and
+    /// every buffer there comes down.
     #[track_caller]
     pub(crate) fn sync_depth<M: GpuMemory>(&mut self, memory: &mut M, addr: u32, len: u32) -> Result<(), String> {
-        self.sync_where(memory, addr, len, |surface| matches!(surface.kind, Kind::Depth(_)))
+        let end = addr.saturating_add(len);
+        let color_over = |from: u32, to: u32| {
+            let (from, to) = (from.max(addr), to.min(end));
+            from < to && self.surfaces.iter().any(|o| matches!(o.kind, Kind::Color(_)) && o.dirty_overlaps(from, to - from))
+        };
+        let replaced = self.surfaces.iter().any(|s| {
+            matches!(s.kind, Kind::Depth(_)) && s.overlaps(addr, len) && s.stale.spans().iter().any(|&(from, to)| color_over(s.addr + from, s.addr + to))
+        });
+        match replaced {
+            true => self.sync(memory, addr, len),
+            false => self.sync_where(memory, addr, len, |surface| matches!(surface.kind, Kind::Depth(_))),
+        }
     }
 
     #[track_caller]
@@ -5009,7 +5023,15 @@ impl Hardware {
         // nor where a fill wrote over what it drew
         let row_bytes = surface.row_bytes();
         let stale = surface.stale.overlaps(row * row_bytes, (row + texture.height) * row_bytes);
-        surface.dirty.is_some() && !changed && !stale
+        // nor where another surface drew the rows last, unless this one drew
+        // all of them or looked at what others drew there since: a lookup of
+        // some of its rows took memory's bytes for the rest, which another
+        // may hold
+        let rows = texture.height.min(surface.height - row);
+        let drawn = (0..self.surfaces.len()).any(|i| i != index && self.surfaces[i].dirty_overlaps(texture.addr, rows * row_bytes));
+        let current = surface.checked_over((row, row + rows)) || surface.dirty.is_some_and(|(from, to)| from <= row && row + rows <= to);
+        let behind = drawn && !current;
+        surface.dirty.is_some() && !changed && !stale && !behind
     }
 
     /// the image of a texture copied from the surface it is part of, copied
