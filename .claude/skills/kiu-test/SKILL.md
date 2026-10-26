@@ -17,6 +17,8 @@ Load before claiming a change works, after any edit under `zakuro/`, and for any
 - Vertices are shaded on the GPU by default; with `ZAKURO_CPU_SHADERS=1` 5 raster tests fail on integrated GPUs (known, not a regression).
 - Never judge performance from one run: automated runs varied 4–188 hitches. Use interleaved A/B (a1 b1 a2 b2) with an env switch.
 - Never measure during the boot cinematic or the white title screen; measure in real battles.
+- Measure frame pacing (unshown frames, present times) only with the display on: Windows turns it off after 15 idle minutes on this PC and then throttles presentation to ~33 fps, whatever the build or settings. CPU and GPU times and screen dumps (`ZAKURO_SHOT`) stay valid with it off.
+- Compare builds by screen dumps: runs from the same save state with no input draw the same frames, so `ZAKURO_SHOT` PNGs of two builds must match pixel for pixel; a mouse or keyboard touching the test window breaks that.
 - Behaviour changes need a test that fails before the fix (RED) and passes after (GREEN) when a deterministic test is possible.
 
 ## Decision Gates
