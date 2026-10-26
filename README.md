@@ -283,6 +283,12 @@ Tools used to work on it:
   `scripts\find-usa-addresses.ps1 -Europe <eur rom> -Usa <usa rom>` finds
   them from both ROMs and checks the table. It prints only addresses.
 - Widescreen would need more 3dsrecomp overrides and is not done.
+- Local wireless play (**Together > Nearby**) through a Zakuro room
+  (**Esc > Multiplayer**): a European and a USA copy find each other's
+  room, share the lobby and reach the warm-up arena together, but the
+  battle does not start for the player who joined yet. Tested with two
+  copies on one PC only. To debug it, set
+  `RUST_LOG=info,zakuro_core::services::uds=trace` to log every packet.
 - Performance was measured on one PC (Ryzen 5 5600G, integrated Radeon,
   Windows 10). On that driver, Vulkan's presentation in fifo mode, the only
   vsync mode it offers, blocks until the GPU finishes the frame; presenting
