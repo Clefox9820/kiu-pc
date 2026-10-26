@@ -184,6 +184,14 @@ Tools used to work on it:
 
 - `ZAKURO_LOAD_SLOT=<1-9>` starts the game from that save-state slot, for
   runs that should begin at the same place.
+- `ZAKURO_SHOT=<path prefix>` saves both screens as the GPU shows them every
+  600 frames, as `<prefix>-<frame>-top.png` and `-bottom.png`. Runs from the
+  same slot with no input draw the same frames, so two builds can be compared
+  pixel by pixel. Windows' own captures of the game window can come out white.
+- The log counts late frames every 10 s (`pacing:`) and names slow service
+  requests. `RUST_LOG=info,zakuro::frames=debug` logs every frame's time and
+  draws, and `zakuro_gpu::waits=debug` every wait for the GPU, with the line
+  that asked for it.
 - `ZAKURO_LOG_DRAWS=1` logs each texture drawn and the buffer it goes into,
   named as `ZAKURO_DUMP_TEXTURES=<folder>` saves the pictures, to tell which
   draws are which. It slows drawing.

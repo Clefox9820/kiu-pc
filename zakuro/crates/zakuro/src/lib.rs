@@ -343,6 +343,22 @@ struct Running {
     pacing: Pacing,
 }
 
+/// with ZAKURO_SHOT=<path prefix>, saves both screens as the GPU shows them
+/// to <prefix>-<frame>-top.png and -bottom.png, once a pacing window, for
+/// checking a change to the renderer by eye where the window can't be
+/// captured.
+fn save_screens(system: &mut System, frame: u64) {
+    static PREFIX: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    let Some(prefix) = PREFIX.get_or_init(|| std::env::var("ZAKURO_SHOT").ok()) else { return };
+    for (screen, name) in [(zakuro_common::Screen::Top, "top"), (zakuro_common::Screen::Bottom, "bottom")] {
+        let Some((pixels, width, height)) = system.upright_screen(screen, false) else { continue };
+        let path = format!("{prefix}-{frame}-{name}.png");
+        if let Err(error) = image::save_buffer(&path, &pixels, width, height, image::ExtendedColorType::Rgba8) {
+            log::warn!("could not save {path}, {error}");
+        }
+    }
+}
+
 /// how many frames of a window came late, the small stutters a hitch line
 /// is too coarse for: one over 20 ms shows a frame twice, one over 33 ms
 /// shows it three times or more.
@@ -1569,6 +1585,7 @@ impl App {
                     window.very_late,
                     window.worst.as_secs_f64() * 1000.0
                 );
+                save_screens(&mut game.system, game.frame);
             }
         }
         if !menu && (took.as_millis() >= 50 || since.as_millis() >= 100) {
