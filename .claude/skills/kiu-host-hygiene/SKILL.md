@@ -30,6 +30,7 @@ Load before launching or closing the game, touching Zakuro settings, saves or lo
 | Read the user's log | `.bat` that copies `%APPDATA%\zakuro\zakuro.log` to the repo's ignored scratch area, via `explorer.exe` |
 | Change the user's settings | `.bat` that backs up then copies a prepared `settings.toml` |
 | Test in game | `.bat` that sets the env vars (`ZAKURO_PORTRAITS`, probes) and calls `build\prueba.bat <slot>`, launched with `explorer.exe`; find its PID by the `test-data` command line, close it by PID when done |
+| Play or look at the test game unattended | `scripts\drive-window.ps1 -ProcessId <pid> -Steps "click:x,y;key:Return;shot:<png>"`; white shots without the fps overlay mean the display was asleep, which the script wakes before each shot |
 | Build the play exe | `powershell -File build\compilar.ps1`, any time; it adapts to whether the game is being played |
 
 ## Execution Steps
