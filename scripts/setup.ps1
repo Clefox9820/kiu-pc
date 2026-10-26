@@ -160,9 +160,21 @@ if (-not (Test-Path (Join-Path $Port "code\librecomp.a"))) {
         }
         $Overrides = $moved
     }
-    Run $RecompExe @("port", $Rom, $Port, "--name", "kid-icarus", "--overrides", $Overrides) $Build
+    # 3dsrecomp archives the ~810 objects with their whole paths when the
+    # overrides' objects sit in a folder of their own, and from a deep enough
+    # folder that command line passes Windows' 32767 characters. A drive
+    # letter of its own for build\ keeps the paths short.
+    $letter = [char[]]"ZYXWVUTSRQPONMLK" | Where-Object { -not (Test-Path "${_}:\") } | Select-Object -First 1
+    if (-not $letter) { Fail "no free drive letter to shorten build\'s paths with" }
+    & subst "${letter}:" $Build
+    if ($LASTEXITCODE -ne 0) { Fail "subst ${letter}: $Build failed ($LASTEXITCODE)" }
+    try {
+        Run $RecompExe @("port", $Rom, "${letter}:\$(Split-Path -Leaf $Port)", "--name", "kid-icarus", "--overrides", $Overrides) "${letter}:\"
+    } finally {
+        & subst "${letter}:" /D | Out-Null
+    }
 } else {
-    Write-Host "already translated, in build\port (-Force translates again)"
+    Write-Host "already translated, in $Port (-Force translates again)"
 }
 
 # --- the program, against this repository's Zakuro --------------------------
@@ -179,6 +191,11 @@ Set-Content -NoNewline -Path $manifest -Value $text
 New-Item -ItemType Directory -Force -Path (Join-Path $Port ".cargo") | Out-Null
 # built for this machine's processor only
 Set-Content -Path (Join-Path $Port ".cargo\config.toml") -Value "[build]`nrustflags = [`"-C`", `"target-cpu=native`"]"
+# the crate versions Zakuro is tested with, and 3dsrecomp's runtime at the
+# commit that translated the code; left alone, cargo takes 3dsrecomp's main
+# of the day, which the translated code was not made for
+Copy-Item -Force (Join-Path $Root "zakuro\Cargo.lock") (Join-Path $Port "Cargo.lock")
+Run cargo @("update", "--quiet", "-p", "recomp3ds", "-p", "recomp-abi", "--precise", $RecompCommit) $Port
 Run cargo @("build", "--release") $Port
 $Exe = Join-Path $Port "target\release\kid-icarus.exe"
 

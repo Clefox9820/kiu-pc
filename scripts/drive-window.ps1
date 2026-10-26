@@ -5,6 +5,8 @@ param(
     #   key:<Keys name or 0xVK> [ms]   holds a key (default 120 ms)
     #   click:<x>,<y>                  touches at window client pixels
     #   mouse:<dx>,<dy>,<count>        real relative mouse motion, for mouse aim
+    #   lmb:down | lmb:up              real left button, which fires while aiming
+    #   front                          brings the window in front, for mouse and lmb
     #   shot:<file.png>                captures the window's client area
     #   wait:<ms>
     [Parameter(Mandatory)][string]$Steps
@@ -100,6 +102,8 @@ foreach ($step in $Steps -split ';') {
             $dx, $dy, $n = $arg -split ','
             for ($i = 0; $i -lt [int]$n; $i++) { [Drv]::mouse_event(1, [int]$dx, [int]$dy, 0, [UIntPtr]::Zero); Start-Sleep -Milliseconds 16 }
         }
+        'lmb' { [Drv]::mouse_event($(if ($arg -eq 'down') { 2 } else { 4 }), 0, 0, 0, [UIntPtr]::Zero) }
+        'front' { [void][Drv]::SetThreadExecutionState(3); [void][Drv]::SetForegroundWindow($h); Start-Sleep -Milliseconds 300 }
         'shot' { Shot $arg }
         'wait' { Start-Sleep -Milliseconds ([int]$arg) }
         default { throw "unknown step '$step'" }
