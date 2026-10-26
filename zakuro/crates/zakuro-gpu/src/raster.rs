@@ -4396,6 +4396,127 @@ mod tests {
         assert!(rest.as_chunks::<4>().0.iter().all(|p| ColorFormat::Rgba8.decode(p) == [255, 0, 0, 255]), "the rows it drew stay red");
     }
 
+    /// buffers of two shapes over the same memory, as Kid Icarus Uprising
+    /// draws a 256x512 and a 240x320 one at the same address every frame,
+    /// take what the other drew on the GPU, without waiting for it, and
+    /// memory ends up as writing each back in between would leave it. the
+    /// narrow one covers the first row of tiles of the wide one and half of
+    /// the second, as 240x320 does 37 and a half rows of tiles of 256x512.
+    #[cfg(feature = "vulkan")]
+    #[test]
+    fn buffers_over_the_same_memory_take_what_the_other_drew_on_the_gpu() {
+        let rgba = |at: usize, out: &[u8]| ColorFormat::Rgba8.decode(&out[at..at + 4]);
+        for scale in [1, 2] {
+            for flushed_between in [false, true] {
+                let Ok(mut hardware) = hardware::Hardware::new() else { return };
+                hardware.set_scale(scale);
+                // 16x16, two rows of two tiles
+                let mut wide = target_registers();
+                sized(&mut wide, 16, 16);
+                // 8x24, three rows of one tile, the first three tiles of the wide one
+                let mut narrow = target_registers();
+                sized(&mut narrow, 8, 24);
+                // the window's top 8 rows, memory's first row of tiles
+                narrow[REG_VIEWPORT_XY] = 16 << 16;
+                narrow[REG_VIEWPORT_HEIGHT] = float24(4.0);
+                // the window's bottom 8 rows, memory's second row of tiles
+                let mut bottom = wide.clone();
+                bottom[REG_VIEWPORT_HEIGHT] = float24(4.0);
+                let mut memory = ConsoleMemory::default();
+                let mut resources = Resources { hardware: Some(hardware), ..Default::default() };
+                rasterize_shaded(&wide, &mut memory, &mut resources, &cover(-0.5, RED));
+                // reads the wide one's red, drawing green over its first tile
+                rasterize_shaded(&narrow, &mut memory, &mut resources, &cover(-0.5, GREEN));
+                let waits = resources.hardware.as_ref().unwrap().waited_done;
+                assert_eq!(waits, 0, "the narrow buffer took the drawing on the GPU at scale {scale}");
+                if flushed_between {
+                    resources.hardware.as_mut().unwrap().flush(&mut memory).unwrap();
+                    let mut out = [0u8; 1024];
+                    memory.read(COLOR, &mut out);
+                    assert!((0..256).step_by(4).all(|at| rgba(at, &out) == [0, 255, 0, 255]), "the narrow buffer's green at scale {scale}");
+                    assert!((256..1024).step_by(4).all(|at| rgba(at, &out) == [255, 0, 0, 255]), "the wide buffer's red at scale {scale}");
+                }
+                // and back, reads the green and the red, drawing blue over its
+                // second row of tiles
+                let before = resources.hardware.as_ref().unwrap().waited_done;
+                rasterize_shaded(&bottom, &mut memory, &mut resources, &cover(-0.5, BLUE));
+                let waits = resources.hardware.as_ref().unwrap().waited_done - before;
+                assert_eq!(waits, 0, "the wide buffer took the drawing back on the GPU at scale {scale}");
+                resources.hardware.as_mut().unwrap().flush(&mut memory).unwrap();
+                let mut out = [0u8; 1024];
+                memory.read(COLOR, &mut out);
+                let colors: Vec<[u8; 4]> = (0..1024).step_by(256).map(|at| rgba(at, &out)).collect();
+                for (tile, at) in (0..1024).step_by(4).map(|at| (at / 256, at)) {
+                    assert_eq!(rgba(at, &out), colors[tile], "tile {tile} is one color at scale {scale}");
+                }
+                assert_eq!(colors, [[0, 255, 0, 255], [255, 0, 0, 255], [0, 0, 255, 255], [0, 0, 255, 255]], "at scale {scale}");
+            }
+        }
+    }
+
+    /// bytes memory took after a buffer last matched it, which the rows it
+    /// drew around them came to include, a CPU write before the rows it
+    /// guards grew over them or a fill beside what it had drawn, stay
+    /// memory's when a buffer of another shape over the same memory is used,
+    /// as they do when the drawing is written back in between. Kid Icarus
+    /// Uprising's shapes, 256x512 and 240x320 at the same address.
+    #[cfg(feature = "vulkan")]
+    #[test]
+    fn bytes_memory_took_after_a_buffer_drew_survive_another_shape_taking_it() {
+        // memory's rows of a buffer of this width and height to draw over
+        let over = |width: u32, height: u32, (first, rows): (u32, u32)| {
+            let mut registers = target_registers();
+            sized(&mut registers, width, height);
+            // a depth buffer far from the color ones
+            registers[REG_DEPTH_BUFFER_ADDRESS] = 0x20_0000 >> 3;
+            // window rows run up from the buffer's last row of memory
+            registers[REG_VIEWPORT_XY] = (height - first - rows) << 16;
+            registers[REG_VIEWPORT_HEIGHT] = float24(rows as f32 / 2.0);
+            registers
+        };
+        // a tile of the 240x320 buffer's memory its draw leaves alone, the
+        // 256x512 one's row 100
+        const WRITTEN: u32 = COLOR + 100 * 1024;
+        let mut blue = [0u8; 4];
+        ColorFormat::Rgba8.encode([0, 0, 255, 255], &mut blue);
+        let blue = blue.repeat(64);
+        for filled in [false, true] {
+            for scale in [1, 3] {
+                for mut memory in [ConsoleMemory::default(), ConsoleMemory::scattered()] {
+                    let Ok(mut hardware) = hardware::Hardware::new() else { return };
+                    hardware.set_scale(scale);
+                    let mut resources = Resources { hardware: Some(hardware), ..Default::default() };
+                    rasterize_shaded(&over(256, 512, (480, 8)), &mut memory, &mut resources, &cover(-0.5, RED));
+                    // past the rows drawn and guarded so far
+                    if filled {
+                        let hardware = resources.hardware.as_mut().unwrap();
+                        hardware.before_fill(&mut memory, WRITTEN, 256, 4).unwrap();
+                        memory.write(WRITTEN, &blue);
+                        hardware.filled(WRITTEN, &blue).unwrap();
+                    } else {
+                        memory.write(WRITTEN, &blue);
+                    }
+                    // the rows drawn now reach around them
+                    rasterize_shaded(&over(256, 512, (0, 8)), &mut memory, &mut resources, &cover(-0.5, RED));
+                    rasterize_shaded(&over(240, 320, (0, 8)), &mut memory, &mut resources, &cover(-0.5, GREEN));
+                    resources.hardware.as_mut().unwrap().flush(&mut memory).unwrap();
+                    let mut out = [0u8; 256];
+                    memory.read(WRITTEN, &mut out);
+                    let what = if filled { "the fill" } else { "the write" };
+                    assert_eq!(out[..], blue[..], "{what} stays at scale {scale}");
+                    // and what was drawn reached memory
+                    let mut out = [0u8; 4];
+                    memory.read(COLOR, &mut out);
+                    assert_eq!(ColorFormat::Rgba8.decode(&out), [0, 255, 0, 255], "the narrow buffer's green at scale {scale}");
+                    memory.read(COLOR + 7680, &mut out);
+                    assert_eq!(ColorFormat::Rgba8.decode(&out), [255, 0, 0, 255], "the wide buffer's red past it at scale {scale}");
+                    memory.read(COLOR + 480 * 1024, &mut out);
+                    assert_eq!(ColorFormat::Rgba8.decode(&out), [255, 0, 0, 255], "the wide buffer's first red at scale {scale}");
+                }
+            }
+        }
+    }
+
     /// a fill over the first rows of a buffer the GPU drew leaves only the
     /// rest of the drawing to come down, so a buffer of another shape over
     /// the filled rows does not have it written back first.

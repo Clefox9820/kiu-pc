@@ -442,19 +442,25 @@ impl Surface {
     /// false when they do not join the bytes stale already, one span holds
     /// them all.
     fn supersede(&mut self, addr: u32, len: u32) -> bool {
-        let start = addr.max(self.addr) - self.addr;
-        let end = ((addr as u64 + len as u64).min(self.addr as u64 + self.size() as u64) - self.addr as u64) as u32;
-        let joined = match self.stale {
-            None => Some((start, end)),
-            Some((from, to)) if start <= to && from <= end => Some((from.min(start), to.max(end))),
-            Some(_) => None,
-        };
+        let joined = self.joined(addr, len);
         if let Some(span) = joined {
             self.stale = Some(span);
             // memory is newer than the image there, a draw looks again
             self.checked = false;
         }
         joined.is_some()
+    }
+
+    /// the bytes stale once some more of them go stale, from the buffer's
+    /// start, none when they do not join those stale already.
+    fn joined(&self, addr: u32, len: u32) -> Option<(u32, u32)> {
+        let start = addr.max(self.addr) - self.addr;
+        let end = ((addr as u64 + len as u64).min(self.addr as u64 + self.size() as u64) - self.addr as u64) as u32;
+        match self.stale {
+            None => Some((start, end)),
+            Some((from, to)) if start <= to && from <= end => Some((from.min(start), to.max(end))),
+            Some(_) => None,
+        }
     }
 
     /// the GPU changed rows of the image, rows of memory from the start.
@@ -667,6 +673,16 @@ struct Upright {
     batch: u64,
     /// nothing changed the surface since.
     current: bool,
+}
+
+/// what a surface looked up takes on the GPU from others over its memory
+/// that drew there, rather than through memory, which waits for the GPU.
+struct Handover {
+    /// each of them, the spans of memory copied out of it, whole tiles, and
+    /// the span that goes stale in it when it keeps what it drew past them.
+    from: Vec<(usize, Vec<(u32, u32)>, Option<(u32, u32)>)>,
+    /// the rows of memory of the surface looked up they come to.
+    rows: (u32, u32),
 }
 
 /// a copy of a surface on its way to the host, recorded along with what
@@ -1586,6 +1602,10 @@ pub struct Hardware {
     /// and those not written there yet.
     known_keys: std::collections::HashSet<PipelineKey>,
     new_keys: Vec<PipelineKey>,
+    /// how many times the host waited for work done, for the tests to tell
+    /// what waits without timing it.
+    #[cfg(test)]
+    pub(crate) waited_done: u32,
 }
 
 impl Hardware {
@@ -1821,6 +1841,8 @@ impl Hardware {
                 kept_pipelines,
                 known_keys: std::collections::HashSet::new(),
                 new_keys: Vec::new(),
+                #[cfg(test)]
+                waited_done: 0,
             };
             let ring_usage = vk::BufferUsageFlags::VERTEX_BUFFER
                 | vk::BufferUsageFlags::INDEX_BUFFER
@@ -2475,29 +2497,30 @@ impl Hardware {
         let others: Vec<usize> = (0..self.surfaces.len())
             .filter(|&i| i != index && self.surfaces[i].dirty_overlaps(from, to))
             .collect();
-        if !others.is_empty() {
-            if log::log_enabled!(target: "zakuro_gpu::waits", log::Level::Debug) {
-                let shape = |s: &Surface| format!("0x{:08X} {}x{} {:?}{}", s.addr, s.width, s.height, s.kind, if s.tiled { "" } else { " linear" });
-                let drew: Vec<String> = others.iter().map(|&i| shape(&self.surfaces[i])).collect();
-                log::debug!(target: "zakuro_gpu::waits", "{} reads memory {} drew", shape(&self.surfaces[index]), drew.join(", "));
-            }
+        // or it comes straight from their images, without a wait
+        let mut handover = if others.is_empty() { None } else { self.handover(memory, index, &others) };
+        // into the last lookup's buffer, a surface's worth of bytes allocated
+        // for each costs more than reading them
+        let mut bytes = std::mem::take(&mut self.scratch);
+        if handover.is_some() && self.surfaces[index].dirty.is_some() && self.differs(memory, index, false, &mut bytes) {
+            // memory changed beside rows it drew and lacks, which come down
+            // first, and what the others drew with them
+            handover = None;
+        }
+        if !others.is_empty() && log::log_enabled!(target: "zakuro_gpu::waits", log::Level::Debug) {
+            let shape = |s: &Surface| format!("0x{:08X} {}x{} {:?}{}", s.addr, s.width, s.height, s.kind, if s.tiled { "" } else { " linear" });
+            let drew: Vec<String> = others.iter().map(|&i| shape(&self.surfaces[i])).collect();
+            let how = if handover.is_some() { "takes on the GPU what" } else { "reads memory" };
+            log::debug!(target: "zakuro_gpu::waits", "{} {how} {} drew", shape(&self.surfaces[index]), drew.join(", "));
+        }
+        if handover.is_none() && !others.is_empty() {
             self.write_back(memory, others)?;
             self.begin()?;
         }
-        // into the last lookup's buffer, a surface's worth of bytes allocated
-        // for each costs more than reading them. compared in place where
-        // memory is in one piece, most lookups find nothing changed
-        let mut bytes = std::mem::take(&mut self.scratch);
-        let whole = 0..size as usize;
         // bytes a fill wrote can hold what the shadow does, and still be
-        // newer than the image
-        let stale = self.surfaces[index].stale.is_some();
-        let same = !stale && memory.slice(addr, size as usize).is_some_and(|now| self.surfaces[index].shadows(whole.clone(), now));
-        if !same {
-            bytes.resize(size as usize, 0);
-            memory.read(addr, &mut bytes);
-        }
-        if !same && (stale || !self.surfaces[index].shadows(whole, &bytes)) {
+        // newer than the image. those of a handover come from the others
+        let stale = handover.is_none() && self.surfaces[index].stale.is_some();
+        if self.differs(memory, index, stale, &mut bytes) {
             if self.surfaces[index].dirty.is_some() {
                 // memory changed beside rows the GPU drew and it lacks, which
                 // an upload alone would lose. they come down first, along
@@ -2509,9 +2532,193 @@ impl Hardware {
             self.upload(index, &bytes)?;
             self.surfaces[index].keep(&bytes);
         }
+        if let Some(handover) = handover {
+            self.hand_over(memory, index, handover)?;
+        }
         self.scratch = bytes;
         self.surfaces[index].checked = true;
         Ok(index)
+    }
+
+    /// whether guest memory differs from what a surface's image last
+    /// matched, or holds bytes newer than it where stale, compared in place
+    /// where memory is in one piece, as most lookups find nothing changed.
+    /// bytes holds memory's when it may differ.
+    fn differs<M: GpuMemory>(&self, memory: &mut M, index: usize, stale: bool, bytes: &mut Vec<u8>) -> bool {
+        let s = &self.surfaces[index];
+        let size = s.size() as usize;
+        if !stale && memory.slice(s.addr, size).is_some_and(|now| s.shadows(0..size, now)) {
+            return false;
+        }
+        bytes.resize(size, 0);
+        memory.read(s.addr, bytes);
+        stale || !s.shadows(0..size, bytes)
+    }
+
+    /// how a tiled color surface takes what others of its format drew over
+    /// its memory straight from their images. the same format lays a tile's
+    /// pixels out the same in a buffer of any width, so each tile copies
+    /// whole, only where it sits in each image differs. none when one of
+    /// them is a depth buffer, linear, of another format, has rows a fill
+    /// cleared that another may have drawn over, or what it drew there
+    /// does not split into whole tiles, or the rows it draws in then hold
+    /// what yet another drew, all of which go through memory instead.
+    fn handover<M: GpuMemory>(&self, memory: &mut M, index: usize, others: &[usize]) -> Option<Handover> {
+        let s = &self.surfaces[index];
+        if !matches!(s.kind, Kind::Color(_)) || !s.tiled || s.cleared.is_some() {
+            return None;
+        }
+        let tile = 64 * s.kind.bytes();
+        let (start, end) = (s.addr, s.addr + s.size());
+        let mut from = Vec::with_capacity(others.len());
+        let mut copied: Vec<(u32, u32)> = Vec::new();
+        for &i in others {
+            let o = &self.surfaces[i];
+            if o.kind != s.kind || !o.tiled || o.cleared.is_some() || o.addr.abs_diff(s.addr) % tile != 0 {
+                return None;
+            }
+            let (first, last) = o.dirty?;
+            let (drawn, past) = (o.addr + first * o.row_bytes(), o.addr + last * o.row_bytes());
+            // what it drew but for what a fill wrote over since, memory's
+            let pieces = match o.stale {
+                Some((from, to)) => [(drawn, past.min(o.addr + from)), (drawn.max(o.addr + to), past)],
+                None => [(drawn, past), (past, past)],
+            };
+            let spans: Vec<(u32, u32)> =
+                pieces.iter().map(|&(a, b)| (a.max(start), b.min(end))).filter(|&(a, b)| a < b).collect();
+            if spans.iter().any(|&(a, b)| !(a - start).is_multiple_of(tile) || !(b - start).is_multiple_of(tile)) {
+                return None;
+            }
+            // its dirty rows join all it drew, and can take in bytes memory
+            // got after it last matched memory, a CPU write before its guards
+            // grew over them or a fill beside what it had drawn then. its
+            // image is older there, writing it back keeps memory's bytes
+            // where they differ from its shadow, a copy would not
+            let current = |memory: &mut M, (a, b): (u32, u32)| {
+                let range = (a - o.addr) as usize..(b - o.addr) as usize;
+                match memory.slice(a, range.len()) {
+                    Some(now) => o.shadows(range, now),
+                    None => {
+                        let mut now = vec![0u8; range.len()];
+                        memory.read(a, &mut now);
+                        o.shadows(range, &now)
+                    }
+                }
+            };
+            if !spans.iter().all(|&span| current(memory, span)) {
+                return None;
+            }
+            // one surface holds a byte newer than memory, each copied once
+            if spans.iter().any(|&(a, b)| copied.iter().any(|&(c, d)| a < d && c < b)) {
+                return None;
+            }
+            // what it drew past this surface stays its own, the bytes
+            // inside go stale in it, which have to join those stale already
+            let inside = pieces.iter().all(|&(a, b)| a >= b || (start <= a && b <= end));
+            let kept = (drawn.max(start), past.min(end).saturating_sub(drawn.max(start)));
+            if !inside && o.joined(kept.0, kept.1).is_none() {
+                return None;
+            }
+            copied.extend(&spans);
+            from.push((i, spans, (!inside).then_some(kept)));
+        }
+        // its stale bytes, a fill's or those another took, come back with them
+        if let Some((a, b)) = s.stale {
+            if !copied.iter().any(|&(c, d)| c <= s.addr + a && s.addr + b <= d) {
+                return None;
+            }
+        }
+        let row = s.row_bytes();
+        let first = copied.iter().map(|&(a, _)| (a - start) / row).min()?;
+        let last = copied.iter().map(|&(_, b)| (b - start).div_ceil(row)).max()?;
+        // the rows of tiles it holds the drawing of then, as drew has them,
+        // the other bytes there memory's, which no one else may have drawn
+        let (top, bottom) = (first / 8 * 8, last.div_ceil(8).saturating_mul(8).min(s.height));
+        let (top, bottom) = s.dirty.map_or((top, bottom), |(from, to)| (from.min(top), to.max(bottom)));
+        let (addr, len) = (start + top * row, (bottom - top) * row);
+        if (0..self.surfaces.len()).any(|j| j != index && !others.contains(&j) && self.surfaces[j].dirty_overlaps(addr, len)) {
+            return None;
+        }
+        Some(Handover { from, rows: (first, last) })
+    }
+
+    /// copies what others drew into a surface's image, as handover planned,
+    /// once the image took what memory holds, and has the surface hold the
+    /// drawing in their place, as though it drew it.
+    fn hand_over<M: GpuMemory>(&mut self, memory: &mut M, index: usize, handover: Handover) -> Result<(), String> {
+        self.begin()?;
+        self.end_rendering();
+        self.mark(Work::Copy, false);
+        // what drew into either image, or went into this one from memory,
+        // comes first
+        self.barrier();
+        let scale = self.scale;
+        // where a tile is in an image, the first one at the window's top
+        let corner = |surface: &Surface, tile: u32| {
+            let across = surface.width / 8;
+            let (x, y) = (tile % across * 8, surface.height - (tile / across + 1) * 8);
+            vk::Offset3D { x: (x * scale) as i32, y: (y * scale) as i32, z: 0 }
+        };
+        let layers = vk::ImageSubresourceLayers::default().aspect_mask(vk::ImageAspectFlags::COLOR).layer_count(1);
+        let s = &self.surfaces[index];
+        let tile = 64 * s.kind.bytes();
+        for (i, spans, _) in &handover.from {
+            let o = &self.surfaces[*i];
+            let mut regions = Vec::new();
+            for &(a, b) in spans {
+                let mut at = a;
+                while at < b {
+                    let (source, target) = ((at - o.addr) / tile, (at - s.addr) / tile);
+                    // a run of tiles along a row of tiles of both
+                    let run = (o.width / 8 - source % (o.width / 8)).min(s.width / 8 - target % (s.width / 8)).min((b - at) / tile);
+                    regions.push(
+                        vk::ImageCopy::default()
+                            .src_subresource(layers)
+                            .src_offset(corner(o, source))
+                            .dst_subresource(layers)
+                            .dst_offset(corner(s, target))
+                            .extent(vk::Extent3D { width: run * 8 * scale, height: 8 * scale, depth: 1 }),
+                    );
+                    at += run * tile;
+                }
+            }
+            // SAFETY: recording, outside rendering, between two images of the
+            // same format in the general layout made for transfers, every
+            // region inside both
+            unsafe {
+                self.device.cmd_copy_image(self.commands, o.image.image, vk::ImageLayout::GENERAL, s.image.image, vk::ImageLayout::GENERAL, &regions)
+            };
+        }
+        self.unfenced = true;
+        self.uploads = true;
+        for (i, _, kept) in handover.from {
+            let o = &mut self.surfaces[i];
+            match kept {
+                Some((addr, len)) => {
+                    let joined = o.supersede(addr, len);
+                    debug_assert!(joined, "handover checked the stale bytes join");
+                }
+                None => {
+                    // all it drew is this one's now. its image is not what
+                    // memory holds, and takes memory's bytes at its next use
+                    o.shadow.clear();
+                    o.pixel = None;
+                    o.dirty = None;
+                    o.guarded = None;
+                    o.write_guarded = None;
+                    o.cleared = None;
+                    o.stale = None;
+                    o.checked = false;
+                }
+            }
+        }
+        let s = &mut self.surfaces[index];
+        s.stale = None;
+        s.drew(handover.rows);
+        // what it holds now is the same in between, as after an upload
+        s.untwin();
+        s.guard_writes(memory);
+        Ok(())
     }
 
     /// the GPU drew rows of a surface, which other surfaces over the same
@@ -5135,6 +5342,10 @@ impl Hardware {
         let start = self.timing.is_some().then(std::time::Instant::now);
         let started = std::time::Instant::now();
         let _timer = crate::stats::time(&crate::stats::WAITING);
+        #[cfg(test)]
+        if matches!(why, Wait::Done) {
+            self.waited_done += 1;
+        }
         self.retire_oldest()?;
         // a long wait is the GPU behind, a frame the player feels
         let took = started.elapsed().as_secs_f64() * 1000.0;
