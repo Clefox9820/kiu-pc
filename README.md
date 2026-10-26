@@ -22,7 +22,7 @@ Everything else is still emulated by Zakuro:
 | --- | --- |
 | Game CPU code | Recompiled to C ahead of time, compiled with gcc |
 | 3DS OS and services | Emulated (high-level) by Zakuro |
-| PICA200 GPU | Translated to Vulkan at run time; on integrated GPUs vertex shading is done on the CPU |
+| PICA200 GPU | Translated to Vulkan at run time, vertex shaders included |
 | DSP audio | Simulated on the CPU, played through cpal |
 | Cartridge | Read from your ROM file |
 
@@ -146,8 +146,29 @@ gameplay once warm.
   (`<title>.keys`) and compiled at start, so shader compilation stalls happen
   only the first time.
 
+Kid Icarus draws at 30 frames a second, so each picture has two display
+refreshes (33 ms) to be ready; when one takes longer it shows for a refresh
+too many or too few, which reads as judder. Zakuro used to wait for the GPU
+several times a frame, whenever the game reused the memory of a buffer it had
+drawn in another shape: its bloom samples the top screen as a 240x400 texture
+and draws into memory its depth buffer used. These now stay on the GPU. On a
+Ryzen 5 5600G with its integrated Radeon graphics, at 3x resolution with
+frame interpolation, a frame that draws went from 33 ms to 6-7 ms, and the
+CPU no longer waits for the GPU within a frame. Screens are pixel-identical
+to before at 1x; at 3x the top screen is sharper, because its last pass now
+samples the 3x picture instead of a console-resolution copy.
+
+On an integrated GPU the GPU itself is then the limit:
+
+- At 3x with frame interpolation it is about 80 % busy, and the Vulkan
+  driver holds each presented picture until the GPU catches up, so some
+  pictures are skipped. Frame interpolation costs about a quarter of the GPU
+  time, since it draws the 3D scene twice.
+- 2x resolution, or 3x without frame interpolation, leaves headroom.
+
 If you still see stutter, the log at `%APPDATA%\zakuro\zakuro.log` contains
-`hitch:` lines with a per-frame breakdown; include them in a bug report.
+`hitch:` lines with a per-frame breakdown and a `pacing:` line every 10
+seconds; include them in a bug report.
 
 ## Single screen (work in progress)
 
@@ -187,7 +208,9 @@ Tools used to work on it:
 - `ZAKURO_SHOT=<path prefix>` saves both screens as the GPU shows them every
   600 frames, as `<prefix>-<frame>-top.png` and `-bottom.png`. Runs from the
   same slot with no input draw the same frames, so two builds can be compared
-  pixel by pixel. Windows' own captures of the game window can come out white.
+  pixel by pixel, the pictures in between included (`-top-between.png`).
+  Windows' own captures of the game window come out white while the display
+  is asleep.
 - `ZAKURO_TWIN_ALL=1` has frame interpolation draw every picture in between as
   it did before it knew which screens the window shows, so one build can be
   compared both ways; `RUST_LOG=zakuro_gpu::twins=debug` says what it drew for
@@ -222,6 +245,11 @@ Tools used to work on it:
   `scripts\find-usa-addresses.ps1 -Europe <eur rom> -Usa <usa rom>` finds
   them from both ROMs and checks the table. It prints only addresses.
 - Widescreen would need more 3dsrecomp overrides and is not done.
+- Performance was measured on one PC (Ryzen 5 5600G, integrated Radeon,
+  Windows 10). On that driver, Vulkan's presentation in fifo mode, the only
+  vsync mode it offers, blocks until the GPU finishes the frame; presenting
+  from a thread of its own on a second queue is being tried. Reports from
+  other GPUs are welcome.
 - The changes to Zakuro in this repository were written with AI assistance.
   They have not been sent upstream; the Zakuro author does not accept fully
   AI-written contributions, so a human must review them first.
