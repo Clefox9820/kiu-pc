@@ -137,6 +137,9 @@ pub(super) struct Draw<'a> {
     /// whether the fog is on, and its table.
     pub(super) fog: bool,
     pub(super) fog_table: &'a fog::Table,
+    /// the draw writes every pixel of the whole target without reading it,
+    /// so what memory or other buffers held there does not matter.
+    pub(super) replaces: bool,
 }
 
 /// where something is staged in the ring, and its bytes.
@@ -293,6 +296,93 @@ impl Kind {
     }
 }
 
+/// the most spans apart a surface keeps stale, past which what it drew comes
+/// down instead. Kid Icarus Uprising's scene depth has two, under its two
+/// bloom buffers.
+const MOST_STALE_SPANS: usize = 8;
+
+/// spans of a surface's bytes, from its start, apart and in order, joined
+/// where they meet. nothing is allocated while there are none.
+#[derive(Clone, Default, PartialEq, Eq)]
+struct Stale(Vec<(u32, u32)>);
+
+impl std::fmt::Debug for Stale {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.debug_list().entries(&self.0).finish()
+    }
+}
+
+impl Stale {
+    fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    fn clear(&mut self) {
+        self.0.clear();
+    }
+
+    fn spans(&self) -> &[(u32, u32)] {
+        &self.0
+    }
+
+    /// the spans once another joins them, none when that leaves more apart
+    /// than MOST_STALE_SPANS.
+    fn with(&self, (start, end): (u32, u32)) -> Option<Stale> {
+        if start >= end {
+            return Some(self.clone());
+        }
+        let (mut start, mut end) = (start, end);
+        let mut spans = Vec::with_capacity(self.0.len() + 1);
+        for &(from, to) in &self.0 {
+            if to < start || end < from {
+                spans.push((from, to));
+            } else {
+                (start, end) = (start.min(from), end.max(to));
+            }
+        }
+        let at = spans.partition_point(|&(from, _)| from < start);
+        spans.insert(at, (start, end));
+        (spans.len() <= MOST_STALE_SPANS).then_some(Stale(spans))
+    }
+
+    /// whether any of them overlaps the bytes from start to end.
+    fn overlaps(&self, start: u32, end: u32) -> bool {
+        self.0.iter().any(|&(from, to)| from < end && start < to)
+    }
+
+    /// the bytes from start to end outside them, a piece at a time, until
+    /// each says true, and whether one did.
+    fn any_outside(&self, start: u32, end: u32, mut each: impl FnMut(u32, u32) -> bool) -> bool {
+        let mut at = start;
+        for &(from, to) in &self.0 {
+            if to <= at {
+                continue;
+            }
+            if from >= end {
+                break;
+            }
+            if from > at && each(at, from) {
+                return true;
+            }
+            at = at.max(to);
+            if at >= end {
+                return false;
+            }
+        }
+        at < end && each(at, end)
+    }
+
+    /// those pieces.
+    fn outside(&self, start: u32, end: u32) -> Vec<(u32, u32)> {
+        let mut pieces = Vec::new();
+        self.any_outside(start, end, |from, to| {
+            pieces.push((from, to));
+            false
+        });
+        pieces
+    }
+}
+
 /// a color or depth buffer of the guest's, kept on the GPU with its rows
 /// bottom first, the other way from memory, see draw.
 struct Surface {
@@ -326,10 +416,11 @@ struct Surface {
     /// rows a fill cleared while others it drew had not come down, which
     /// another surface over the same memory may have drawn over since.
     cleared: Option<(u32, u32)>,
-    /// bytes a fill wrote after the GPU drew there, from the buffer's start,
-    /// memory's from then on and none of the image's, what it drew past
+    /// bytes a fill wrote after the GPU drew there, or another surface or
+    /// a draw over all of one took, from the buffer's start, memory's or
+    /// another's from then on and none of the image's, what it drew past
     /// them still has to come down, around them.
-    stale: Option<(u32, u32)>,
+    stale: Stale,
     capture: Option<Capture>,
     /// when drawing scaled, an image at the console's resolution the
     /// surface goes through on its way to and from guest memory, and a
@@ -437,40 +528,31 @@ impl Surface {
         self.dirty.is_some_and(|(start, end)| {
             let (from, to) = (self.addr + start * self.row_bytes(), self.addr + end * self.row_bytes());
             let overlaps = |from: u32, to: u32| from < to && addr < to && from < addr + len;
-            match self.stale {
-                // what a fill wrote over since is memory's
-                Some((stale_from, stale_to)) => {
-                    overlaps(from, to.min(self.addr + stale_from)) || overlaps(from.max(self.addr + stale_to), to)
-                }
-                None => overlaps(from, to),
-            }
+            // what a fill wrote over since is memory's
+            self.stale.any_outside(from - self.addr, to - self.addr, |from, to| overlaps(self.addr + from, self.addr + to))
         })
     }
 
     /// a fill wrote over some of the bytes it drew, which are memory's now,
     /// the rest of what it drew stays on the GPU until something needs it.
-    /// false when they do not join the bytes stale already, one span holds
-    /// them all.
+    /// false when that leaves more spans stale apart than it keeps.
     fn supersede(&mut self, addr: u32, len: u32) -> bool {
         let joined = self.joined(addr, len);
-        if let Some(span) = joined {
-            self.stale = Some(span);
+        let superseded = joined.is_some();
+        if let Some(stale) = joined {
+            self.stale = stale;
             // memory is newer than the image there, a draw looks again
             self.checked = false;
         }
-        joined.is_some()
+        superseded
     }
 
     /// the bytes stale once some more of them go stale, from the buffer's
-    /// start, none when they do not join those stale already.
-    fn joined(&self, addr: u32, len: u32) -> Option<(u32, u32)> {
+    /// start, none when that leaves more spans apart than it keeps.
+    fn joined(&self, addr: u32, len: u32) -> Option<Stale> {
         let start = addr.max(self.addr) - self.addr;
         let end = ((addr as u64 + len as u64).min(self.addr as u64 + self.size() as u64) - self.addr as u64) as u32;
-        match self.stale {
-            None => Some((start, end)),
-            Some((from, to)) if start <= to && from <= end => Some((from.min(start), to.max(end))),
-            Some(_) => None,
-        }
+        self.stale.with((start, end))
     }
 
     /// the GPU changed rows of the image, rows of memory from the start.
@@ -2359,6 +2441,7 @@ impl Hardware {
     }
 
     /// the surface for a guest buffer, matching guest memory.
+    #[track_caller]
     fn surface<M: GpuMemory>(
         &mut self,
         memory: &mut M,
@@ -2480,7 +2563,7 @@ impl Hardware {
             guarded: None,
             write_guarded: None,
             cleared: None,
-            stale: None,
+            stale: Stale::default(),
             capture: None,
             native,
             screen: None,
@@ -2546,6 +2629,110 @@ impl Hardware {
         Ok(self.holds(texture))
     }
 
+    /// whether buffers of other shapes drew over a color buffer's memory
+    /// that memory has not got yet.
+    pub(crate) fn drawn_over(&self, addr: u32, (width, height): (u32, u32), format: ColorFormat) -> bool {
+        let kind = Kind::Color(format);
+        let len = width * height * kind.bytes();
+        let shape = |s: &Surface| s.addr == addr && s.width == width && s.height == height && s.kind == kind && s.tiled;
+        self.surfaces.iter().any(|s| !shape(s) && s.dirty_overlaps(addr, len))
+    }
+
+    /// the surface for a tiled color buffer a draw is about to cover whole
+    /// without reading it, as the console's GPU would leave nothing of what
+    /// was there. what others drew over its memory goes stale in them, as
+    /// a fill's bytes do, rather than coming down first, which waits for
+    /// the GPU, and memory's bytes are not uploaded, the draw writes every
+    /// pixel. none when a buffer would keep more spans stale than it may, or
+    /// memory changed under what one drew, a CPU write or a fill, which
+    /// then go through memory as before.
+    fn overwritten<M: GpuMemory>(&mut self, memory: &mut M, addr: u32, (width, height): (u32, u32), kind: Kind) -> Result<Option<usize>, String> {
+        #[cfg(test)]
+        if self.through_memory {
+            return Ok(None);
+        }
+        let found = self.surfaces.iter().position(|s| s.addr == addr && s.width == width && s.height == height && s.kind == kind && s.tiled);
+        let len = width * height * kind.bytes();
+        let others: Vec<usize> = (0..self.surfaces.len()).filter(|&i| Some(i) != found && self.surfaces[i].dirty_overlaps(addr, len)).collect();
+        // each one's bytes there, as it last matched memory, which memory
+        // still holds where it drew
+        let current = |memory: &mut M, o: &Surface| {
+            let (first, last) = o.dirty.unwrap_or((0, 0));
+            let (start, end) = ((o.addr + first * o.row_bytes()).max(addr), (o.addr + last * o.row_bytes()).min(addr + len));
+            if start >= end {
+                return true;
+            }
+            let range = (start - o.addr) as usize..(end - o.addr) as usize;
+            match memory.slice(start, range.len()) {
+                Some(now) => o.shadows(range, now),
+                None => {
+                    let mut now = vec![0u8; range.len()];
+                    memory.read(start, &mut now);
+                    o.shadows(range, &now)
+                }
+            }
+        };
+        for &i in &others {
+            let o = &self.surfaces[i];
+            let why = match () {
+                _ if o.joined(addr, len).is_none() => "more spans stale than it keeps apart",
+                _ if !current(memory, o) => "memory changed under its drawing",
+                _ => continue,
+            };
+            if log::log_enabled!(target: "zakuro_gpu::waits", log::Level::Debug) {
+                log::debug!(
+                    target: "zakuro_gpu::waits",
+                    "a draw into 0x{addr:08X} {width}x{height} {kind:?} does not replace it whole, 0x{:08X} {}x{} {:?} drew there with {why}, dirty {:?} stale {:?}",
+                    o.addr,
+                    o.width,
+                    o.height,
+                    o.kind,
+                    o.dirty,
+                    o.stale
+                );
+            }
+            return Ok(None);
+        }
+        let index = match found {
+            Some(index) => index,
+            None => self.make_surface(addr, (width, height), kind, true)?,
+        };
+        for i in others {
+            let o = &mut self.surfaces[i];
+            let joined = o.supersede(addr, len);
+            debug_assert!(joined, "checked above");
+            // all it drew is under the draw, its image is not what memory
+            // will hold, and takes memory's bytes at its next use
+            if o.dirty.is_some_and(|(first, last)| !o.stale.any_outside(first * o.row_bytes(), last * o.row_bytes(), |_, _| true)) {
+                o.shadow.clear();
+                o.pixel = None;
+                o.dirty = None;
+                o.guarded = None;
+                o.write_guarded = None;
+                o.cleared = None;
+                o.stale.clear();
+                o.checked = false;
+            }
+        }
+        // the shadow is memory as the draw finds it, which tells what the
+        // CPU writes over the drawing later. nothing it held before counts,
+        // the draw goes over all of it
+        let mut bytes = std::mem::take(&mut self.scratch);
+        if self.differs(memory, index, false, &mut bytes) {
+            self.surfaces[index].keep(&bytes);
+        }
+        self.scratch = bytes;
+        let s = &mut self.surfaces[index];
+        s.dirty = None;
+        s.cleared = None;
+        s.stale.clear();
+        s.untwin();
+        s.checked = true;
+        s.checked_rows = (0, height);
+        Ok(Some(index))
+    }
+
+    #[track_caller]
     fn surface_rows<M: GpuMemory>(
         &mut self,
         memory: &mut M,
@@ -2593,7 +2780,13 @@ impl Hardware {
             let shape = |s: &Surface| format!("0x{:08X} {}x{} {:?}{}", s.addr, s.width, s.height, s.kind, if s.tiled { "" } else { " linear" });
             let drew: Vec<String> = others.iter().map(|&i| shape(&self.surfaces[i])).collect();
             let how = if handover.is_some() { "takes on the GPU what" } else { "reads memory" };
-            log::debug!(target: "zakuro_gpu::waits", "{} {how} {} drew", shape(&self.surfaces[index]), drew.join(", "));
+            log::debug!(
+                target: "zakuro_gpu::waits",
+                "{} {how} {} drew, asked at {}",
+                shape(&self.surfaces[index]),
+                drew.join(", "),
+                std::panic::Location::caller()
+            );
         }
         if handover.is_none() && !others.is_empty() {
             self.write_back(memory, others)?;
@@ -2601,7 +2794,7 @@ impl Hardware {
         }
         // bytes a fill wrote can hold what the shadow does, and still be
         // newer than the image. those of a handover come from the others
-        let stale = handover.is_none() && self.surfaces[index].stale.is_some();
+        let stale = handover.is_none() && !self.surfaces[index].stale.is_empty();
         if self.differs(memory, index, stale, &mut bytes) {
             if self.surfaces[index].dirty.is_some() {
                 // memory changed beside rows the GPU drew and it lacks, which
@@ -2675,10 +2868,8 @@ impl Hardware {
             let (first, last) = o.dirty?;
             let (drawn, past) = (o.addr + first * o.row_bytes(), o.addr + last * o.row_bytes());
             // what it drew but for what a fill wrote over since, memory's
-            let pieces = match o.stale {
-                Some((from, to)) => [(drawn, past.min(o.addr + from)), (drawn.max(o.addr + to), past)],
-                None => [(drawn, past), (past, past)],
-            };
+            let pieces: Vec<(u32, u32)> =
+                o.stale.outside(drawn - o.addr, past - o.addr).into_iter().map(|(a, b)| (o.addr + a, o.addr + b)).collect();
             let spans: Vec<(u32, u32)> =
                 pieces.iter().map(|&(a, b)| (a.max(start), b.min(end))).filter(|&(a, b)| a < b).collect();
             if spans.iter().any(|&(a, b)| !(a - start).is_multiple_of(tile) || !(b - start).is_multiple_of(tile)) {
@@ -2708,7 +2899,7 @@ impl Hardware {
                 return None;
             }
             // what it drew past this surface stays its own, the bytes
-            // inside go stale in it, which have to join those stale already
+            // inside go stale in it, within the spans it keeps apart
             let inside = pieces.iter().all(|&(a, b)| a >= b || (start <= a && b <= end));
             let kept = (drawn.max(start), past.min(end).saturating_sub(drawn.max(start)));
             if !inside && o.joined(kept.0, kept.1).is_none() {
@@ -2718,7 +2909,7 @@ impl Hardware {
             from.push((i, spans, (!inside).then_some(kept)));
         }
         // its stale bytes, a fill's or those another took, come back with them
-        if let Some((a, b)) = s.stale {
+        for &(a, b) in s.stale.spans() {
             if !copied.iter().any(|&(c, d)| c <= s.addr + a && s.addr + b <= d) {
                 return None;
             }
@@ -2802,13 +2993,13 @@ impl Hardware {
                     o.guarded = None;
                     o.write_guarded = None;
                     o.cleared = None;
-                    o.stale = None;
+                    o.stale.clear();
                     o.checked = false;
                 }
             }
         }
         let s = &mut self.surfaces[index];
-        s.stale = None;
+        s.stale.clear();
         s.drew(handover.rows);
         // what it holds now is the same in between, as after an upload
         s.untwin();
@@ -3451,7 +3642,7 @@ impl Hardware {
                     }
                     if left.is_none() {
                         // nothing it drew is left to come down around them
-                        surface.stale = None;
+                        surface.stale.clear();
                     }
                     if left.is_some() {
                         surface.cleared = Some(surface.cleared.map_or(rows, |(from, to)| (from.min(rows.0), to.max(rows.1))));
@@ -3482,7 +3673,7 @@ impl Hardware {
                 surface.guarded = None;
                 surface.write_guarded = None;
                 surface.cleared = None;
-                surface.stale = None;
+                surface.stale.clear();
                 surface.checked = false;
                 continue;
             }
@@ -3534,7 +3725,7 @@ impl Hardware {
             surface.guarded = None;
             surface.write_guarded = None;
             surface.cleared = None;
-            surface.stale = None;
+            surface.stale.clear();
             surface.checked = false;
             surface.replaced();
         }
@@ -3975,10 +4166,41 @@ impl Hardware {
             _ => height,
         };
         let raise = (height - draw.height) as i32;
+        // a draw over all of its own buffer, a taller one taking none of it,
+        // its depth buffer elsewhere, and on the image rather than only in
+        // between
+        let len = draw.width * draw.height * Kind::Color(draw.format).bytes();
+        let apart = |(addr, bytes): (u32, u32)| addr >= draw.target + len || addr + draw.width * draw.height * bytes <= draw.target;
+        let refused = if !draw.replaces {
+            None
+        } else if pass == Pass::Twin {
+            Some("the draw in between".to_string())
+        } else if raise != 0 {
+            Some(format!("a taller buffer {height} rows high takes it"))
+        } else if rows != (0, draw.height) {
+            Some(format!("rows {rows:?} looked up"))
+        } else if !draw.depth.is_none_or(apart) {
+            Some("its depth buffer inside it".to_string())
+        } else {
+            None
+        };
+        let replaces = draw.replaces && refused.is_none();
+        if log::log_enabled!(target: "zakuro_gpu::waits", log::Level::Debug) {
+            if let Some(why) = refused {
+                log::debug!(target: "zakuro_gpu::waits", "a draw into 0x{:08X} {}x{} {:?} does not replace it whole, {why}", draw.target, draw.width, draw.height, draw.format);
+            }
+        }
         // a flush looking one of them up drops what the other had checked
         let (color, depth) = loop {
             let size = (draw.width, height);
-            let color = self.surface_rows(memory, draw.target, size, Kind::Color(draw.format), true, Some(rows))?;
+            let replaced = match replaces {
+                true => self.overwritten(memory, draw.target, size, Kind::Color(draw.format))?,
+                false => None,
+            };
+            let color = match replaced {
+                Some(color) => color,
+                None => self.surface_rows(memory, draw.target, size, Kind::Color(draw.format), true, Some(rows))?,
+            };
             let depth = match draw.depth {
                 Some((addr, bytes)) => Some(self.surface_rows(memory, addr, size, Kind::Depth(bytes), true, Some(rows))?),
                 None => None,
@@ -4417,7 +4639,7 @@ impl Hardware {
             surface.guarded = None;
             surface.write_guarded = None;
             surface.cleared = None;
-            surface.stale = None;
+            surface.stale.clear();
             surface.checked = false;
             surface.replaced();
         }
@@ -4664,7 +4886,7 @@ impl Hardware {
         });
         // nor where a fill wrote over what it drew
         let row_bytes = surface.row_bytes();
-        let stale = surface.stale.is_some_and(|(from, to)| from < (row + texture.height) * row_bytes && row * row_bytes < to);
+        let stale = surface.stale.overlaps(row * row_bytes, (row + texture.height) * row_bytes);
         surface.dirty.is_some() && !changed && !stale
     }
 
@@ -5739,7 +5961,7 @@ impl Hardware {
             }
         }
         // and the bytes a fill wrote over since are memory's whatever they hold
-        if let Some((from, to)) = s.stale {
+        for &(from, to) in s.stale.spans() {
             let (from, to) = ((from as usize).max(rows.start), (to as usize).min(rows.end));
             if from < to {
                 let mut now = vec![0u8; to - from];
@@ -5765,7 +5987,7 @@ impl Hardware {
         surface.cleared = None;
         // where a fill wrote, the image is behind memory, which it takes
         // again before it is used, whatever the shadow came to hold
-        if surface.stale.take().is_some() {
+        if !std::mem::take(&mut surface.stale).is_empty() {
             surface.shadow.clear();
             surface.pixel = None;
             surface.checked = false;
@@ -6184,6 +6406,31 @@ mod tests {
 
     use super::*;
 
+    /// stale spans stay in order and apart, join where they meet or
+    /// overlap, leave the bytes between them to be told apart, and no more
+    /// than MOST_STALE_SPANS of them are kept.
+    #[test]
+    fn stale_spans_join_where_they_meet_and_no_more_are_kept() {
+        let stale = Stale::default().with((300, 400)).unwrap().with((0, 100)).unwrap();
+        assert_eq!(stale.spans(), [(0, 100), (300, 400)]);
+        // meeting one, then overlapping both
+        let met = stale.with((100, 150)).unwrap();
+        assert_eq!(met.spans(), [(0, 150), (300, 400)]);
+        assert_eq!(met.with((120, 320)).unwrap().spans(), [(0, 400)]);
+        // the bytes outside them, and whether any overlap
+        assert_eq!(stale.outside(50, 500), [(100, 300), (400, 500)]);
+        assert!(stale.outside(0, 100).is_empty());
+        assert!(stale.overlaps(99, 101) && !stale.overlaps(100, 300));
+        // nothing added for no bytes
+        assert_eq!(stale.with((200, 200)).unwrap(), stale);
+        let mut many = Stale::default();
+        for k in 0..MOST_STALE_SPANS as u32 {
+            many = many.with((k * 10, k * 10 + 5)).unwrap();
+        }
+        assert!(many.with((1000, 1005)).is_none(), "one more apart than kept");
+        assert!(many.with((5, 10)).is_some(), "joining two keeps them as many");
+    }
+
     /// a block gathered with the words of the last one staged is read from
     /// where that went, any other is staged anew, and nothing is read from
     /// a batch handed over.
@@ -6241,7 +6488,7 @@ mod tests {
                 guarded: None,
                 write_guarded: None,
                 cleared: None,
-                stale: None,
+                stale: Stale::default(),
                 capture: None,
                 native: None,
                 screen: None,

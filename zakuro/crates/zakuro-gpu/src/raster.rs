@@ -2401,8 +2401,182 @@ impl DrawState<'_> {
             proctex_tables: self.proctex_tables,
             fog: self.fog.is_some(),
             fog_table: self.fog_table,
+            replaces: false,
         }
     }
+}
+
+/// why a draw may not write all of every pixel it covers whatever its
+/// buffer held, none when it does: all four channels, without blending or
+/// a logic op that reads the buffer, and with no alpha, depth or stencil
+/// test that can keep a pixel as it was, no texture it samples nor its
+/// depth buffer over the buffer's memory, the bytes given.
+#[cfg(feature = "vulkan")]
+fn partial_pixels<M: GpuMemory>(registers: &[u32], memory: &M, (addr, len): (u32, u32), (width, height): (u32, u32)) -> Option<&'static str> {
+    if registers[REG_COLOR_BUFFER_WRITE] == 0 {
+        return Some("color writes off");
+    }
+    if (registers[REG_DEPTH_COLOR_MASK] >> 8) & 0xF != 0xF {
+        return Some("color mask");
+    }
+    if registers[REG_COLOR_OPERATION] & 0x100 != 0 {
+        // min and max compare with the buffer whatever the factors, and the
+        // factors that take the buffer's color or alpha read it, see
+        // crate::blend
+        let config = registers[REG_BLEND_FUNC];
+        let equations = [config & 0x7, (config >> 8) & 0x7];
+        let sources = [(config >> 16) & 0xF, (config >> 24) & 0xF];
+        let dests = [(config >> 20) & 0xF, (config >> 28) & 0xF];
+        if equations.iter().any(|&e| e == 3 || e == 4) {
+            return Some("blend equation min or max");
+        }
+        if dests.iter().any(|&f| f != 0) {
+            return Some("blend destination factor");
+        }
+        if sources.iter().any(|f| matches!(f, 4 | 5 | 8 | 9 | 14)) {
+            return Some("blend source factor reads the buffer");
+        }
+    } else if crate::blend::LogicOp::read(registers).is_some() {
+        return Some("logic op");
+    }
+    if AlphaTest::read(registers).is_some() {
+        return Some("alpha test");
+    }
+    let apart = |(at, bytes): (u32, u32)| at >= addr + len || at + bytes <= addr;
+    if let Some(depth) = DepthStencil::read(registers, memory) {
+        if depth.stencil.is_some() {
+            return Some("stencil test");
+        }
+        if depth.test.is_some_and(|test| test != Compare::Always) {
+            return Some("depth test");
+        }
+        if !apart((depth.addr, width * height * depth.bytes)) {
+            return Some("depth buffer inside the target");
+        }
+    }
+    if (0..3).any(|unit| texture_range(registers, memory, unit).is_some_and(|range| !apart(range))) {
+        return Some("a texture inside the target");
+    }
+    None
+}
+
+/// the most triangles a draw over all of a buffer is looked at for, a
+/// geometry shader can emit a handful from a point.
+#[cfg(feature = "vulkan")]
+const MOST_COVERING_TRIANGLES: usize = 8;
+
+/// why a draw's triangles, its vertices shaded in draw order, may not
+/// cover every pixel of a buffer, none when they do: one triangle over all
+/// of it, or two that make a rectangle over all of it, neither culled,
+/// every vertex inside the volume the PICA draws so nothing is clipped off.
+/// anything else is taken as not covering it. what a geometry shader
+/// emitted, which shaded_in_order runs on the CPU, is a list of triangles,
+/// as the draw takes it, Kid Icarus Uprising's bloom is two of them.
+#[cfg(feature = "vulkan")]
+fn uncovered(shaded: &[Vertex], topology: u32, cull_mode: u32, viewport: (f32, f32, f32, f32), (width, height): (u32, u32)) -> Option<&'static str> {
+    if shaded.len() > 3 * MOST_COVERING_TRIANGLES {
+        return Some("too many triangles");
+    }
+    if !shaded.iter().all(inside) {
+        return Some("a vertex outside the clip volume");
+    }
+    let Some(screen) = shaded.iter().map(|vertex| to_screen(vertex, viewport)).collect::<Option<Vec<Screen>>>() else {
+        return Some("a vertex at w 0");
+    };
+    let triangles: Vec<[&Screen; 3]> = assemble(topology, screen.len()).into_iter().map(|(a, b, c)| [&screen[a], &screen[b], &screen[c]]).collect();
+    // twice the signed area, positive counter-clockwise with y up
+    let area = |[p, q, r]: [&Screen; 3]| (q.x - p.x) * (r.y - p.y) - (q.y - p.y) * (r.x - p.x);
+    let culled = |triangle: [&Screen; 3]| cull_mode != 0 && (area(triangle) > 0.0) == (cull_mode == 1);
+    if triangles.is_empty() {
+        return Some("no triangles");
+    }
+    if triangles.iter().any(|&triangle| culled(triangle)) {
+        return Some("a triangle culled");
+    }
+    if triangles.iter().any(|&triangle| area(triangle) == 0.0) {
+        return Some("a triangle flat");
+    }
+    let (right, top) = (width as f32, height as f32);
+    let corners = [(0.0, 0.0), (right, 0.0), (right, top), (0.0, top)];
+    // a point on the triangle or inside it
+    let holds = |[p, q, r]: [&Screen; 3], (x, y): (f32, f32)| {
+        let side = |a: &Screen, b: &Screen| (b.x - a.x) * (y - a.y) - (b.y - a.y) * (x - a.x);
+        let sides = [side(p, q), side(q, r), side(r, p)];
+        sides.iter().all(|&s| s >= 0.0) || sides.iter().all(|&s| s <= 0.0)
+    };
+    if triangles.iter().any(|&triangle| corners.iter().all(|&corner| holds(triangle, corner))) {
+        return None;
+    }
+    // two triangles, each on three corners of one rectangle, apart from
+    // two opposite ones, their shared edge its diagonal
+    let [first, second] = triangles[..] else { return Some("no triangle over the buffer, and not two") };
+    let xs = screen.iter().map(|p| p.x);
+    let ys = screen.iter().map(|p| p.y);
+    let (low_x, high_x) = (xs.clone().fold(f32::MAX, f32::min), xs.fold(f32::MIN, f32::max));
+    let (low_y, high_y) = (ys.clone().fold(f32::MAX, f32::min), ys.fold(f32::MIN, f32::max));
+    let corner = |p: &Screen| match (p.x == low_x || p.x == high_x) && (p.y == low_y || p.y == high_y) {
+        true => Some((p.x == high_x) as u32 | ((p.y == high_y) as u32) << 1),
+        false => None,
+    };
+    let missing = |triangle: [&Screen; 3]| {
+        let ids: Option<Vec<u32>> = triangle.iter().map(|p| corner(p)).collect();
+        let ids = ids?;
+        (ids[0] != ids[1] && ids[1] != ids[2] && ids[0] != ids[2]).then(|| 6 - ids.iter().sum::<u32>())
+    };
+    let (Some(a), Some(b)) = (missing(first), missing(second)) else { return Some("a vertex off the corners of one rectangle") };
+    if a ^ b != 3 {
+        return Some("two triangles that do not make one rectangle");
+    }
+    if !(low_x <= 0.0 && low_y <= 0.0 && high_x >= right && high_y >= top) {
+        return Some("a rectangle short of the buffer");
+    }
+    None
+}
+
+/// with RUST_LOG=zakuro_gpu::waits=debug, says why a draw over a buffer
+/// other shapes drew over does not replace it whole, which then has what
+/// they drew come down first, and the values that told.
+#[cfg(feature = "vulkan")]
+fn log_not_replaced(registers: &[u32], target: (u32, u32, u32, ColorFormat), viewport: (f32, f32, f32, f32), why: &str, vertices: Option<&[Vertex]>, covering: bool) {
+    if !log::log_enabled!(target: "zakuro_gpu::waits", log::Level::Debug) {
+        return;
+    }
+    let (addr, width, height, format) = target;
+    let (x, y, w, h) = viewport;
+    // what a geometry shader emitted, the triangles looked at
+    let emitted = covering && registers[REG_GEOSTAGE_CONFIG] & 0x3 == 2;
+    let from = if emitted { "geometry shader output not covering, " } else { "" };
+    let positions = vertices.map_or(String::new(), |shaded| {
+        let each: Vec<String> = shaded
+            .iter()
+            .map(|vertex| {
+                let [cx, cy, cz, cw] = vertex.clip;
+                match to_screen(vertex, viewport) {
+                    Some(at) => format!("({cx},{cy},{cz},{cw})->({},{})", at.x, at.y),
+                    None => format!("({cx},{cy},{cz},{cw})"),
+                }
+            })
+            .collect();
+        format!(", {}clip->window {}", if emitted { "emitted " } else { "" }, each.join(" "))
+    });
+    log::debug!(
+        target: "zakuro_gpu::waits",
+        "a draw into 0x{addr:08X} {width}x{height} {format:?} does not replace it whole, {from}{why}: viewport {x},{y} {w}x{h}, \
+         color write {} mask 0x{:08X}, color op 0x{:08X} blend 0x{:08X} logic 0x{:X}, alpha test 0x{:08X}, stencil 0x{:08X}, \
+         depth format {} at 0x{:08X}, textures 0x{:X}, topology {} cull {}{positions}",
+        registers[REG_COLOR_BUFFER_WRITE],
+        registers[REG_DEPTH_COLOR_MASK],
+        registers[REG_COLOR_OPERATION],
+        registers[REG_BLEND_FUNC],
+        registers[REG_LOGIC_OP],
+        registers[REG_ALPHA_TEST],
+        registers[REG_STENCIL_TEST],
+        registers[REG_DEPTH_BUFFER_FORMAT] & 0x3,
+        loc_register(registers, REG_DEPTH_BUFFER_ADDRESS),
+        registers[REG_TEXTURE_CONFIG] & 0x7,
+        (registers[REG_PRIMITIVE_CONFIG] >> 8) & 0x3,
+        registers[REG_FACE_CULLING] & 0x3,
+    );
 }
 
 /// rasterizes one triangle, texturing and the combiners, then the alpha,
@@ -3051,6 +3225,35 @@ fn rasterize<M: GpuMemory>(registers: &[u32], memory: &mut M, resources: &mut Re
     let buffer_height = (((dimensions >> 12) & 0x3FF) + 1).max(viewport_top.max(1) as u32);
     let (target_width, target_height) = (buffer_width, buffer_height);
 
+    // a draw over all of its buffer that reads none of it leaves nothing of
+    // what other buffers drew there, which then need not come down first.
+    // its few vertices are shaded on the CPU as well to tell, from arrays
+    // the CPU decodes
+    #[cfg(feature = "vulkan")]
+    let shape = (target_addr, buffer_width, buffer_height, target_format);
+    #[cfg(feature = "vulkan")]
+    let replacing = resources.hardware.as_ref().is_some_and(|hardware| hardware.drawn_over(target_addr, (buffer_width, buffer_height), target_format)) && {
+        let len = buffer_width * buffer_height * target_format.bytes_per_pixel() as u32;
+        let refused = if vertex_count > 6 {
+            Some("more than 6 vertices")
+        } else if viewport_x > 0.0 || viewport_y > 0.0 || viewport_right < buffer_width as i32 || viewport_top < buffer_height as i32 {
+            Some("the viewport short of the buffer")
+        } else {
+            partial_pixels(registers, memory, (target_addr, len), (buffer_width, buffer_height))
+        };
+        if let Some(why) = refused {
+            // the vertices too, where few and shaded or for the CPU to shade
+            let few = vertex_count <= 6 && log::log_enabled!(target: "zakuro_gpu::waits", log::Level::Debug);
+            let shaded = few.then(|| shaded_in_order(registers, vertices)).flatten();
+            log_not_replaced(registers, shape, viewport, why, shaded.as_deref(), false);
+        }
+        refused.is_none()
+    };
+    #[cfg(feature = "vulkan")]
+    if replacing && matches!(vertices, Vertices::Raw { .. }) {
+        return None;
+    }
+
     // draws are far more frequent than fills or transfers (thousands per
     // second versus dozens), so this stays at trace level to keep debug
     // usable for spotting the rarer GX commands.
@@ -3157,6 +3360,16 @@ fn rasterize<M: GpuMemory>(registers: &[u32], memory: &mut M, resources: &mut Re
     // wound clockwise and 2 counter-clockwise, as seen with y pointing up.
     let cull_mode = registers[REG_FACE_CULLING] & 0x3;
 
+    #[cfg(feature = "vulkan")]
+    let replaces = replacing
+        && shaded_in_order(registers, vertices).is_some_and(|shaded| {
+            let refused = uncovered(&shaded, topology, cull_mode, viewport, (buffer_width, buffer_height));
+            if let Some(why) = refused {
+                log_not_replaced(registers, shape, viewport, why, Some(&shaded), true);
+            }
+            refused.is_none()
+        });
+
     // the GPU runs the vertex shader itself, unless a geometry shader
     // comes after it
     #[cfg(feature = "vulkan")]
@@ -3181,7 +3394,7 @@ fn rasterize<M: GpuMemory>(registers: &[u32], memory: &mut M, resources: &mut Re
                 viewport,
                 cull: cull_mode,
             };
-            let drawn = hardware.draw(memory, &state.hardware(registers, hardware::Geometry::Shaded(&shading)));
+            let drawn = hardware.draw(memory, &hardware::Draw { replaces, ..state.hardware(registers, hardware::Geometry::Shaded(&shading)) });
             let triangles = (indices.len() / 3) as u32;
             resources.triangles = assembled;
             match drawn {
@@ -3264,7 +3477,7 @@ fn rasterize<M: GpuMemory>(registers: &[u32], memory: &mut M, resources: &mut Re
         // tiles are whole in any buffer a title really draws into
         if target.buffer_width.is_multiple_of(8) && target.buffer_height.is_multiple_of(8) {
             let geometry = hardware::Geometry::Placed { vertices: &placed, indices: &indices };
-            match hardware.draw(memory, &state.hardware(registers, geometry)) {
+            match hardware.draw(memory, &hardware::Draw { replaces, ..state.hardware(registers, geometry) }) {
                 Ok(()) => return Some(triangle_count as u32),
                 Err(error) => log::error!("the GPU could not draw, {error}, drawing in software"),
             }
@@ -4636,6 +4849,300 @@ mod tests {
                 return;
             };
             assert!(old == new, "at scale {scale}");
+        }
+    }
+
+    /// how a draw over all of a buffer goes, in the tests of draws that
+    /// replace what was there.
+    #[cfg(feature = "vulkan")]
+    #[derive(Debug, Clone, Copy, PartialEq)]
+    enum Over {
+        /// two triangles over all of it, writing whole pixels.
+        Whole,
+        /// blending with what is there.
+        Blended,
+        /// leaving a strip at the right uncovered.
+        Strip,
+        /// writing three channels of four.
+        Masked,
+        /// after the CPU wrote under it.
+        Written,
+        /// after a fill under it.
+        Filled,
+    }
+
+    /// what shades the vertices of a draw over all of a buffer.
+    #[cfg(feature = "vulkan")]
+    #[derive(Debug, Clone, Copy, PartialEq)]
+    enum ShadedBy {
+        /// the CPU, before the draw.
+        Cpu,
+        /// a vertex shader the GPU runs.
+        VertexShader,
+        /// a geometry shader making the triangles out of a point, which
+        /// the CPU runs.
+        GeometryShader,
+    }
+
+    /// two triangles over a rectangle of clip space, a color at each corner.
+    #[cfg(feature = "vulkan")]
+    fn rectangle(left: f32, bottom: f32, right: f32, top: f32) -> Vec<Vertex> {
+        let corner = |x: f32, y: f32, color: Vec4| Vertex {
+            clip: [x, y, -0.5, 1.0],
+            color,
+            texcoords: [[0.0; 2]; 3],
+            quaternion: [0.0, 0.0, 0.0, 1.0],
+            view: [0.0; 3],
+        };
+        let [a, b, c, d] = [corner(left, bottom, RED), corner(right, bottom, GREEN), corner(right, top, BLUE), corner(left, top, [1.0, 1.0, 0.0, 1.0])];
+        vec![a, b, c, a, c, d]
+    }
+
+    /// Kid Icarus Uprising's bloom: the scene's 256x512 depth buffer and a
+    /// 64x64 buffer drawn over the memory of a 128x256 one, which a draw then
+    /// covers whole, and a draw samples. what memory holds then, and how many
+    /// times the draw over all of it waited for the GPU.
+    #[cfg(feature = "vulkan")]
+    fn draw_over(over: Over, scale: u32, shading: ShadedBy, through_memory: bool) -> Option<(Vec<u8>, u32)> {
+        const TARGET: u32 = 0x10_0000;
+        const SCENE: u32 = 0x20_0000;
+        const SAMPLED: u32 = 0x28_0000;
+        let mut hardware = hardware::Hardware::new().ok()?;
+        hardware.set_scale(scale);
+        hardware.through_memory = through_memory;
+        let mut resources = Resources { hardware: Some(hardware), ..Default::default() };
+        let mut memory = ConsoleMemory::default();
+        // the scene's depth, rows 112 to 512, the first 16 KB of them in the
+        // 128x256 buffer's memory
+        let mut scene = over_rows(SCENE, (256, 512), (112, 400));
+        scene[REG_DEPTH_BUFFER_ADDRESS] = TARGET >> 3;
+        scene[REG_DEPTH_COLOR_MASK] |= 1 << 12;
+        scene[REG_VIEWPORT_DEPTH_RANGE] = float24(-1.0);
+        scene[REG_DEPTHMAP_ENABLE] = 1;
+        rasterize_shaded(&scene, &mut memory, &mut resources, &cover(-0.5, BLUE));
+        rasterize_shaded(&over_rows(TARGET, (64, 64), (0, 64)), &mut memory, &mut resources, &cover(-0.5, RED));
+        match over {
+            // under the 64x64 one's drawing
+            Over::Written => memory.write(TARGET + 4096, &[0x5A; 256]),
+            // under the depth buffer's drawing
+            Over::Filled => {
+                let hardware = resources.hardware.as_mut().unwrap();
+                hardware.before_fill(&mut memory, TARGET + 0x1C000, 0x1000, 4).unwrap();
+                memory.write(TARGET + 0x1C000, &[0x77; 0x1000]);
+                hardware.filled(TARGET + 0x1C000, &[0x77; 0x1000]).unwrap();
+            }
+            _ => {}
+        }
+        let mut full = over_rows(TARGET, (128, 256), (0, 256));
+        match over {
+            Over::Blended => {
+                // source alpha and one minus it, which reads the buffer
+                full[REG_COLOR_OPERATION] |= 0x100;
+                full[REG_BLEND_FUNC] = 6 << 16 | 7 << 20 | 6 << 24 | 7 << 28;
+            }
+            Over::Masked => full[REG_DEPTH_COLOR_MASK] = 0x7 << 8,
+            _ => {}
+        }
+        let triangles = match over {
+            Over::Strip => rectangle(-1.0, -1.0, 0.9, 1.0),
+            _ => rectangle(-1.0, -1.0, 1.0, 1.0),
+        };
+        // or through a vertex shader the GPU runs, the position from v0 and
+        // the color from c0, which the CPU shades again to tell
+        const IDENTITY: u32 = 0x1B << 5 | 0x1B << 14 | 0x1B << 23;
+        let mut unit = ShaderUnit::new();
+        unit.descriptors[0] = 0xF | IDENTITY;
+        let mov = |destination: u32, source: u32| 0x13 << 26 | destination << 21 | source << 12;
+        unit.program[..3].copy_from_slice(&[mov(0, 0x00), mov(1, 0x20), 0x22 << 26]);
+        unit.float_uniforms[0] = [0.0, 1.0, 0.5, 1.0];
+        unit.prepare();
+        let input = |clip: Vec4| {
+            let mut input = [shader::ZERO; shader::INPUT_REGISTERS];
+            input[0] = clip;
+            input
+        };
+        let inputs: Vec<_> = triangles.iter().map(|vertex| input(vertex.clip)).collect();
+        // or a point a geometry shader makes the rectangle of, as the PICA
+        // runs one, its corners in c0 to c3, the point's color kept
+        let mut geometry = ShaderUnit::new();
+        geometry.descriptors[0] = 0xF | IDENTITY;
+        let setemit = |slot: u32, primitive: bool| 0x2B << 26 | slot << 24 | (primitive as u32) << 23;
+        let emit = 0x2A << 26;
+        let program = [
+            setemit(0, false),
+            mov(0, 0x20),
+            mov(1, 0x01),
+            emit,
+            setemit(1, false),
+            mov(0, 0x21),
+            emit,
+            setemit(2, true),
+            mov(0, 0x22),
+            emit,
+            setemit(0, false),
+            mov(0, 0x20),
+            emit,
+            setemit(1, false),
+            mov(0, 0x22),
+            emit,
+            setemit(2, true),
+            mov(0, 0x23),
+            emit,
+            0x22 << 26,
+        ];
+        geometry.program[..program.len()].copy_from_slice(&program);
+        // left bottom, right bottom, right top, left top
+        for (uniform, corner) in [0, 1, 2, 5].into_iter().enumerate() {
+            geometry.float_uniforms[uniform] = triangles[corner].clip;
+        }
+        geometry.prepare();
+        let point = [input([0.0, 0.0, -0.5, 1.0])];
+        if shading != ShadedBy::Cpu {
+            full[REG_SHADER_OUTPUT_TOTAL] = 2;
+            full[REG_SHADER_OUTPUT_MAP] = 0x0302_0100;
+            full[REG_SHADER_OUTPUT_MAP + 1] = 0x0B0A_0908;
+            full[REG_VS_OUTPUT_MASK] = 0b11;
+            full[0x0C0] = 0;
+            for base in [0x0C8, 0x0D0, 0x0D8, 0x0F0, 0x0F8] {
+                full[base] = 0x000F_000F;
+            }
+        }
+        if shading == ShadedBy::GeometryShader {
+            full[REG_GEOSTAGE_CONFIG] = 2;
+            full[REG_VS_COM_MODE] = 1;
+            // two attributes a vertex, one vertex an invocation
+            full[REG_VS_OUTPUT_TOTAL] = 1;
+            full[REG_GS_BLOCK + SHADER_INPUT_CONFIG] = 1;
+            full[REG_GS_BLOCK + SHADER_INPUT_MAP_LOW] = 0x10;
+            full[REG_GS_BLOCK + SHADER_OUTPUT_MASK] = 0b11;
+            // whatever the geometry shader emits, a list
+            full[REG_PRIMITIVE_CONFIG] = full[REG_PRIMITIVE_CONFIG] & !(3 << 8) | 3 << 8;
+        }
+        let before = resources.hardware.as_ref().unwrap().waited_done;
+        match shading {
+            ShadedBy::Cpu => {
+                rasterize_shaded(&full, &mut memory, &mut resources, &triangles);
+            }
+            ShadedBy::VertexShader => {
+                let vertices = Vertices::Unshaded { vertex_shader: &unit, geometry_shader: &unit, inputs: &inputs, order: None };
+                rasterize(&full, &mut memory, &mut resources, vertices);
+            }
+            ShadedBy::GeometryShader => {
+                let vertices = Vertices::Unshaded { vertex_shader: &unit, geometry_shader: &geometry, inputs: &point, order: None };
+                rasterize(&full, &mut memory, &mut resources, vertices);
+            }
+        }
+        let waits = resources.hardware.as_ref().unwrap().waited_done - before;
+        rasterize_shaded(&sampling(TARGET, (128, 256), SAMPLED), &mut memory, &mut resources, &spread());
+        resources.hardware.as_mut().unwrap().flush(&mut memory).unwrap();
+        let mut held = vec![0u8; (SAMPLED + 128 * 256 * 4 - TARGET) as usize];
+        memory.read(TARGET, &mut held);
+        Some((held, waits))
+    }
+
+    /// draws over all of buffers at offsets into the memory of Kid Icarus
+    /// Uprising's 256x512 depth buffer, drawn at rows 112 to 512, each then
+    /// sampled. what a CPU read of the whole depth buffer finds after them,
+    /// what memory holds once flushed, and how many times each draw over a
+    /// whole buffer waited for the GPU.
+    #[cfg(feature = "vulkan")]
+    fn draws_over_depth(buffers: &[(u32, (u32, u32))], scale: u32, through_memory: bool) -> Option<(Vec<u8>, Vec<u8>, Vec<u32>)> {
+        const DEPTH_BUFFER: u32 = 0x10_0000;
+        const SCENE: u32 = 0x20_0000;
+        const SAMPLED: u32 = 0x28_0000;
+        let mut hardware = hardware::Hardware::new().ok()?;
+        hardware.set_scale(scale);
+        hardware.through_memory = through_memory;
+        let mut resources = Resources { hardware: Some(hardware), ..Default::default() };
+        let mut memory = ConsoleMemory::default();
+        let mut scene = over_rows(SCENE, (256, 512), (112, 400));
+        scene[REG_DEPTH_BUFFER_ADDRESS] = DEPTH_BUFFER >> 3;
+        scene[REG_DEPTH_COLOR_MASK] |= 1 << 12;
+        scene[REG_VIEWPORT_DEPTH_RANGE] = float24(-1.0);
+        scene[REG_DEPTHMAP_ENABLE] = 1;
+        for (i, z) in [-0.25, -0.5, -0.75].into_iter().enumerate() {
+            // depths that differ across it
+            let mut triangle = cover(z, BLUE);
+            triangle[i].clip[2] = -0.1;
+            rasterize_shaded(&scene, &mut memory, &mut resources, &triangle);
+        }
+        let mut waits = Vec::new();
+        let mut sampled_at = SAMPLED;
+        for &(offset, size) in buffers {
+            let before = resources.hardware.as_ref().unwrap().waited_done;
+            rasterize_shaded(&over_rows(DEPTH_BUFFER + offset, size, (0, size.1)), &mut memory, &mut resources, &rectangle(-1.0, -1.0, 1.0, 1.0));
+            waits.push(resources.hardware.as_ref().unwrap().waited_done - before);
+            rasterize_shaded(&sampling(DEPTH_BUFFER + offset, size, sampled_at), &mut memory, &mut resources, &spread());
+            sampled_at += size.0 * size.1 * 4;
+        }
+        // the CPU reads the depth buffer
+        let hardware = resources.hardware.as_mut().unwrap();
+        hardware.sync(&mut memory, DEPTH_BUFFER, 256 * 512 * 4).unwrap();
+        let mut read = vec![0u8; 256 * 512 * 4];
+        memory.read(DEPTH_BUFFER, &mut read);
+        hardware.flush(&mut memory).unwrap();
+        let mut held = vec![0u8; (sampled_at - DEPTH_BUFFER) as usize];
+        memory.read(DEPTH_BUFFER, &mut held);
+        Some((read, held, waits))
+    }
+
+    /// two draws over whole buffers at two places in what a depth buffer
+    /// drew, as Kid Icarus Uprising's two bloom buffers lie in its scene's
+    /// depth, each leave the bytes under them stale in it, apart, neither
+    /// waiting for the GPU, and a CPU read of the depth buffer and memory
+    /// find what they would with it written back before each.
+    #[cfg(feature = "vulkan")]
+    #[test]
+    fn draws_over_two_places_in_a_buffer_leave_both_stale() {
+        for scale in [1, 3] {
+            let buffers = [(0, (128, 256)), (0x2C000, (128, 256))];
+            let Some((old_read, old_held, _)) = draws_over_depth(&buffers, scale, true) else { return };
+            let Some((read, held, waits)) = draws_over_depth(&buffers, scale, false) else { return };
+            assert_eq!(waits, [0, 0], "at scale {scale}");
+            assert!(read == old_read, "the CPU reads the depth buffer as before at scale {scale}");
+            assert!(held == old_held, "memory ends up as before at scale {scale}");
+        }
+    }
+
+    /// more places stale in a buffer than it keeps apart have it come down
+    /// first, and memory ends up as before.
+    #[cfg(feature = "vulkan")]
+    #[test]
+    fn more_stale_places_than_a_buffer_keeps_come_down_first() {
+        // 8x8 buffers over its first rows drawn, a gap between each
+        let buffers: Vec<(u32, (u32, u32))> = (0..10).map(|k| (0x1C000 + k * 1024, (8, 8))).collect();
+        for scale in [1, 3] {
+            let Some((old_read, old_held, _)) = draws_over_depth(&buffers, scale, true) else { return };
+            let Some((read, held, waits)) = draws_over_depth(&buffers, scale, false) else { return };
+            assert!(waits[..8].iter().all(|&w| w == 0), "the first eight go stale at scale {scale}: {waits:?}");
+            assert!(waits[8] > 0, "the ninth comes down at scale {scale}: {waits:?}");
+            assert!(read == old_read, "the CPU reads the depth buffer as before at scale {scale}");
+            assert!(held == old_held, "memory ends up as before at scale {scale}");
+        }
+    }
+
+    /// a draw that replaces every pixel of a buffer without reading them
+    /// has what other buffers drew over its memory go stale rather than come
+    /// down first, without waiting for the GPU, and memory and what samples
+    /// it end up as before. a draw that blends, leaves pixels uncovered,
+    /// writes some channels, or memory written under the buffer, goes as
+    /// before.
+    #[cfg(feature = "vulkan")]
+    #[test]
+    fn a_draw_over_a_whole_buffer_lets_what_was_under_it_go() {
+        for over in [Over::Whole, Over::Blended, Over::Strip, Over::Masked, Over::Written, Over::Filled] {
+            for shading in [ShadedBy::Cpu, ShadedBy::VertexShader, ShadedBy::GeometryShader] {
+                for scale in [1, 3] {
+                    let Some((old, _)) = draw_over(over, scale, shading, true) else { return };
+                    let Some((new, waits)) = draw_over(over, scale, shading, false) else { return };
+                    let how = format!("at scale {scale}, shaded by {shading:?}");
+                    assert!(old == new, "{over:?} ends up as before {how}");
+                    match over {
+                        Over::Whole => assert_eq!(waits, 0, "{over:?} waited {how}"),
+                        _ => assert!(waits > 0, "{over:?} went through memory {how}"),
+                    }
+                }
+            }
         }
     }
 
