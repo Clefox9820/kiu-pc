@@ -1357,8 +1357,55 @@ fn mirror_portrait(registers: &[u32], resources: &mut Resources, vertices: Verti
         true => MARGIN - low[1] * SCALE,
         false => 400.0 - MARGIN - high[1] * SCALE,
     };
-    let registers = onto_top(registers, top, SCALE, x, y);
+    let mut registers = onto_top(registers, top, SCALE, x, y);
+    // the title's pictures stop at the bottom screen's top edge, some cut
+    // there, Medusa's snakes; on the top screen that edge fades out
+    let vertices = faded_top(registers[REG_PRIMITIVE_CONFIG] >> 8 & 3, &vertices);
+    registers[REG_PRIMITIVE_CONFIG] &= !(3 << 8);
     resources.portraits.sides[!right as usize].incoming.push(PortraitDraw { registers, vertices });
+}
+
+/// how many of the bottom screen's rows below its top edge a portrait fades
+/// out over on the top screen.
+const PORTRAIT_FADE: f32 = 24.0;
+
+/// a bottom-screen draw's triangles, as a list, fading out over the last
+/// PORTRAIT_FADE rows before the bottom screen's top edge, by their alpha:
+/// each triangle is cut along the band's lower edge, so the band has
+/// corners of its own and its alpha runs from whole to none across it alone.
+// ponytail: fades by the vertices' alpha, so only a draw that blends by it
+// fades, as Kid Icarus Uprising's portraits do.
+fn faded_top(topology: u32, vertices: &[Vertex]) -> Vec<Vertex> {
+    // where an edge crosses the band's lower edge, in clip space, so the
+    // cut is where it is however far the vertex is
+    let edge = (240.0 - PORTRAIT_FADE) / 120.0 - 1.0;
+    let below = |vertex: &Vertex| edge * vertex.clip[3] - vertex.clip[0];
+    let mut faded = Vec::with_capacity(vertices.len() * 2);
+    for (a, b, c) in assemble(topology, vertices.len()) {
+        let triangle = [vertices[a], vertices[b], vertices[c]];
+        // the part below the band's edge, then the part in it
+        for side in [1.0, -1.0] {
+            let mut polygon = Vec::with_capacity(4);
+            for (i, current) in triangle.iter().enumerate() {
+                let next = &triangle[(i + 1) % 3];
+                let (d0, d1) = (side * below(current), side * below(next));
+                if d0 >= 0.0 {
+                    polygon.push(*current);
+                }
+                if d0 * d1 < 0.0 {
+                    polygon.push(current.lerp(next, d0 / (d0 - d1)));
+                }
+            }
+            for i in 1..polygon.len().saturating_sub(1) {
+                faded.extend([polygon[0], polygon[i], polygon[i + 1]]);
+            }
+        }
+    }
+    for vertex in &mut faded {
+        let row = (vertex.clip[0] / vertex.clip[3] * 0.5 + 0.5) * 240.0;
+        vertex.color[3] *= ((240.0 - row) / PORTRAIT_FADE).clamp(0.0, 1.0);
+    }
+    faded
 }
 
 /// a part of the bottom screen's battle display shown on the top screen:
@@ -6255,6 +6302,43 @@ mod tests {
         assert_eq!(placed(0), (0, -16));
         // 60 * 0.4 below, and 400 - 280 * 0.4 along
         assert_eq!(placed(1), (-24, 288));
+    }
+
+    /// a portrait as Kid Icarus Uprising draws it, its picture from x -16 to
+    /// the bottom screen's top edge at 240, fades out over its last rows on
+    /// the top screen, so where the picture is cut does not show as a line.
+    #[test]
+    fn a_portrait_fades_out_at_the_bottom_screens_top_edge() {
+        let mut registers = target_registers();
+        sized(&mut registers, 240, 320);
+        let mut resources = Resources::default();
+        resources.portraits.top = Some([0x1F08_0000 >> 3, 0, 256 | (511 << 12)]);
+        let quad = quad((-16.0 / 120.0 - 1.0, 1.0), (-0.75, -0.25), RED);
+        mirror_portrait(&registers, &mut resources, Vertices::Shaded(&quad));
+        let [draw] = &resources.portraits.sides[0].incoming[..] else { panic!("one draw on the right") };
+        assert_eq!((draw.registers[REG_PRIMITIVE_CONFIG] >> 8) & 3, 0, "a triangle list");
+        assert_eq!(draw.vertices.len() % 3, 0);
+        let x = |vertex: &Vertex| (vertex.clip[0] / vertex.clip[3] * 0.5 + 0.5) * 240.0;
+        // every corner's alpha follows its rows: whole up to the band, none
+        // at the edge, and in between as far as it is into the band
+        for vertex in &draw.vertices {
+            let expected = ((240.0 - x(vertex)) / PORTRAIT_FADE).clamp(0.0, 1.0);
+            assert!((vertex.color[3] - expected).abs() < 1e-4, "alpha {} at x {}", vertex.color[3], x(vertex));
+        }
+        // the band has corners of its own on its lower edge, so the ramp
+        // runs across it alone
+        assert!(draw.vertices.iter().any(|vertex| (x(vertex) - (240.0 - PORTRAIT_FADE)).abs() < 1e-3));
+        // and all of the picture is still there: the triangles cover what
+        // the quad covered
+        let area = |vertices: &[Vertex]| -> f32 {
+            vertices
+                .as_chunks::<3>()
+                .0
+                .iter()
+                .map(|t| ((t[1].clip[0] - t[0].clip[0]) * (t[2].clip[1] - t[0].clip[1]) - (t[2].clip[0] - t[0].clip[0]) * (t[1].clip[1] - t[0].clip[1])).abs() / 2.0)
+                .sum()
+        };
+        assert!((area(&draw.vertices) - area(&quad)).abs() < 1e-4);
     }
 
     /// a draw inside the counters' island goes under the score on the top
