@@ -175,6 +175,9 @@ pub struct Gpu {
     resources: raster::Resources,
     /// frame interpolation's record of the draws, none while it is off.
     interpolation: Option<interpolation::Interpolation>,
+    /// whether the window shows the top screen and the bottom one, see
+    /// set_shown.
+    shown: [bool; 2],
 }
 
 /// number of external register words we track (0x1EF00000..0x1EF04000).
@@ -209,6 +212,7 @@ impl Gpu {
             busy: std::time::Duration::ZERO,
             resources: raster::Resources::default(),
             interpolation: None,
+            shown: [true; 2],
         }
     }
 
@@ -357,6 +361,8 @@ impl Gpu {
     ) {
         let input_width = input_dimensions & 0xFFFF;
         let input_height = input_dimensions >> 16;
+        #[cfg(feature = "vulkan")]
+        let hidden = self.hidden_output(output_paddr);
         // the portraits the bottom screen drew last frame go into the top
         // screen before it goes out, unless they went under its subtitles
         let top = [self.framebuffers[0].address_a_left, self.framebuffers[0].address_b_left].contains(&output_paddr);
@@ -436,6 +442,7 @@ impl Gpu {
                 input_format,
                 output_format,
             };
+            hardware.screen_hidden(hidden);
             match hardware.display_transfer(memory, &transfer) {
                 Ok(true) => {
                     self.transfers += 1;
@@ -688,6 +695,24 @@ impl Gpu {
         self.resources.portraits.in_play = on;
     }
 
+    /// says which screens the window shows now, the top one and the bottom
+    /// one. a screen it does not show needs no picture in between, which
+    /// frame interpolation then leaves out.
+    pub fn set_shown(&mut self, top: bool, bottom: bool) {
+        self.shown = [top, bottom];
+    }
+
+    /// whether a display transfer to an address goes to the framebuffer of a
+    /// screen the window does not show, and to no shown one's.
+    #[cfg(any(feature = "vulkan", test))]
+    fn hidden_output(&self, output_paddr: u32) -> bool {
+        let holds = |config: &FramebufferConfig| {
+            [config.address_a_left, config.address_a_right, config.address_b_left, config.address_b_right].contains(&output_paddr)
+        };
+        let goes = |shown: bool| self.framebuffers.iter().zip(self.shown).any(|(config, on)| on == shown && holds(config));
+        goes(false) && !goes(true)
+    }
+
     /// whether frame interpolation is on.
     pub fn interpolates(&self) -> bool {
         self.interpolation.is_some()
@@ -707,6 +732,10 @@ impl Gpu {
     /// the title's frame is done, its draws are the ones the next frame's
     /// match, and how they matched the frame before's.
     pub fn frame_done(&mut self) -> Option<Matches> {
+        #[cfg(feature = "vulkan")]
+        if let Some(hardware) = self.resources.hardware.as_mut() {
+            hardware.twin_frame();
+        }
         self.interpolation.as_mut().map(interpolation::Interpolation::frame_done)
     }
 
@@ -1403,6 +1432,25 @@ fn external_index(gsp_offset: u32) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// a display transfer to a framebuffer of a screen the window does not
+    /// show goes to a hidden screen, unless a shown one uses that buffer too.
+    #[test]
+    fn transfers_to_a_screen_not_shown_go_to_a_hidden_one() {
+        let mut gpu = Gpu::new();
+        gpu.framebuffers[0].address_a_left = 0x1800_0000;
+        gpu.framebuffers[0].address_b_left = 0x1804_0000;
+        gpu.framebuffers[1].address_a_left = 0x1808_0000;
+        assert!(!gpu.hidden_output(0x1808_0000), "both screens shown");
+        gpu.set_shown(true, false);
+        assert!(gpu.hidden_output(0x1808_0000), "the bottom screen's");
+        assert!(!gpu.hidden_output(0x1804_0000), "the top screen's");
+        assert!(!gpu.hidden_output(0x1F00_0000), "no screen's");
+        gpu.framebuffers[1].address_b_left = 0x1800_0000;
+        assert!(!gpu.hidden_output(0x1800_0000), "a buffer the top screen shows too");
+        gpu.set_shown(false, true);
+        assert!(gpu.hidden_output(0x1804_0000), "the top screen's, hidden");
+    }
 
     /// guest memory as one flat block starting at address zero.
     #[derive(Clone)]

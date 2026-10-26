@@ -188,6 +188,10 @@ Tools used to work on it:
   600 frames, as `<prefix>-<frame>-top.png` and `-bottom.png`. Runs from the
   same slot with no input draw the same frames, so two builds can be compared
   pixel by pixel. Windows' own captures of the game window can come out white.
+- `ZAKURO_TWIN_ALL=1` has frame interpolation draw every picture in between as
+  it did before it knew which screens the window shows, so one build can be
+  compared both ways; `RUST_LOG=zakuro_gpu::twins=debug` says what it drew for
+  each buffer every 600 frames.
 - The log counts late frames every 10 s (`pacing:`) and names slow service
   requests. `RUST_LOG=info,zakuro::frames=debug` logs every frame's time and
   draws, and `zakuro_gpu::waits=debug` every wait for the GPU, with the line

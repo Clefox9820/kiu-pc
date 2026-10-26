@@ -280,7 +280,7 @@ struct Image {
     view: vk::ImageView,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum Kind {
     Color(ColorFormat),
     /// bytes per sample, 2 for D16, 3 for D24 and 4 for D24S8.
@@ -441,6 +441,12 @@ struct Surface {
     twin_generation: u64,
     /// the twin turned upright, as upright has the image.
     twin_upright: Option<Upright>,
+    /// the framebuffer of a screen the window does not show, which needs
+    /// no picture in between, as the last display transfer into it said.
+    hidden: bool,
+    /// how many more transfers into it turn its twin upright, the picture
+    /// in between having been asked for lately, see WANTED_BETWEEN.
+    between_wanted: u32,
 }
 
 impl Surface {
@@ -776,6 +782,26 @@ struct Handover {
     /// the rows of memory of the surface looked up they come to.
     rows: (u32, u32),
 }
+
+/// what frame interpolation does for a surface, counted for the log.
+#[derive(Clone, Copy)]
+enum TwinWork {
+    /// a draw into its twin.
+    Draw,
+    /// a display transfer into its twin.
+    Transfer,
+    /// its twin turned upright for showing.
+    Upright,
+    /// its image copied into its twin.
+    Copy,
+}
+
+/// frames of the title's the log of what frame interpolation did covers.
+const TWIN_FRAMES: u32 = 600;
+
+/// display transfers into a screen's buffer that turn its twin upright after
+/// its picture in between was last asked for, two seconds of frames.
+const WANTED_BETWEEN: u32 = 120;
 
 /// a copy of a surface on its way to the host, recorded along with what
 /// changed the surface so reading it back needs no batch of its own.
@@ -1705,6 +1731,16 @@ pub struct Hardware {
     /// tests to compare with.
     #[cfg(test)]
     pub(crate) through_memory: bool,
+    /// frame interpolation leaves out what no screen shown needs, see
+    /// crate::raster::twin_all, which keeps it all as before.
+    pub(crate) twin_cuts: bool,
+    /// whether the next display transfer goes to the framebuffer of a
+    /// screen the window does not show.
+    hidden_output: bool,
+    /// what frame interpolation did for each surface, by its shape, see
+    /// TwinWork, and the frames since the log last told.
+    twin_work: HashMap<(u32, u32, u32, Kind), [u32; 4]>,
+    twin_frames: u32,
 }
 
 impl Hardware {
@@ -1945,6 +1981,10 @@ impl Hardware {
                 waited_done: 0,
                 #[cfg(test)]
                 through_memory: false,
+                twin_cuts: !crate::raster::twin_all(),
+                hidden_output: false,
+                twin_work: HashMap::new(),
+                twin_frames: 0,
             };
             let ring_usage = vk::BufferUsageFlags::VERTEX_BUFFER
                 | vk::BufferUsageFlags::INDEX_BUFFER
@@ -2573,6 +2613,8 @@ impl Hardware {
             twinned: false,
             twin_generation: 0,
             twin_upright: None,
+            hidden: false,
+            between_wanted: 0,
         });
         Ok(self.surfaces.len() - 1)
     }
@@ -3045,6 +3087,64 @@ impl Hardware {
         self.twins = twins;
     }
 
+    /// says the next display transfer goes to the framebuffer of a screen
+    /// the window does not show, which then needs no picture in between.
+    pub(crate) fn screen_hidden(&mut self, hidden: bool) {
+        self.hidden_output = hidden;
+    }
+
+    /// counts work frame interpolation did for a surface, for the log, see
+    /// twin_frame. nothing is counted while the log does not tell.
+    fn count_twin(&mut self, index: usize, work: TwinWork) {
+        if !cfg!(test) && !log::log_enabled!(target: "zakuro_gpu::twins", log::Level::Debug) {
+            return;
+        }
+        let s = &self.surfaces[index];
+        self.twin_work.entry((s.addr, s.width, s.height, s.kind)).or_default()[work as usize] += 1;
+    }
+
+    /// a frame of the title's is done. with RUST_LOG=zakuro_gpu::twins=debug,
+    /// every TWIN_FRAMES of them, says what frame interpolation did for each
+    /// buffer, to tell what the pictures in between cost and where.
+    pub(crate) fn twin_frame(&mut self) {
+        self.twin_frames += 1;
+        if self.twin_frames < TWIN_FRAMES {
+            return;
+        }
+        self.twin_frames = 0;
+        let work = std::mem::take(&mut self.twin_work);
+        if !log::log_enabled!(target: "zakuro_gpu::twins", log::Level::Debug) {
+            return;
+        }
+        let mut each: Vec<_> = work.into_iter().collect();
+        each.sort_by_key(|&((addr, ..), _)| addr);
+        let lines: Vec<String> = each
+            .iter()
+            .map(|((addr, width, height, kind), [draws, transfers, uprights, copies])| {
+                format!("0x{addr:08X} {width}x{height} {kind:?}: {draws} draws, {transfers} transfers, {uprights} uprights, {copies} copies")
+            })
+            .collect();
+        log::debug!(
+            target: "zakuro_gpu::twins",
+            "pictures in between over {TWIN_FRAMES} frames{}: {}",
+            if self.twin_cuts { "" } else { ", every twin kept" },
+            if lines.is_empty() { "none".to_string() } else { lines.join("; ") }
+        );
+    }
+
+    /// what frame interpolation did for the surfaces at an address so far,
+    /// as count_twin counts it, for the tests.
+    #[cfg(test)]
+    pub(crate) fn twin_work(&self, addr: u32) -> [u32; 4] {
+        let mut sum = [0; 4];
+        for (_, work) in self.twin_work.iter().filter(|((at, ..), _)| *at == addr) {
+            for (total, count) in sum.iter_mut().zip(work) {
+                *total += count;
+            }
+        }
+        sum
+    }
+
     /// whether a texture is rows of a surface with a twin.
     fn reads_twin(&self, texture: &DrawnTexture) -> bool {
         self.texture_source(texture).is_some_and(|(index, _)| self.surfaces[index].twinned)
@@ -3090,6 +3190,7 @@ impl Hardware {
         let s = &mut self.surfaces[index];
         s.twinned = true;
         s.twin_changed();
+        self.count_twin(index, TwinWork::Copy);
         Ok(())
     }
 
@@ -4213,8 +4314,14 @@ impl Hardware {
 
         // frame interpolation draws it into the twins of its buffers too, the
         // draw in between where it moved, as it is where its buffers or what
-        // it reads have twins, which hold the picture in between
+        // it reads have twins, which hold the picture in between. none for
+        // the framebuffer of a screen the window does not show
+        let hidden = self.twin_cuts && self.surfaces[color].hidden;
+        if hidden && pass == Pass::Twin {
+            return Ok(());
+        }
         let twinned = self.twins
+            && !hidden
             && match pass {
                 Pass::Real => {
                     self.surfaces[color].twinned
@@ -4240,6 +4347,9 @@ impl Hardware {
         // draw in between that follows
         let real = pass != Pass::Twin;
         let twin = twinned && pass != Pass::Twinned;
+        if twin {
+            self.count_twin(color, TwinWork::Draw);
+        }
 
         let mut views = [self.blank.view; 3];
         let mut twin_views = [self.blank.view; 3];
@@ -4685,6 +4795,8 @@ impl Hardware {
     /// copy of it heads for the host in the same batch, which goes to the
     /// GPU right away without waiting for it.
     pub(crate) fn display_transfer<M: GpuMemory>(&mut self, memory: &mut M, transfer: &Transfer) -> Result<bool, String> {
+        // what screen_hidden said is for this transfer alone
+        let hidden = std::mem::take(&mut self.hidden_output);
         let t = transfer;
         let input_kind = Kind::Color(t.input_format);
         let output_kind = Kind::Color(t.output_format);
@@ -4758,8 +4870,11 @@ impl Hardware {
             input_size.1 as i32 * n,
         ];
         // and in between, from the input's twin into the output's, which
-        // holds what the output did before
-        let twinned = self.twins && (self.surfaces[source].twinned || self.surfaces[target].twinned);
+        // holds what the output did before, unless the output is a screen
+        // the window does not show
+        self.surfaces[target].hidden = hidden;
+        let shown = !(self.twin_cuts && hidden);
+        let twinned = self.twins && shown && (self.surfaces[source].twinned || self.surfaces[target].twinned);
         let twinned = twinned
             && match self.make_twin(target) {
                 Ok(()) => true,
@@ -4775,6 +4890,7 @@ impl Hardware {
         if twinned {
             self.dispatch_transfer((self.surface_view(source, true), self.surface_view(target, true)), constants, size)?;
             self.surfaces[target].twin_changed();
+            self.count_twin(target, TwinWork::Transfer);
         }
         self.surfaces[target].changed();
         self.surfaces[target].guard_writes(memory);
@@ -4783,8 +4899,14 @@ impl Hardware {
         // turned upright for showing at any scale, at the console's own too
         // that beats the CPU waiting for the GPU and decoding the buffer
         self.capture_screen(target)?;
-        if twinned && self.direct {
+        // the picture in between turned upright too, where it was asked for
+        // lately, the presenter shows the screen's own picture until then
+        let wanted = &mut self.surfaces[target].between_wanted;
+        let asked = !self.twin_cuts || *wanted > 0;
+        *wanted = wanted.saturating_sub(1);
+        if twinned && self.direct && asked {
             self.upright_image(target, true)?;
+            self.count_twin(target, TwinWork::Upright);
         }
         self.submit()?;
         Ok(true)
@@ -5225,6 +5347,9 @@ impl Hardware {
     pub(crate) fn upright_pixels(&mut self, screen: ScreenRef, twin: bool) -> Result<(Vec<u8>, u32), String> {
         let (row_pixels, rows) = screen.size;
         let index = self.surfaces.iter().position(|s| s.addr == screen.addr && s.width == row_pixels && s.height == rows).ok_or("no surface")?;
+        if twin {
+            self.surfaces[index].between_wanted = WANTED_BETWEEN;
+        }
         let upright = match twin {
             true => self.surfaces[index].twin_upright.as_ref().filter(|upright| upright.batch == screen.batch),
             false => self.surfaces[index].upright.as_ref(),
@@ -5297,6 +5422,10 @@ impl Hardware {
             s.addr == screen.addr && s.width == row_pixels && s.height == rows && s.kind == Kind::Color(screen.format) && !s.tiled
         });
         let Some(index) = found else { return Ok(None) };
+        if twin {
+            // the next transfers into it turn its twin upright for it
+            self.surfaces[index].between_wanted = WANTED_BETWEEN;
+        }
         let upright = match twin {
             true => self.surfaces[index].twin_upright.as_ref(),
             false => self.surfaces[index].upright.as_ref(),
@@ -6498,6 +6627,8 @@ mod tests {
                 twinned: false,
                 twin_generation: 0,
                 twin_upright: None,
+                hidden: false,
+                between_wanted: 0,
             };
             let (size, bpp, row) = (surface.size() as usize, kind.bytes() as usize, surface.row_bytes() as usize);
             // the bytes the shadow stands for, none before the first upload

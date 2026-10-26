@@ -1208,9 +1208,44 @@ impl PortraitDraw {
     }
 }
 
+// a test's own ZAKURO_PORTRAITS, which the tests running beside it on other
+// threads do not see.
+#[cfg(test)]
+thread_local! {
+    static PORTRAITS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// with ZAKURO_TWIN_ALL=1, frame interpolation draws every picture in between
+/// it did before it knew what is shown: twins of the screens the window does
+/// not show and of what goes into them, the twin of every screen turned
+/// upright whether it is shown or not, and the portraits taken from the
+/// bottom screen again in the draws in between. for comparing the two, see
+/// hardware's twin_cuts.
+pub(crate) fn twin_all() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("ZAKURO_TWIN_ALL").is_ok_and(|value| value != "0"))
+}
+
+/// whether a draw is the one in between alone, into twins, which takes
+/// nothing for the top screen, the title's own draw did, unless every twin
+/// is kept, see twin_all.
+fn in_between(resources: &Resources) -> bool {
+    #[cfg(feature = "vulkan")]
+    return resources.hardware.as_ref().is_some_and(|hardware| hardware.pass == Pass::Twin && hardware.twin_cuts);
+    #[cfg(not(feature = "vulkan"))]
+    {
+        let _ = resources;
+        false
+    }
+}
+
 /// whether ZAKURO_PORTRAITS=1 asks for the bottom screen's portraits on the
 /// top screen.
 pub(crate) fn portraits_on() -> bool {
+    #[cfg(test)]
+    if PORTRAITS.with(std::cell::Cell::get) {
+        return true;
+    }
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("ZAKURO_PORTRAITS").is_ok_and(|value| value != "0"))
 }
@@ -1475,6 +1510,20 @@ fn mirror_hud(registers: &[u32], resources: &mut Resources, vertices: Vertices) 
 /// game stopped drawing. whether it drew any. once a frame: under the
 /// subtitles when there are any, else just before the top screen goes out.
 pub(crate) fn flush_portraits<M: GpuMemory>(memory: &mut M, resources: &mut Resources) -> bool {
+    // drawn as the title's own draws are, into the buffer and its twin, the
+    // picture in between, whichever draw goes over them
+    #[cfg(feature = "vulkan")]
+    let pass = resources.hardware.as_mut().filter(|hardware| hardware.twin_cuts).map(|hardware| std::mem::replace(&mut hardware.pass, Pass::Real));
+    let drew = draw_portraits(memory, resources);
+    #[cfg(feature = "vulkan")]
+    if let (Some(pass), Some(hardware)) = (pass, resources.hardware.as_mut()) {
+        hardware.pass = pass;
+    }
+    drew
+}
+
+/// draws them, see flush_portraits.
+fn draw_portraits<M: GpuMemory>(memory: &mut M, resources: &mut Resources) -> bool {
     // how much of a portrait fades in or out each frame, 8 frames in all
     let step = 1.0 / 8.0;
     let mut sides = std::mem::take(&mut resources.portraits.sides);
@@ -3223,6 +3272,9 @@ fn rasterize<M: GpuMemory>(registers: &[u32], memory: &mut M, resources: &mut Re
                     return drawn;
                 }
             }
+        } else if in_between(resources) {
+            // the draw in between, into twins alone, takes nothing of the
+            // title's: its text and bottom screen are the title's own draw's
         } else if is_text_buffer(registers) {
             // the CPU decodes its arrays, so its letters say where they are
             #[cfg(feature = "vulkan")]
@@ -7164,6 +7216,9 @@ mod tests {
         let scene = |red: f32, between: Option<f32>| -> Option<(Vec<u8>, Option<Vec<u8>>)> {
             let device = hardware::own_device().ok()?;
             let mut hardware = hardware::Hardware::with_device(std::sync::Arc::new(device), true, None).unwrap();
+            // the twin turned upright from the first frame on, as with every
+            // twin kept, see only_a_shown_screen_gets_a_picture_in_between_once_asked_for
+            hardware.twin_cuts = false;
             hardware.set_twins(between.is_some());
             let mut resources = Resources { hardware: Some(hardware), ..Default::default() };
             let mut memory = ConsoleMemory::default();
@@ -7194,6 +7249,129 @@ mod tests {
         assert!(own == plain, "the title's own picture");
         assert!(between == halfway, "the picture in between");
         assert!(own != between);
+    }
+
+    /// a bottom-screen draw in its battle display's island is taken for the
+    /// top screen once, by the title's own draw, not again by the draw in
+    /// between, which goes into twins alone; with every twin kept, as before,
+    /// it took a second copy.
+    #[cfg(feature = "vulkan")]
+    #[test]
+    fn the_draw_in_between_takes_no_second_copy_of_the_bottom_screen() {
+        PORTRAITS.with(|on| on.set(true));
+        let mut registers = target_registers();
+        sized(&mut registers, 240, 320);
+        registers[REG_TEXTURE_CONFIG] = 1;
+        // in the island against the bottom screen's top right corner
+        let hud = quad((0.6667, 0.9167), (-0.9375, -0.375), RED);
+        for twin_cuts in [true, false] {
+            let Ok(mut hardware) = hardware::Hardware::new() else { break };
+            hardware.twin_cuts = twin_cuts;
+            hardware.set_twins(true);
+            let mut resources = Resources { hardware: Some(hardware), ..Default::default() };
+            resources.portraits.in_play = true;
+            resources.portraits.top = Some([0x1F08_0000 >> 3, 0, 256 | (511 << 12)]);
+            let mut memory = ConsoleMemory::default();
+            for pass in [Pass::Twinned, Pass::Twin] {
+                resources.hardware.as_mut().unwrap().pass = pass;
+                rasterize_shaded(&registers, &mut memory, &mut resources, &hud);
+            }
+            assert_eq!(resources.portraits.hud.len(), if twin_cuts { 1 } else { 2 }, "with twin cuts {twin_cuts}");
+        }
+        PORTRAITS.with(|on| on.set(false));
+    }
+
+    /// the portraits drawn into the top screen's buffer go into its twin as
+    /// well, the picture in between has them too, even when the draw they
+    /// go under, the subtitles', is one a draw in between follows.
+    #[cfg(feature = "vulkan")]
+    #[test]
+    fn portraits_go_into_the_picture_in_between_too() {
+        let registers = target_registers();
+        for twin_cuts in [true, false] {
+            let Ok(mut hardware) = hardware::Hardware::new() else { return };
+            hardware.twin_cuts = twin_cuts;
+            hardware.set_twins(true);
+            let mut resources = Resources { hardware: Some(hardware), ..Default::default() };
+            let mut memory = ConsoleMemory::default();
+            let pass = |resources: &mut Resources, pass| resources.hardware.as_mut().unwrap().pass = pass;
+            // a draw that moved gave the buffer a twin
+            pass(&mut resources, Pass::Twinned);
+            rasterize_shaded(&registers, &mut memory, &mut resources, &cover(-0.5, BLUE));
+            pass(&mut resources, Pass::Twin);
+            rasterize_shaded(&registers, &mut memory, &mut resources, &cover(-0.5, BLUE));
+            // the portraits go in during the title's own draw of the next
+            pass(&mut resources, Pass::Twinned);
+            resources.portraits.hud.push(PortraitDraw { registers: registers.clone(), vertices: cover(-0.5, RED) });
+            let before = resources.hardware.as_ref().unwrap().twin_work(COLOR)[0];
+            flush_portraits(&mut memory, &mut resources);
+            let drawn = resources.hardware.as_ref().unwrap().twin_work(COLOR)[0] - before;
+            assert_eq!(drawn, if twin_cuts { 1 } else { 0 }, "into the twin with twin cuts {twin_cuts}");
+        }
+    }
+
+    /// a frame drawn with a picture in between, a band that moved, and the
+    /// display transfer of it to a screen's buffer, shown or not. the
+    /// screen's picture.
+    #[cfg(feature = "vulkan")]
+    fn interpolated_frame(resources: &mut Resources, memory: &mut ConsoleMemory, registers: &[u32], output: u32, hidden: bool) -> crate::ScreenRef {
+        const SIZE: u32 = 32;
+        let pass = |resources: &mut Resources, pass| resources.hardware.as_mut().unwrap().pass = pass;
+        rasterize_shaded(registers, memory, resources, &cover(0.0, BLUE));
+        pass(resources, Pass::Twinned);
+        rasterize_shaded(registers, memory, resources, &quad((-1.0, 0.0), (-1.0, 1.0), RED));
+        pass(resources, Pass::Twin);
+        rasterize_shaded(registers, memory, resources, &quad((-0.5, 0.5), (-1.0, 1.0), RED));
+        pass(resources, Pass::Real);
+        let hardware = resources.hardware.as_mut().unwrap();
+        hardware.screen_hidden(hidden);
+        assert!(hardware.display_transfer(memory, &plain_transfer(COLOR, output, (SIZE, SIZE))).unwrap());
+        hardware.screen(output, (SIZE, SIZE), SIZE, ColorFormat::Rgba8, &[]).expect("drawn on the GPU")
+    }
+
+    /// a screen the window does not show gets no picture in between, no
+    /// transfer into its twin nor its twin turned upright. a shown one gets
+    /// its twin turned upright once its picture in between is asked for,
+    /// the same picture as when every twin was kept, which turned it upright
+    /// from the first frame.
+    #[cfg(feature = "vulkan")]
+    #[test]
+    fn only_a_shown_screen_gets_a_picture_in_between_once_asked_for() {
+        const OUTPUT: u32 = 0x10_0000;
+        let mut registers = target_registers();
+        sized(&mut registers, 32, 32);
+        let mut betweens = Vec::new();
+        for twin_cuts in [true, false] {
+            let made = |hidden: bool| -> Option<(Resources, ConsoleMemory)> {
+                let device = hardware::own_device().ok()?;
+                let mut hardware = hardware::Hardware::with_device(std::sync::Arc::new(device), true, None).unwrap();
+                hardware.twin_cuts = twin_cuts;
+                hardware.set_twins(true);
+                let mut resources = Resources { hardware: Some(hardware), ..Default::default() };
+                let mut memory = ConsoleMemory::default();
+                interpolated_frame(&mut resources, &mut memory, &registers, OUTPUT, hidden);
+                Some((resources, memory))
+            };
+            // hidden
+            let Some((mut resources, _)) = made(true) else { return };
+            let hardware = resources.hardware.as_mut().unwrap();
+            let [_, transfers, uprights, _] = hardware.twin_work(OUTPUT);
+            assert_eq!((transfers, uprights), if twin_cuts { (0, 0) } else { (1, 1) }, "a hidden screen with twin cuts {twin_cuts}");
+            // shown, the first frame turns its twin upright only when every
+            // twin is kept, the second once the first asked for it
+            let (mut resources, mut memory) = made(false).unwrap();
+            let hardware = resources.hardware.as_mut().unwrap();
+            let [_, transfers, uprights, _] = hardware.twin_work(OUTPUT);
+            assert_eq!((transfers, uprights), if twin_cuts { (1, 0) } else { (1, 1) }, "a shown screen with twin cuts {twin_cuts}");
+            let screen = hardware.screen(OUTPUT, (32, 32), 32, ColorFormat::Rgba8, &[]).unwrap();
+            assert_eq!(hardware.between_image(screen).unwrap().is_some(), !twin_cuts, "with twin cuts {twin_cuts}");
+            let screen = interpolated_frame(&mut resources, &mut memory, &registers, OUTPUT, false);
+            let hardware = resources.hardware.as_mut().unwrap();
+            assert_eq!(hardware.twin_work(OUTPUT)[2], if twin_cuts { 1 } else { 2 }, "with twin cuts {twin_cuts}");
+            assert!(hardware.between_image(screen).unwrap().is_some(), "asked for, with twin cuts {twin_cuts}");
+            betweens.push(hardware.upright_pixels(screen, true).unwrap().0);
+        }
+        assert!(betweens[0] == betweens[1], "the same picture in between");
     }
 
     /// a quad covering x from `x.0` to `x.1` and y from `y.0` to `y.1` in

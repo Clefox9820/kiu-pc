@@ -346,15 +346,19 @@ struct Running {
 /// with ZAKURO_SHOT=<path prefix>, saves both screens as the GPU shows them
 /// to <prefix>-<frame>-top.png and -bottom.png, once a pacing window, for
 /// checking a change to the renderer by eye where the window can't be
-/// captured.
+/// captured. frame interpolation's pictures in between go to
+/// -top-between.png and -bottom-between.png, when it made them, to compare
+/// them between builds pixel by pixel.
 fn save_screens(system: &mut System, frame: u64) {
     static PREFIX: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
     let Some(prefix) = PREFIX.get_or_init(|| std::env::var("ZAKURO_SHOT").ok()) else { return };
     for (screen, name) in [(zakuro_common::Screen::Top, "top"), (zakuro_common::Screen::Bottom, "bottom")] {
-        let Some((pixels, width, height)) = system.upright_screen(screen, false) else { continue };
-        let path = format!("{prefix}-{frame}-{name}.png");
-        if let Err(error) = image::save_buffer(&path, &pixels, width, height, image::ExtendedColorType::Rgba8) {
-            log::warn!("could not save {path}, {error}");
+        for (between, suffix) in [(false, ""), (true, "-between")] {
+            let Some((pixels, width, height)) = system.upright_screen(screen, between) else { continue };
+            let path = format!("{prefix}-{frame}-{name}{suffix}.png");
+            if let Err(error) = image::save_buffer(&path, &pixels, width, height, image::ExtendedColorType::Rgba8) {
+                log::warn!("could not save {path}, {error}");
+            }
         }
     }
 }
@@ -1548,6 +1552,9 @@ impl App {
         }
         let in_play = game.out_of_play <= IN_PLAY_QUIET;
         game.system.gpu.set_in_play(in_play);
+        // a screen the window does not show needs no picture in between
+        let (top, bottom) = shows(self.layout.screens_in(in_play));
+        game.system.gpu.set_shown(top, bottom);
         // the automatic layout shows the bottom screen over the top one in
         // menus, where the game is played on it
         if in_play != was_in_play && self.layout == Screens::Auto {
@@ -2016,6 +2023,15 @@ fn download_play_view(guest: &zakuro_core::download_play::Guest, members: &[zaku
     menus::DlpView { offers, doing }
 }
 
+/// whether a layout shows the top screen and the bottom one.
+fn shows(layout: zakuro_gpu::ScreenLayout) -> (bool, bool) {
+    match layout {
+        zakuro_gpu::ScreenLayout::TopOnly => (true, false),
+        zakuro_gpu::ScreenLayout::BottomOnly => (false, true),
+        _ => (true, true),
+    }
+}
+
 /// a screen as the presenter takes it, straight from the GPU when it shares
 /// the renderer's device and the GPU drew what the screen shows, else its
 /// pixels.
@@ -2043,6 +2059,18 @@ const _: RendererKind = RendererKind::Software;
 #[cfg(test)]
 mod tests {
     use zakuro_gpu::Viewport;
+
+    /// the layouts with one screen hide the other one, the rest show both,
+    /// the bottom screen over the top one's included.
+    #[test]
+    fn a_layout_with_one_screen_hides_the_other() {
+        use zakuro_gpu::ScreenLayout::*;
+        assert_eq!(super::shows(TopOnly), (true, false));
+        assert_eq!(super::shows(BottomOnly), (false, true));
+        for layout in [Stacked, SideBySide, LargeTop, BottomOverTop] {
+            assert_eq!(super::shows(layout), (true, true), "{layout:?}");
+        }
+    }
 
     #[test]
     fn pacing_counts_late_frames_once_a_window() {
