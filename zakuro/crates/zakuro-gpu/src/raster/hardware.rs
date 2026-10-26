@@ -312,6 +312,10 @@ struct Surface {
     pixel: Option<[u8; 4]>,
     /// the image is known to match guest memory in this batch.
     checked: bool,
+    /// the rows of memory the lookup that checked it looked for others'
+    /// drawing over, all of them unless it asked for some, which leaves the
+    /// others to look at before they are used.
+    checked_rows: (u32, u32),
     /// the rows drawn into since guest memory last got the image, rows of
     /// memory from the buffer's start, whole rows of tiles.
     dirty: Option<(u32, u32)>,
@@ -355,6 +359,12 @@ impl Surface {
 
     fn overlaps(&self, addr: u32, len: u32) -> bool {
         addr < self.addr + self.size() && self.addr < addr + len
+    }
+
+    /// whether the image is known to match guest memory over rows of
+    /// memory, with what others drew there looked for.
+    fn checked_over(&self, (start, end): (u32, u32)) -> bool {
+        self.checked && self.checked_rows.0 <= start && end <= self.checked_rows.1
     }
 
     /// the bytes a row of the buffer takes.
@@ -1540,6 +1550,9 @@ pub struct Hardware {
     replacing: (std::time::Duration, u64),
     /// the buffers they were uploaded from, by batch, freed once it is done.
     staged: Vec<(u64, Buffer)>,
+    /// images let go of that a batch still records something into, by
+    /// batch, destroyed once it is done.
+    dropped: Vec<(u64, Image)>,
     /// pictures asked for and not uploaded yet, by hash, with the batch
     /// they were last asked for in.
     waiting: HashMap<u64, (Arc<Material>, u64)>,
@@ -1606,6 +1619,10 @@ pub struct Hardware {
     /// what waits without timing it.
     #[cfg(test)]
     pub(crate) waited_done: u32,
+    /// hands nothing over between surfaces, as before handovers, for the
+    /// tests to compare with.
+    #[cfg(test)]
+    pub(crate) through_memory: bool,
 }
 
 impl Hardware {
@@ -1801,6 +1818,7 @@ impl Hardware {
                 replaced_most: (properties.limits.max_memory_allocation_count / 2).min(4096) as usize,
                 replacing: (std::time::Duration::ZERO, 0),
                 staged: Vec::new(),
+                dropped: Vec::new(),
                 waiting: HashMap::new(),
                 replacing_from: 0,
                 max_image_size: properties.limits.max_image_dimension2_d,
@@ -1843,6 +1861,8 @@ impl Hardware {
                 new_keys: Vec::new(),
                 #[cfg(test)]
                 waited_done: 0,
+                #[cfg(test)]
+                through_memory: false,
             };
             let ring_usage = vk::BufferUsageFlags::VERTEX_BUFFER
                 | vk::BufferUsageFlags::INDEX_BUFFER
@@ -2430,6 +2450,102 @@ impl Hardware {
             .fold(height, u32::max)
     }
 
+    /// makes a surface for a guest buffer, which takes memory's bytes at its
+    /// first use.
+    fn make_surface(&mut self, addr: u32, (width, height): (u32, u32), kind: Kind, tiled: bool) -> Result<usize, String> {
+        let (format, usage, aspect) = surface_image(kind, self.depth_format);
+        let image = self.image(width * self.scale, height * self.scale, format, usage, aspect)?;
+        let native = match self.scale {
+            1 => None,
+            // scaled on the CPU on its way to and from memory
+            _ if matches!(kind, Kind::Depth(_)) && !self.depth_blits => None,
+            _ => {
+                let usage = vk::ImageUsageFlags::TRANSFER_SRC | vk::ImageUsageFlags::TRANSFER_DST;
+                Some(self.image(width, height, format, usage, aspect)?)
+            }
+        };
+        self.uploads = true;
+        self.surfaces.push(Surface {
+            image,
+            addr,
+            width,
+            height,
+            kind,
+            tiled,
+            shadow: Vec::new(),
+            pixel: None,
+            checked: false,
+            checked_rows: (0, 0),
+            dirty: None,
+            guarded: None,
+            write_guarded: None,
+            cleared: None,
+            stale: None,
+            capture: None,
+            native,
+            screen: None,
+            upright: None,
+            generation: 0,
+            twin: None,
+            twinned: false,
+            twin_generation: 0,
+            twin_upright: None,
+        });
+        Ok(self.surfaces.len() - 1)
+    }
+
+    /// whether a texture over memory other buffers drew, of a shape none of
+    /// them has, is rows of a surface of its own shape once that surface
+    /// takes what they drew there on the GPU, as a handover lets it, so the
+    /// draw copies the texture from its image instead of waiting for theirs
+    /// to come down. Kid Icarus Uprising samples the top screen's 240x400
+    /// picture out of a 256x512 buffer's memory for its bloom. a texture's
+    /// texels lie in tiles as a buffer's pixels do, rows of memory the same.
+    /// false when nothing can be handed over, a surface made for the texture
+    /// is let go then, and the texture comes from memory as before.
+    pub(crate) fn takes<M: GpuMemory>(&mut self, memory: &mut M, texture: &DrawnTexture) -> Result<bool, String> {
+        let kind = Kind::Color(texture.format);
+        let (width, height) = (texture.width, texture.height);
+        if !width.is_multiple_of(8) || !height.is_multiple_of(8) {
+            return Ok(false);
+        }
+        let len = width * height * kind.bytes();
+        let others: Vec<usize> = (0..self.surfaces.len()).filter(|&i| self.surfaces[i].dirty_overlaps(texture.addr, len)).collect();
+        // a handover takes from tiled buffers of the same format alone
+        if others.is_empty() || others.iter().any(|&i| self.surfaces[i].kind != kind || !self.surfaces[i].tiled) {
+            return Ok(false);
+        }
+        // making an image and taking memory's bytes record into the batch,
+        // which a transfer, a sync or a write back may have run already
+        self.begin()?;
+        let found = self.surfaces.iter().position(|s| s.addr == texture.addr && s.width == width && s.height == height && s.kind == kind && s.tiled);
+        let index = match found {
+            Some(index) => index,
+            None => self.make_surface(texture.addr, (width, height), kind, true)?,
+        };
+        let others: Vec<usize> = others.into_iter().filter(|&i| i != index).collect();
+        // as the lookup decides, which then takes what they drew, or what
+        // memory changed beside what this one drew comes down first
+        let mut bytes = std::mem::take(&mut self.scratch);
+        let handed = !others.is_empty()
+            && !self.surfaces[index].checked_over((0, height))
+            && self.handover(memory, index, &others).is_some()
+            && !(self.surfaces[index].dirty.is_some() && self.differs(memory, index, false, &mut bytes));
+        self.scratch = bytes;
+        if !handed {
+            if found.is_none() {
+                // made above and never used, but the batch has the barrier
+                // that readied its images, which go once the batch is done
+                let surface = self.surfaces.pop().expect("made above");
+                let batch = self.batch;
+                self.dropped.extend(std::iter::once(surface.image).chain(surface.native).map(|image| (batch, image)));
+            }
+            return Ok(false);
+        }
+        self.surface(memory, texture.addr, (width, height), kind, true)?;
+        Ok(self.holds(texture))
+    }
+
     fn surface_rows<M: GpuMemory>(
         &mut self,
         memory: &mut M,
@@ -2445,49 +2561,15 @@ impl Hardware {
             .position(|s| s.addr == addr && s.width == width && s.height == height && s.kind == kind && s.tiled == tiled)
         {
             Some(index) => index,
-            None => {
-                let (format, usage, aspect) = surface_image(kind, self.depth_format);
-                let image = self.image(width * self.scale, height * self.scale, format, usage, aspect)?;
-                let native = match self.scale {
-                    1 => None,
-                    // scaled on the CPU on its way to and from memory
-                    _ if matches!(kind, Kind::Depth(_)) && !self.depth_blits => None,
-                    _ => {
-                        let usage = vk::ImageUsageFlags::TRANSFER_SRC | vk::ImageUsageFlags::TRANSFER_DST;
-                        Some(self.image(width, height, format, usage, aspect)?)
-                    }
-                };
-                self.uploads = true;
-                self.surfaces.push(Surface {
-                    image,
-                    addr,
-                    width,
-                    height,
-                    kind,
-                    tiled,
-                    shadow: Vec::new(),
-                    pixel: None,
-                    checked: false,
-                    dirty: None,
-                    guarded: None,
-                    write_guarded: None,
-                    cleared: None,
-                    stale: None,
-                    capture: None,
-                    native,
-                    screen: None,
-                    upright: None,
-                    generation: 0,
-                    twin: None,
-                    twinned: false,
-                    twin_generation: 0,
-                    twin_upright: None,
-                });
-                self.surfaces.len() - 1
-            }
+            None => self.make_surface(addr, (width, height), kind, tiled)?,
         };
-        if self.surfaces[index].checked {
+        let asked = rows.unwrap_or((0, height));
+        if self.surfaces[index].checked_over(asked) {
             return Ok(index);
+        }
+        if log::log_enabled!(target: "zakuro_gpu::surfaces", log::Level::Trace) {
+            let s = &self.surfaces[index];
+            log::trace!(target: "zakuro_gpu::surfaces", "looks at 0x{:08X} {}x{} {:?} rows {rows:?}, dirty {:?}", s.addr, s.width, s.height, s.kind, s.dirty);
         }
         // what another surface over the same memory drew has to reach guest
         // memory before this one reads it, where this one is used
@@ -2536,7 +2618,16 @@ impl Hardware {
             self.hand_over(memory, index, handover)?;
         }
         self.scratch = bytes;
-        self.surfaces[index].checked = true;
+        let s = &mut self.surfaces[index];
+        // the rows looked at before join these, unless rows between them
+        // were not, nothing drew over this one since or it would not be
+        // checked
+        let (from, to) = s.checked_rows;
+        s.checked_rows = match s.checked && from <= asked.1 && asked.0 <= to {
+            true => (from.min(asked.0), to.max(asked.1)),
+            false => asked,
+        };
+        s.checked = true;
         Ok(index)
     }
 
@@ -2564,6 +2655,10 @@ impl Hardware {
     /// does not split into whole tiles, or the rows it draws in then hold
     /// what yet another drew, all of which go through memory instead.
     fn handover<M: GpuMemory>(&self, memory: &mut M, index: usize, others: &[usize]) -> Option<Handover> {
+        #[cfg(test)]
+        if self.through_memory {
+            return None;
+        }
         let s = &self.surfaces[index];
         if !matches!(s.kind, Kind::Color(_)) || !s.tiled || s.cleared.is_some() {
             return None;
@@ -3450,6 +3545,15 @@ impl Hardware {
     /// something reads it.
     pub(crate) fn prepare_read<M: GpuMemory>(&mut self, memory: &mut M, addr: u32, len: u32) -> Result<(), String> {
         if self.surfaces.iter().any(|s| s.dirty_overlaps(addr, len)) {
+            if log::log_enabled!(target: "zakuro_gpu::waits", log::Level::Debug) {
+                let drew: Vec<String> = self
+                    .surfaces
+                    .iter()
+                    .filter(|s| s.dirty_overlaps(addr, len))
+                    .map(|s| format!("0x{:08X} {}x{} {:?} dirty {:?}", s.addr, s.width, s.height, s.kind, s.dirty))
+                    .collect();
+                log::debug!(target: "zakuro_gpu::waits", "a texture at 0x{addr:08X}+0x{len:X} reads memory {} drew", drew.join(", "));
+            }
             self.sync(memory, addr, len)?;
         }
         Ok(())
@@ -3458,6 +3562,7 @@ impl Hardware {
     /// a fill is about to write a range, whatever the GPU drew over the part
     /// of a buffer it leaves alone has to come down first.
     pub(crate) fn before_fill<M: GpuMemory>(&mut self, memory: &mut M, addr: u32, len: u32, width: u32) -> Result<(), String> {
+        log::trace!(target: "zakuro_gpu::surfaces", "fill 0x{addr:08X}+0x{len:X}, pattern width {width}");
         let end = addr as u64 + len as u64;
         // whole rows of tiles get cleared on the GPU, when the pattern lines
         // up with the pixels
@@ -3473,6 +3578,16 @@ impl Hardware {
         // Eleven GO clears a depth buffer over the start of another every
         // frame, which it clears whole before drawing into it again
         let written: Vec<usize> = partial.into_iter().filter(|&i| !self.surfaces[i].supersede(addr, len)).collect();
+        if !written.is_empty() && log::log_enabled!(target: "zakuro_gpu::waits", log::Level::Debug) {
+            let shapes: Vec<String> = written
+                .iter()
+                .map(|&i| {
+                    let s = &self.surfaces[i];
+                    format!("0x{:08X} {}x{} {:?} dirty {:?} stale {:?}", s.addr, s.width, s.height, s.kind, s.dirty, s.stale)
+                })
+                .collect();
+            log::debug!(target: "zakuro_gpu::waits", "a fill of 0x{addr:08X}+0x{len:X} writes back {}", shapes.join(", "));
+        }
         if !written.is_empty() {
             self.write_back(memory, written)?;
         }
@@ -4521,6 +4636,17 @@ impl Hardware {
         self.texture_source(texture).is_some_and(|(index, row)| row + texture.height <= self.surfaces[index].height)
     }
 
+    /// the memory of a texture past the surface it is rows of, which is read
+    /// as memory holds it, so what others drew there has to come down.
+    pub(crate) fn past(&self, texture: &DrawnTexture) -> Option<(u32, u32)> {
+        let (index, row) = self.texture_source(texture)?;
+        let s = &self.surfaces[index];
+        let rows = (s.height - row).min(texture.height);
+        let held = texture.addr + rows * s.row_bytes();
+        let end = texture.addr + texture.width * texture.height * Kind::Color(texture.format).bytes();
+        (held < end).then(|| (held, end - held))
+    }
+
     /// whether a texture is rows of a surface the GPU drew and guest memory
     /// has not got back, which draw then copies on the GPU. rows a fill
     /// cleared of it hold what memory held then, when memory may have
@@ -5398,6 +5524,11 @@ impl Hardware {
             for (_, buffer) in done {
                 self.destroy_buffer(&buffer);
             }
+            let (done, waiting) = std::mem::take(&mut self.dropped).into_iter().partition(|&(dropped, _)| dropped <= batch);
+            self.dropped = waiting;
+            for (_, image) in done {
+                self.destroy_image(&image);
+            }
         }
         // pictures for screens are read out before a later batch can draw
         // over them
@@ -5689,6 +5820,9 @@ impl Drop for Hardware {
             }
             for (_, buffer) in &self.staged {
                 self.destroy_buffer(buffer);
+            }
+            for (_, image) in &self.dropped {
+                self.destroy_image(image);
             }
             for surface in &self.surfaces {
                 self.destroy_image(&surface.image);
@@ -6102,6 +6236,7 @@ mod tests {
                 shadow: Vec::new(),
                 pixel: None,
                 checked: false,
+                checked_rows: (0, 0),
                 dirty: None,
                 guarded: None,
                 write_guarded: None,

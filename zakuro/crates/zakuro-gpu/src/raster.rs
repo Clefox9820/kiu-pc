@@ -3081,9 +3081,23 @@ fn rasterize<M: GpuMemory>(registers: &[u32], memory: &mut M, resources: &mut Re
     #[cfg(feature = "vulkan")]
     if let Some(hardware) = resources.hardware.as_mut() {
         for (unit, drawn) in drawn.iter_mut().enumerate() {
-            *drawn = drawn_texture(registers, memory, unit).filter(|texture| hardware.holds(texture));
+            // or one of its own shape takes what they drew there, on the GPU
+            let takes = |hardware: &mut hardware::Hardware, memory: &mut M, texture: &DrawnTexture| {
+                hardware.takes(memory, texture).unwrap_or_else(|error| {
+                    log::error!("the GPU could not hand a buffer over to a texture, {error}");
+                    false
+                })
+            };
+            *drawn = drawn_texture(registers, memory, unit).filter(|texture| hardware.holds(texture) || takes(hardware, memory, texture));
             if let Some(texture) = drawn {
                 past[unit] = !hardware.covers(texture);
+                // the rows past it are read as memory holds them, which
+                // needs what another buffer drew there
+                if let Some((addr, len)) = hardware.past(texture) {
+                    if let Err(error) = hardware.prepare_read(memory, addr, len) {
+                        log::error!("the GPU could not write back a buffer, {error}");
+                    }
+                }
                 continue;
             }
             if let Some((addr, len)) = texture_range(registers, memory, unit) {
@@ -4450,6 +4464,295 @@ mod tests {
                     assert_eq!(rgba(at, &out), colors[tile], "tile {tile} is one color at scale {scale}");
                 }
                 assert_eq!(colors, [[0, 255, 0, 255], [255, 0, 0, 255], [0, 0, 255, 255], [0, 0, 255, 255]], "at scale {scale}");
+            }
+        }
+    }
+
+    /// the registers of a draw over rows of memory of a buffer, its depth
+    /// buffer far from the color ones.
+    #[cfg(feature = "vulkan")]
+    fn over_rows(addr: u32, (width, height): (u32, u32), (first, rows): (u32, u32)) -> Vec<u32> {
+        let mut registers = target_registers();
+        sized(&mut registers, width, height);
+        registers[REG_COLOR_BUFFER_ADDRESS] = addr >> 3;
+        registers[REG_DEPTH_BUFFER_ADDRESS] = 0x30_0000 >> 3;
+        // window rows run up from the buffer's last row of memory
+        registers[REG_VIEWPORT_XY] = (height - first - rows) << 16;
+        registers[REG_VIEWPORT_HEIGHT] = float24(rows as f32 / 2.0);
+        registers
+    }
+
+    /// the registers of a draw spreading a texture over a buffer of its
+    /// size, straight from the combiners, see spread.
+    #[cfg(feature = "vulkan")]
+    fn sampling(texture: u32, (width, height): (u32, u32), target: u32) -> Vec<u32> {
+        let mut registers = over_rows(target, (width, height), (0, height));
+        registers[REG_TEXTURE_CONFIG] = 1;
+        registers[REG_TEXTURE0_DIMENSIONS] = height | (width << 16);
+        registers[REG_TEXTURE0_ADDRESS] = texture >> 3;
+        registers[0x0C0] = 0x3 | (0x3 << 16);
+        for stage in [0x0C8, 0x0D0, 0x0D8, 0x0F0, 0x0F8] {
+            registers[stage] = 0xF | (0xF << 16);
+        }
+        registers
+    }
+
+    /// a triangle over the whole target, the texture spread across it.
+    #[cfg(feature = "vulkan")]
+    fn spread() -> Vec<Vertex> {
+        [[-1.0, -1.0, 0.0, 0.0], [3.0, -1.0, 2.0, 0.0], [-1.0, 3.0, 0.0, 2.0]]
+            .into_iter()
+            .map(|[x, y, u, v]| Vertex {
+                clip: [x, y, -0.5, 1.0],
+                color: [1.0; 4],
+                texcoords: [[u, v], [0.0; 2], [0.0; 2]],
+                quaternion: [0.0, 0.0, 0.0, 1.0],
+                view: [0.0; 3],
+            })
+            .collect()
+    }
+
+    /// what steps leave in memory over a range once flushed, on a GPU of
+    /// their own at a scale, once with buffers handing each other nothing,
+    /// as before handovers, and once as they do now. none without a GPU.
+    #[cfg(feature = "vulkan")]
+    fn both_ways(scale: u32, (addr, len): (u32, u32), steps: impl Fn(&mut ConsoleMemory, &mut Resources)) -> Option<[Vec<u8>; 2]> {
+        let mut held = [Vec::new(), Vec::new()];
+        for (through_memory, held) in [true, false].into_iter().zip(&mut held) {
+            let mut hardware = hardware::Hardware::new().ok()?;
+            hardware.set_scale(scale);
+            hardware.through_memory = through_memory;
+            let mut resources = Resources { hardware: Some(hardware), ..Default::default() };
+            let mut memory = ConsoleMemory::default();
+            steps(&mut memory, &mut resources);
+            resources.hardware.as_mut().unwrap().flush(&mut memory).unwrap();
+            *held = vec![0; len as usize];
+            memory.read(addr, held);
+        }
+        Some(held)
+    }
+
+    /// a transfer from a buffer to linear memory as wide and tall.
+    #[cfg(feature = "vulkan")]
+    fn plain_transfer(input: u32, output: u32, (width, height): (u32, u32)) -> hardware::Transfer {
+        hardware::Transfer {
+            input,
+            output,
+            input_width: width,
+            output_width: width,
+            output_height: height,
+            copy: (width, height),
+            scale: (1, 1),
+            flip: false,
+            input_linear: false,
+            output_tiled: false,
+            input_format: ColorFormat::Rgba8,
+            output_format: ColorFormat::Rgba8,
+        }
+    }
+
+    /// a texture of another shape taken on the GPU once a transfer ran the
+    /// batch goes into a batch begun for it, and samples as memory would
+    /// have it. Kid Icarus Uprising's shapes, 256x512 and 240x320 at one
+    /// address, the 240x400 texture past the 240x320 one.
+    #[cfg(feature = "vulkan")]
+    #[test]
+    fn a_texture_taken_after_a_transfer_goes_into_a_batch_of_its_own() {
+        const TEXTURE: u32 = COLOR + 0x5DC00;
+        const OUTPUT: u32 = 0x20_0000;
+        const TARGET: u32 = 0x28_0000;
+        for scale in [1, 3] {
+            let Some([old, new]) = both_ways(scale, (COLOR, 0x30_0000 - COLOR), |memory, resources| {
+                rasterize_shaded(&over_rows(COLOR, (256, 512), (0, 512)), memory, resources, &cover(-0.5, RED));
+                rasterize_shaded(&over_rows(COLOR, (240, 320), (0, 8)), memory, resources, &cover(-0.5, GREEN));
+                let hardware = resources.hardware.as_mut().unwrap();
+                hardware.display_transfer(memory, &plain_transfer(COLOR, OUTPUT, (240, 320))).unwrap();
+                rasterize_shaded(&sampling(TEXTURE, (240, 400), TARGET), memory, resources, &spread());
+            }) else {
+                return;
+            };
+            assert!(old == new, "at scale {scale}");
+        }
+    }
+
+    /// the same once a sync ran the batch, with bytes the CPU wrote under
+    /// and past the buffers.
+    #[cfg(feature = "vulkan")]
+    #[test]
+    fn a_texture_taken_after_a_sync_goes_into_a_batch_of_its_own() {
+        const TEXTURE: u32 = COLOR + 0x5DC00;
+        const TARGET: u32 = 0x28_0000;
+        for scale in [1, 3] {
+            let Some([old, new]) = both_ways(scale, (COLOR, 0x30_0000 - COLOR), |memory, resources| {
+                for (at, byte) in [(COLOR + 400 * 1024, 0x11), (TEXTURE + 200_000, 0x22), (COLOR + 8 * 1024, 0x33)] {
+                    memory.write(at, &[byte; 256]);
+                }
+                rasterize_shaded(&over_rows(COLOR, (256, 512), (480, 8)), memory, resources, &cover(-0.5, RED));
+                rasterize_shaded(&over_rows(COLOR, (240, 320), (0, 8)), memory, resources, &cover(-0.5, GREEN));
+                resources.hardware.as_mut().unwrap().sync(memory, COLOR, 240 * 320 * 4).unwrap();
+                rasterize_shaded(&sampling(TEXTURE, (240, 400), TARGET), memory, resources, &spread());
+            }) else {
+                return;
+            };
+            assert!(old == new, "at scale {scale}");
+        }
+    }
+
+    /// the rows of a texture past the surface it is rows of are read from
+    /// memory once what another buffer drew there came down.
+    #[cfg(feature = "vulkan")]
+    #[test]
+    fn the_rows_of_a_texture_past_its_surface_come_down_first() {
+        const TARGET: u32 = 0x20_0000;
+        for scale in [1, 3] {
+            let Some([old, new]) = both_ways(scale, (COLOR, TARGET + 2048 - COLOR), |memory, resources| {
+                rasterize_shaded(&over_rows(COLOR, (8, 64), (0, 64)), memory, resources, &cover(-0.5, RED));
+                rasterize_shaded(&sampling(COLOR, (16, 16), TARGET), memory, resources, &spread());
+                // a row of tiles into the first texture, the second past it
+                rasterize_shaded(&sampling(COLOR + 512, (16, 16), TARGET + 1024), memory, resources, &spread());
+            }) else {
+                return;
+            };
+            assert!(old == new, "at scale {scale}");
+        }
+    }
+
+    /// a buffer looked up for some of its rows looks again before its other
+    /// rows are used, another buffer may hold what was drawn there.
+    #[cfg(feature = "vulkan")]
+    #[test]
+    fn a_lookup_of_some_rows_leaves_the_others_to_look_at() {
+        const OUTPUT: u32 = 0x20_0000;
+        const TARGET: u32 = 0x28_0000;
+        for scale in [1, 3] {
+            let Some([old, new]) = both_ways(scale, (COLOR, TARGET + 1024 - COLOR), |memory, resources| {
+                rasterize_shaded(&over_rows(COLOR, (24, 8), (0, 8)), memory, resources, &cover(-0.5, RED));
+                rasterize_shaded(&sampling(COLOR, (16, 16), TARGET), memory, resources, &spread());
+                // away from what the texture's surface took
+                rasterize_shaded(&over_rows(COLOR, (8, 64), (40, 8)), memory, resources, &cover(-0.5, GREEN));
+                let hardware = resources.hardware.as_mut().unwrap();
+                hardware.display_transfer(memory, &plain_transfer(COLOR, OUTPUT, (8, 64))).unwrap();
+            }) else {
+                return;
+            };
+            assert!(old == new, "at scale {scale}");
+        }
+    }
+
+    /// a texture of another shape over memory a buffer drew, as Kid Icarus
+    /// Uprising samples the top screen's 240x400 picture out of a 256x512
+    /// buffer's memory for its bloom, comes from the buffer's image on the
+    /// GPU without waiting for it, and samples as it does from memory with
+    /// the buffer written back first. bytes memory took under the rows the
+    /// buffer drew go through memory, as before.
+    #[cfg(feature = "vulkan")]
+    #[test]
+    fn a_texture_of_another_shape_takes_what_a_buffer_drew_on_the_gpu() {
+        const TEXTURE: u32 = COLOR + 0x5DC00;
+        const END: u32 = TEXTURE + 240 * 400 * 4;
+        const TARGET: u32 = 0x10_0000;
+        const DEPTHS: u32 = 0x30_0000;
+        let mut drawing = target_registers();
+        sized(&mut drawing, 256, 512);
+        // the window's 240x400 at its bottom left, memory's rows 112 to 512
+        drawing[REG_VIEWPORT_WIDTH] = float24(120.0);
+        drawing[REG_VIEWPORT_HEIGHT] = float24(200.0);
+        drawing[REG_DEPTH_BUFFER_ADDRESS] = DEPTHS >> 3;
+        // the texture spread over a buffer of its size, straight from the
+        // combiners
+        let mut sampling = target_registers();
+        sized(&mut sampling, 240, 400);
+        sampling[REG_COLOR_BUFFER_ADDRESS] = TARGET >> 3;
+        sampling[REG_DEPTH_BUFFER_ADDRESS] = DEPTHS >> 3;
+        sampling[REG_TEXTURE_CONFIG] = 1;
+        sampling[REG_TEXTURE0_DIMENSIONS] = 400 | (240 << 16);
+        sampling[REG_TEXTURE0_ADDRESS] = TEXTURE >> 3;
+        sampling[0x0C0] = 0x3 | (0x3 << 16);
+        for stage in [0x0C8, 0x0D0, 0x0D8, 0x0F0, 0x0F8] {
+            sampling[stage] = 0xF | (0xF << 16);
+        }
+        let mut seed = 7u32;
+        let mut random = move || {
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (seed >> 8) as f32 / (1 << 24) as f32
+        };
+        let triangles: Vec<Vec<Vertex>> = (0..30)
+            .map(|_| {
+                let color = [random(), random(), random(), random()];
+                (0..3)
+                    .map(|_| Vertex {
+                        clip: [random() * 2.0 - 1.0, random() * 2.0 - 1.0, -random(), 1.0],
+                        color,
+                        texcoords: [[0.0; 2]; 3],
+                        quaternion: [0.0, 0.0, 0.0, 1.0],
+                        view: [0.0; 3],
+                    })
+                    .collect()
+            })
+            .collect();
+        let quad: Vec<Vertex> = [[-1.0, -1.0, 0.0, 0.0], [3.0, -1.0, 2.0, 0.0], [-1.0, 3.0, 0.0, 2.0]]
+            .into_iter()
+            .map(|[x, y, u, v]| Vertex {
+                clip: [x, y, -0.5, 1.0],
+                color: [1.0; 4],
+                texcoords: [[u, v], [0.0; 2], [0.0; 2]],
+                quaternion: [0.0, 0.0, 0.0, 1.0],
+                view: [0.0; 3],
+            })
+            .collect();
+        // what memory holds past the buffer, where the texture reaches
+        let past: Vec<u8> = (0..END - (COLOR + 512 * 1024)).map(|i| (i * 7 % 251) as u8).collect();
+        for written in [false, true] {
+            for scale in [1, 3] {
+                // once with buffers handed nothing, once as they are now
+                let mut results = Vec::new();
+                for through_memory in [true, false] {
+                    let Ok(mut hardware) = hardware::Hardware::new() else { return };
+                    hardware.set_scale(scale);
+                    hardware.through_memory = through_memory;
+                    let mut resources = Resources { hardware: Some(hardware), ..Default::default() };
+                    let mut memory = ConsoleMemory::default();
+                    memory.write(COLOR + 512 * 1024, &past);
+                    let mut sampled = Vec::new();
+                    // two frames, the buffer drawn again over what the
+                    // texture's surface took, and sampled again
+                    for (frame, triangles) in triangles.chunks(15).enumerate() {
+                        for triangle in triangles {
+                            rasterize_shaded(&drawing, &mut memory, &mut resources, triangle);
+                        }
+                        let falls_back = written && frame == 0;
+                        if falls_back {
+                            // under the rows drawn, inside the texture, without
+                            // the buffer's guards asking first
+                            memory.write(COLOR + 400 * 1024, &[0x5A; 256]);
+                        }
+                        let before = resources.hardware.as_ref().unwrap().waited_done;
+                        rasterize_shaded(&sampling, &mut memory, &mut resources, &quad);
+                        let waits = resources.hardware.as_ref().unwrap().waited_done - before;
+                        match (through_memory, falls_back) {
+                            (false, false) => assert_eq!(waits, 0, "frame {frame} took the buffer's image at scale {scale}"),
+                            (false, true) => assert!(waits > 0, "frame {frame} went through memory at scale {scale}"),
+                            (true, _) => {}
+                        }
+                        // the target as each frame left it
+                        let hardware = resources.hardware.as_mut().unwrap();
+                        hardware.sync(&mut memory, TARGET, 240 * 400 * 4).unwrap();
+                        let mut out = vec![0u8; 240 * 400 * 4];
+                        memory.read(TARGET, &mut out);
+                        sampled.push(out);
+                    }
+                    resources.hardware.as_mut().unwrap().flush(&mut memory).unwrap();
+                    let mut held = vec![0u8; (END - COLOR) as usize];
+                    memory.read(COLOR, &mut held);
+                    results.push((sampled, held));
+                }
+                let what = if written { "with memory written under the drawing" } else { "as drawn" };
+                for frame in 0..2 {
+                    assert!(results[0].0[frame] == results[1].0[frame], "frame {frame} samples the same {what} at scale {scale}");
+                    let colors: std::collections::HashSet<&[u8]> = results[1].0[frame].chunks(4).collect();
+                    assert!(colors.len() > 8, "only {} colors in frame {frame}", colors.len());
+                }
+                assert!(results[0].1 == results[1].1, "memory ends up the same {what} at scale {scale}");
             }
         }
     }
