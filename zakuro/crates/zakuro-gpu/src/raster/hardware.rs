@@ -698,6 +698,19 @@ enum Work {
     Barrier,
 }
 
+/// with RUST_LOG=zakuro_gpu::waits=debug, says how long the host waited for
+/// the GPU to finish and where it asked to, for finding the waits a frame
+/// could do without.
+#[track_caller]
+fn note_wait(started: std::time::Instant) {
+    log::debug!(
+        target: "zakuro_gpu::waits",
+        "waited {:.2} ms for the GPU at {}",
+        started.elapsed().as_secs_f64() * 1000.0,
+        std::panic::Location::caller()
+    );
+}
+
 const WORK_NAMES: [&str; 9] = ["other", "draw", "upload", "clear", "transfer", "capture", "copy", "download", "barrier"];
 
 /// what the pipeline statistics count, in the order the results come.
@@ -2463,6 +2476,11 @@ impl Hardware {
             .filter(|&i| i != index && self.surfaces[i].dirty_overlaps(from, to))
             .collect();
         if !others.is_empty() {
+            if log::log_enabled!(target: "zakuro_gpu::waits", log::Level::Debug) {
+                let shape = |s: &Surface| format!("0x{:08X} {}x{} {:?}{}", s.addr, s.width, s.height, s.kind, if s.tiled { "" } else { " linear" });
+                let drew: Vec<String> = others.iter().map(|&i| shape(&self.surfaces[i])).collect();
+                log::debug!(target: "zakuro_gpu::waits", "{} reads memory {} drew", shape(&self.surfaces[index]), drew.join(", "));
+            }
             self.write_back(memory, others)?;
             self.begin()?;
         }
@@ -4057,6 +4075,7 @@ impl Hardware {
 
     /// runs what the batch recorded and writes everything it drew back to
     /// guest memory.
+    #[track_caller]
     pub(crate) fn flush<M: GpuMemory>(&mut self, memory: &mut M) -> Result<(), String> {
         let dirty = (0..self.surfaces.len()).filter(|&i| self.surfaces[i].dirty.is_some()).collect();
         self.write_back(memory, dirty)?;
@@ -4085,6 +4104,7 @@ impl Hardware {
     /// makes guest memory right over a range something other than a draw
     /// is about to read or write, what the GPU drew there comes down, and
     /// the next draw looks at the memory again.
+    #[track_caller]
     pub(crate) fn sync<M: GpuMemory>(&mut self, memory: &mut M, addr: u32, len: u32) -> Result<(), String> {
         self.sync_where(memory, addr, len, |_| true)
     }
@@ -4092,10 +4112,12 @@ impl Hardware {
     /// the same over the depth buffers alone, for the CPU reading where a
     /// depth buffer was drawn. the color buffers there it reads as memory
     /// holds them, see draw, even over memory a depth buffer had before.
+    #[track_caller]
     pub(crate) fn sync_depth<M: GpuMemory>(&mut self, memory: &mut M, addr: u32, len: u32) -> Result<(), String> {
         self.sync_where(memory, addr, len, |surface| matches!(surface.kind, Kind::Depth(_)))
     }
 
+    #[track_caller]
     fn sync_where<M: GpuMemory>(
         &mut self,
         memory: &mut M,
@@ -5075,21 +5097,34 @@ impl Hardware {
     }
 
     /// waits for the GPU to finish everything handed to it.
+    #[track_caller]
     fn wait(&mut self) -> Result<(), String> {
+        let started = std::time::Instant::now();
+        let waited = !self.in_flight.is_empty();
         while !self.in_flight.is_empty() {
             self.block(Wait::Done)?;
+        }
+        if waited {
+            note_wait(started);
         }
         Ok(())
     }
 
     /// waits for a batch, handing it to the GPU first if it is the one
     /// being recorded.
+    #[track_caller]
     fn wait_for(&mut self, batch: u64) -> Result<(), String> {
         if batch == self.batch {
             self.submit()?;
         }
+        let started = std::time::Instant::now();
+        let mut waited = false;
         while self.in_flight.front().is_some_and(|frame| frame.pending.is_some_and(|pending| pending <= batch)) {
             self.block(Wait::Done)?;
+            waited = true;
+        }
+        if waited {
+            note_wait(started);
         }
         Ok(())
     }
@@ -5167,6 +5202,7 @@ impl Hardware {
     /// writes the given surfaces back to guest memory, from their captures
     /// when those still hold them, else running the batch and reading them
     /// back.
+    #[track_caller]
     fn write_back<M: GpuMemory>(&mut self, memory: &mut M, dirty: Vec<usize>) -> Result<(), String> {
         self.mark(Work::Download, false);
         let (captured, others): (Vec<usize>, Vec<usize>) =
@@ -5196,6 +5232,7 @@ impl Hardware {
 
     /// runs what the batch recorded, then reads the given surfaces back and
     /// writes them to guest memory.
+    #[track_caller]
     fn run<M: GpuMemory>(&mut self, memory: &mut M, dirty: Vec<usize>) -> Result<(), String> {
         self.begin()?;
         self.end_rendering();

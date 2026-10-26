@@ -1548,6 +1548,18 @@ impl App {
         let since = self.last_emulated.replace(started).map(|last| started - last).unwrap_or_default();
         let menu = self.paused || self.menus.menu_open;
         // fast forward runs frames as fast as it can, no pacing to speak of
+        // every frame, with RUST_LOG=zakuro::frames=debug, to see a pattern
+        // the window's counts only add up
+        log::debug!(
+            target: "zakuro::frames",
+            "frame {} took {:.1} ms, {:.1} ms since the last, {} draws in {:.1} ms, waiting for the GPU {:.1} ms",
+            game.frame,
+            took.as_secs_f64() * 1000.0,
+            since.as_secs_f64() * 1000.0,
+            gpu.draws,
+            gpu.drawing,
+            gpu.waiting
+        );
         if !menu && !self.fast_forwarding && !since.is_zero() {
             if let Some(window) = game.pacing.note(since) {
                 log::info!(
