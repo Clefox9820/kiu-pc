@@ -179,6 +179,11 @@ Set-Content -NoNewline -Path $manifest -Value $text
 New-Item -ItemType Directory -Force -Path (Join-Path $Port ".cargo") | Out-Null
 # built for this machine's processor only
 Set-Content -Path (Join-Path $Port ".cargo\config.toml") -Value "[build]`nrustflags = [`"-C`", `"target-cpu=native`"]"
+# the crate versions Zakuro is tested with, and 3dsrecomp's runtime at the
+# commit that translated the code; left alone, cargo takes 3dsrecomp's main
+# of the day, which the translated code was not made for
+Copy-Item -Force (Join-Path $Root "zakuro\Cargo.lock") (Join-Path $Port "Cargo.lock")
+Run cargo @("update", "--quiet", "-p", "recomp3ds", "-p", "recomp-abi", "--precise", $RecompCommit) $Port
 Run cargo @("build", "--release") $Port
 $Exe = Join-Path $Port "target\release\kid-icarus.exe"
 
