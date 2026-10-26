@@ -1470,12 +1470,14 @@ impl App {
         let behind = Instant::now() > self.next_frame;
         let waits = self.backend.as_ref().is_some_and(Backend::waits_for_display);
         let unshown = if fast { Instant::now() < self.next_shown } else { skips_showing(playing, behind, waits, self.skipped) };
+        let mut presented = None;
         if unshown {
             self.skipped += 1;
         } else {
             self.skipped = 0;
             let start = Instant::now();
             self.present(event_loop);
+            presented = Some(start.elapsed());
             // the next one a frame later, or right away after falling
             // behind, at the console's rate on average
             self.next_shown = (self.next_shown + FRAME_TIME).max(Instant::now() - FRAME_TIME);
@@ -1507,8 +1509,23 @@ impl App {
         }
 
         let now = Instant::now();
-        if now < self.next_frame {
-            std::thread::sleep(self.next_frame - now);
+        let sleep = self.next_frame.saturating_duration_since(now);
+        if !sleep.is_zero() {
+            std::thread::sleep(sleep);
+        }
+        // with RUST_LOG=zakuro::frames=debug, how the frame met the display:
+        // how long showing it took, a presenter waiting for the display
+        // blocks there, or that it went unshown, and the sleep after
+        if playing {
+            match presented {
+                Some(took) => log::debug!(
+                    target: "zakuro::frames",
+                    "shown in {:.1} ms, then slept {:.1} ms",
+                    took.as_secs_f64() * 1000.0,
+                    sleep.as_secs_f64() * 1000.0
+                ),
+                None => log::debug!(target: "zakuro::frames", "unshown, behind, slept {:.1} ms", sleep.as_secs_f64() * 1000.0),
+            }
         }
     }
 
@@ -1913,7 +1930,9 @@ impl App {
     }
 
     fn present(&mut self, event_loop: &ActiveEventLoop) {
+        let started = Instant::now();
         let overlay = self.interface(event_loop);
+        let interfaced = started.elapsed();
         let blank = |screen: Screen| ((std::sync::Arc::new(Vec::new()), screen.width(), screen.height()), None);
         // the right eye's picture only while the 3D shows
         let stereo = self.settings.stereo != settings::Stereo3d::Off;
@@ -1926,6 +1945,14 @@ impl App {
             None => (blank(Screen::Top), blank(Screen::Bottom), None),
         };
         let right = right.unwrap_or_else(|| blank(Screen::Top));
+        // with RUST_LOG=zakuro_gpu::present=debug, the interface and the
+        // screens' pictures before the presenter's own steps
+        log::debug!(
+            target: "zakuro_gpu::present",
+            "interface {:.1} ms, screens {:.1} ms",
+            interfaced.as_secs_f64() * 1000.0,
+            (started.elapsed() - interfaced).as_secs_f64() * 1000.0
+        );
         let Some(backend) = &mut self.backend else { return };
         let (((top, top_width, top_height), top_gpu), ((bottom, bottom_width, bottom_height), bottom_gpu)) = (top, bottom);
         let ((right, right_width, right_height), right_gpu) = right;

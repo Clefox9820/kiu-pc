@@ -847,12 +847,16 @@ impl Presenter for VulkanPresenter {
 
         let frame = self.frame;
         let fence = self.in_flight[frame];
+        // with RUST_LOG=zakuro_gpu::present=debug, where showing a frame
+        // spends its time: the fence, the image, recording, presenting
+        let started = std::time::Instant::now();
         unsafe {
             self.device
                 .wait_for_fences(&[fence], true, u64::MAX)
                 .map_err(vk_fail("waiting for a fence"))?;
         }
 
+        let fenced = started.elapsed();
         let acquired = unsafe {
             self.swapchain_device.acquire_next_image(
                 self.swapchain,
@@ -874,6 +878,7 @@ impl Presenter for VulkanPresenter {
             }
         };
 
+        let got = started.elapsed();
         // only reset the fence once we know we are going to submit.
         unsafe {
             self.device
@@ -927,6 +932,7 @@ impl Presenter for VulkanPresenter {
                 .map_err(vk_fail("submitting"))?;
         }
 
+        let submitted = started.elapsed();
         let swapchains = [self.swapchain];
         let indices = [image_index];
         let present = vk::PresentInfoKHR::default()
@@ -934,6 +940,15 @@ impl Presenter for VulkanPresenter {
             .swapchains(&swapchains)
             .image_indices(&indices);
         let result = unsafe { self.swapchain_device.queue_present(self.queue, &present) };
+        let ms = |d: std::time::Duration| d.as_secs_f64() * 1000.0;
+        log::debug!(
+            target: "zakuro_gpu::present",
+            "fence {:.1} ms, image {:.1} ms, recording {:.1} ms, presenting {:.1} ms",
+            ms(fenced),
+            ms(got - fenced),
+            ms(submitted - got),
+            ms(started.elapsed() - submitted)
+        );
 
         self.frame = (self.frame + 1) % FRAMES_IN_FLIGHT;
 
