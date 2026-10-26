@@ -78,6 +78,7 @@ pub fn dispatch(system: &mut System, number: u32) {
         0x25 => wait_synchronization_n(system),
         0x27 => duplicate_handle(system),
         0x28 => get_system_tick(system),
+        0x29 => get_handle_info(system),
         0x2A => get_system_info(system),
         0x2B => get_process_info(system),
         0x2D => connect_to_port(system),
@@ -987,6 +988,25 @@ fn get_system_tick(system: &mut System) {
 /// ticks between two svcGetSystemTick calls in a row on the console.
 const SYSTEM_TICK_COST: u64 = 150;
 
+/// svcGetHandleInfo, r1 = handle, r2 = type. type 0 is how many ticks the
+/// process has run, which here started at tick 0; type 1 is the object's
+/// reference count. Kid Icarus: Uprising asks for type 0 over and over while
+/// it joins a local wireless room, and waits forever on an error.
+fn get_handle_info(system: &mut System) {
+    let kind = system.cpu.regs[2];
+    let value: u64 = match kind {
+        0 => system.cpu.cycles,
+        1 => 1,
+        _ => {
+            log::debug!("svcGetHandleInfo type {kind} is not implemented");
+            0
+        }
+    };
+    system.cpu.regs[0] = 0;
+    system.cpu.regs[1] = value as u32;
+    system.cpu.regs[2] = (value >> 32) as u32;
+}
+
 /// svcGetSystemInfo, r1 = type, r2 = parameter.
 fn get_system_info(system: &mut System) {
     let kind = system.cpu.regs[1];
@@ -1182,6 +1202,20 @@ mod tests {
         };
         let first = read();
         assert_eq!(read() - first, SYSTEM_TICK_COST);
+    }
+
+    /// svcGetHandleInfo type 0 on the process gives how long it has run,
+    /// which a title joining a local wireless room keeps asking for.
+    #[test]
+    fn a_process_handle_tells_how_long_it_has_run() {
+        let mut system = System::new(crate::Config::default());
+        system.cpu.cycles = 123_456_789_012;
+        system.cpu.regs[1] = CURRENT_PROCESS;
+        system.cpu.regs[2] = 0;
+        dispatch(&mut system, 0x29);
+        assert_eq!(system.cpu.regs[0], 0);
+        assert_eq!(system.cpu.regs[1] as u64 | (system.cpu.regs[2] as u64) << 32, 123_456_789_012);
+        assert!(!system.unimplemented_svcs.contains(&0x29));
     }
 
     /// svcControlMemory with an operation, giving back r0 and r1.
