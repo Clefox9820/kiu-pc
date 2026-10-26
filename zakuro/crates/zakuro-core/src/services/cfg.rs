@@ -27,8 +27,21 @@ pub fn region_for_product_code(product_code: &str) -> u8 {
     }
 }
 
-/// what GenHashConsoleUnique answers for every salt, this console's hash.
+/// the system id Miis made on this console carry, and what
+/// GenHashConsoleUnique mixes in.
 pub const CONSOLE_HASH: u64 = 0x0000_5255_3341_5A55;
+
+/// what GenHashConsoleUnique answers: a hash of the console's own number
+/// and the title's salt, as the console hashes its unique id. local
+/// wireless games tell players apart by it, Kid Icarus: Uprising keeps a
+/// joining console waiting forever when it gives the host's own.
+fn console_hash(console_id: u64, salt: u32) -> u64 {
+    // splitmix64's finalizer, any good mix of the two does
+    let mut x = console_id ^ (salt as u64).rotate_left(32) ^ CONSOLE_HASH;
+    x = (x ^ (x >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    x = (x ^ (x >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    x ^ (x >> 31)
+}
 
 pub fn handle(system: &mut System, buffer: &CommandBuffer, header: Header) -> bool {
     match header.command_id() {
@@ -49,7 +62,9 @@ pub fn handle(system: &mut System, buffer: &CommandBuffer, header: Header) -> bo
         }
         // GenHashConsoleUnique(salt) -> a 64-bit hash.
         0x0003 => {
-            buffer.reply(&mut system.memory, 0x0003, &[CONSOLE_HASH as u32, (CONSOLE_HASH >> 32) as u32]);
+            let salt = buffer.get(&mut system.memory, 1);
+            let hash = console_hash(system.config.console_id, salt);
+            buffer.reply(&mut system.memory, 0x0003, &[hash as u32, (hash >> 32) as u32]);
             true
         }
         // GetRegionCanadaUSA
@@ -166,5 +181,28 @@ mod tests {
         // the trailing padding the header holds, and a title that names none.
         assert_eq!(region_for_product_code("CTR-P-AG5P\0\0\0\0\0"), REGION_EUROPE);
         assert_eq!(region_for_product_code(""), REGION_USA);
+    }
+
+    /// GenHashConsoleUnique for one console and salt.
+    fn console_hash_of(console_id: u64, salt: u32) -> u64 {
+        let (mut system, buffer) = crate::services::tests::system_with_thread();
+        system.config.console_id = console_id;
+        buffer.set(&mut system.memory, 0, Header::new(0x0003, 1, 0).0);
+        buffer.set(&mut system.memory, 1, salt);
+        let header = Header(buffer.get(&mut system.memory, 0));
+        assert!(handle(&mut system, &buffer, header));
+        assert_eq!(buffer.get(&mut system.memory, 1), 0);
+        buffer.get(&mut system.memory, 2) as u64 | (buffer.get(&mut system.memory, 3) as u64) << 32
+    }
+
+    /// two consoles answer with different hashes, the way local wireless
+    /// play tells its players apart (Kid Icarus: Uprising keeps a joining
+    /// console waiting forever when both give the same), and one console
+    /// answers the same for a salt every time.
+    #[test]
+    fn the_console_hash_is_this_console_s_own() {
+        assert_ne!(console_hash_of(1, 0x1000), console_hash_of(2, 0x1000));
+        assert_eq!(console_hash_of(1, 0x1000), console_hash_of(1, 0x1000));
+        assert_ne!(console_hash_of(1, 0x1000), console_hash_of(1, 0x2000));
     }
 }
