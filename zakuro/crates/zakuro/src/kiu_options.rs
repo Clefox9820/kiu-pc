@@ -5,7 +5,7 @@
 use egui::{pos2, vec2, Color32, CornerRadius, FontId, Margin, RichText, Sense, Shape, Stroke, Ui};
 
 use crate::menus::{heavy_title, vine, Action, Menus, INK, PAPER, PAPER_LINE, RED, SHADOW};
-use crate::settings::{Filter, Renderer, Screens, Settings};
+use crate::settings::{Filter, Language, Renderer, Screens, Settings};
 
 /// the parchment's margin round the options.
 const MARGIN: i8 = 16;
@@ -53,10 +53,12 @@ impl Menus {
                             ui.columns(2, |columns| {
                                 picture(&mut columns[0], settings);
                                 mouse(&mut columns[1], settings, &mut actions);
+                                game(&mut columns[1], settings);
                             });
                         } else {
                             picture(ui, settings);
                             mouse(ui, settings, &mut actions);
+                            game(ui, settings);
                         }
                         ui.add_space(10.0);
                         ui.horizontal(|ui| {
@@ -131,6 +133,28 @@ fn picture(ui: &mut Ui, settings: &mut Settings) {
             ui.add(egui::Slider::new(&mut settings.volume, 0.0..=1.0).custom_formatter(|value, _| format!("{:.0}%", value * 100.0)))
         });
         row(ui, "Mute", "No sound at all.", |ui| ui.checkbox(&mut settings.mute, ""));
+    });
+}
+
+/// the languages Kid Icarus Uprising has: the USA release the first three,
+/// the European one all five.
+const GAME_LANGUAGES: [Language; 5] = [Language::English, Language::French, Language::Spanish, Language::German, Language::Italian];
+
+/// what the game itself is set to.
+fn game(ui: &mut Ui, settings: &mut Settings) {
+    ui.add_space(8.0);
+    plate(ui, "GAME");
+    egui::Grid::new("kiu game").num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
+        row(ui, "Language", "The language the game is in. The USA release has English, French and Spanish, the European one German and Italian too. It changes with Reset or the next start.", |ui| {
+            egui::ComboBox::from_id_salt("kiu language")
+                .selected_text(settings.language.name())
+                .show_ui(ui, |ui| {
+                    for language in GAME_LANGUAGES {
+                        ui.selectable_value(&mut settings.language, language, language.name());
+                    }
+                })
+                .response
+        });
     });
 }
 
