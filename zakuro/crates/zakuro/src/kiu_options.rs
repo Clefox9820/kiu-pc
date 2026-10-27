@@ -11,6 +11,8 @@ use crate::settings::{Filter, Renderer, Screens, Settings};
 const MARGIN: i8 = 16;
 /// narrower than this, the sections go one under another.
 const TWO_COLUMNS: f32 = 520.0;
+/// the advice at the foot with the space above it, about.
+const FOOTER: f32 = 34.0;
 
 impl Menus {
     /// the options window, when open, over a running game's menu.
@@ -38,31 +40,36 @@ impl Menus {
             .frame(frame)
             .min_width(width)
             .max_width(width)
-            .vscroll(true)
-            .max_height(screen.height() - margin)
             .show(ctx, |ui| {
                 paper(ui.visuals_mut());
-                let (title, _) = ui.allocate_exact_size(vec2(ui.available_width(), 44.0), Sense::hover());
-                heavy_title(ui.painter(), "OPTIONS", title.center().x, title.min.y, 1.0);
-                if ui.available_width() >= TWO_COLUMNS {
-                    ui.columns(2, |columns| {
-                        picture(&mut columns[0], settings);
-                        mouse(&mut columns[1], settings, &mut actions);
+                // the options scroll on a window too short for them, the advice stays at
+                // the foot; a window's own scrolling never shrinks to what it holds
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, true])
+                    .max_height(screen.height() - margin - 2.0 * MARGIN as f32 - FOOTER)
+                    .show(ui, |ui| {
+                        let (title, _) = ui.allocate_exact_size(vec2(ui.available_width(), 44.0), Sense::hover());
+                        heavy_title(ui.painter(), "OPTIONS", title.center().x, title.min.y, 1.0);
+                        if ui.available_width() >= TWO_COLUMNS {
+                            ui.columns(2, |columns| {
+                                picture(&mut columns[0], settings);
+                                mouse(&mut columns[1], settings, &mut actions);
+                            });
+                        } else {
+                            picture(ui, settings);
+                            mouse(ui, settings, &mut actions);
+                        }
+                        ui.add_space(10.0);
+                        ui.horizontal(|ui| {
+                            if ui.button("Back").clicked() {
+                                self.options_open = false;
+                            }
+                            if ui.button("All settings").on_hover_text("The rest: controls, the controller, the 3D, the language.").clicked() {
+                                self.options_open = false;
+                                self.settings_open = true;
+                            }
+                        });
                     });
-                } else {
-                    picture(ui, settings);
-                    mouse(ui, settings, &mut actions);
-                }
-                ui.add_space(10.0);
-                ui.horizontal(|ui| {
-                    if ui.button("Back").clicked() {
-                        self.options_open = false;
-                    }
-                    if ui.button("All settings").on_hover_text("The rest: controls, the controller, the 3D, the language.").clicked() {
-                        self.options_open = false;
-                        self.settings_open = true;
-                    }
-                });
                 ui.add_space(8.0);
                 footer(ui, "Esc goes back. Each change is kept as it is made.");
                 // the vines in the parchment's top corners
@@ -91,7 +98,10 @@ fn picture(ui: &mut Ui, settings: &mut Settings) {
             ui.add_enabled(interpolates, egui::Checkbox::without_text(&mut settings.frame_interpolation))
         });
         row(ui, "Screens", "Where the two screens go. F9 switches them while playing.", |ui| {
+            // its longest choice is wider than a column: kept to the column, cut short with "…"
             egui::ComboBox::from_id_salt("kiu screens")
+                .width(ui.available_width())
+                .truncate()
                 .selected_text(settings.layout.name())
                 .show_ui(ui, |ui| {
                     for layout in Screens::ALL {
@@ -223,10 +233,15 @@ mod tests {
 
     /// the options window on a screen this size, after it settles.
     fn shown(width: f32, height: f32) -> (egui::Rect, egui::Rect) {
+        let (ctx, screen) = settled(width, height, Settings::default());
+        (ctx.memory(|memory| memory.area_rect(egui::Id::new("kiu options"))).unwrap(), screen)
+    }
+
+    /// the context after the options window settled on a screen this size.
+    fn settled(width: f32, height: f32, mut settings: Settings) -> (egui::Context, egui::Rect) {
         let ctx = egui::Context::default();
         let mut menus = Menus::default();
         menus.options_open = true;
-        let mut settings = Settings::default();
         let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::Vec2::new(width, height));
         for _ in 0..3 {
             let input = egui::RawInput { screen_rect: Some(screen), ..Default::default() };
@@ -235,7 +250,43 @@ mod tests {
             })
             .drop_without_applying_deltas();
         }
-        (ctx.memory(|memory| memory.area_rect(egui::Id::new("kiu options"))).unwrap(), screen)
+        (ctx, screen)
+    }
+
+    #[test]
+    fn the_parchment_ends_at_its_footer() {
+        let (ctx, _) = settled(1200.0, 888.0, Settings::default());
+        let window = ctx.memory(|memory| memory.area_rect(egui::Id::new("kiu options"))).unwrap();
+        let lowest = ctx.viewport(|viewport| {
+            viewport.prev_pass.widgets.layers().flat_map(|(_, widgets)| widgets.iter())
+                .filter(|widget| widget.rect.height() < 40.0)
+                .map(|widget| widget.rect.max.y)
+                .fold(f32::MIN, f32::max)
+        });
+        // the footer's advice, its strip's padding and the parchment's shadow below it
+        assert!(window.max.y - lowest < 16.0, "{window:?} ends {} below its last line", window.max.y - lowest);
+    }
+
+    #[test]
+    fn no_option_covers_another() {
+        // the longest choice of the screens, at the narrowest two columns and a wide window
+        let settings = Settings { layout: Screens::Auto, ..Settings::default() };
+        for (width, height) in [(TWO_COLUMNS + 2.0 * MARGIN as f32 + 8.0, 600.0), (1200.0, 888.0)] {
+            let (ctx, _) = settled(width, height, settings.clone());
+            let widgets: Vec<egui::Rect> = ctx.viewport(|viewport| {
+                viewport.prev_pass.widgets.layers().flat_map(|(_, widgets)| widgets.iter())
+                    .map(|widget| widget.interact_rect)
+                    // the labels and controls as far as they show, not the window and the areas that hold them
+                    .filter(|rect| rect.width() < 400.0 && rect.height() < 40.0 && rect.area() > 0.0)
+                    .collect()
+            });
+            for (i, a) in widgets.iter().enumerate() {
+                // a widget made of others (a slider and its number) holds them whole
+                for b in widgets[i + 1..].iter().filter(|b| !a.contains_rect(**b) && !b.contains_rect(*a)) {
+                    assert!(a.intersect(*b).area() < 1.0, "{a:?} covers {b:?} at {width}x{height}");
+                }
+            }
+        }
     }
 
     #[test]
