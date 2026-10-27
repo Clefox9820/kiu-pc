@@ -409,10 +409,12 @@ impl Menus {
             return actions;
         }
         egui::Window::new("Paused")
+            .title_bar(false)
             .collapsible(false)
             .resizable(false)
             .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
             .show(&ctx, |ui| {
+                crate::kiu_options::title(ui, "PAUSED");
                 ui.label(RichText::new(name).strong());
                 ui.label(RichText::new(if recompiled { "running its recompiled code" } else { "interpreted" }).weak());
                 ui.add_space(6.0);

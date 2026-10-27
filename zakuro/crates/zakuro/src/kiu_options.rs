@@ -48,8 +48,7 @@ impl Menus {
                     .auto_shrink([false, true])
                     .max_height(screen.height() - margin - 2.0 * MARGIN as f32 - FOOTER)
                     .show(ui, |ui| {
-                        let (title, _) = ui.allocate_exact_size(vec2(ui.available_width(), 44.0), Sense::hover());
-                        heavy_title(ui.painter(), "OPTIONS", title.center().x, title.min.y, 1.0);
+                        title(ui, "OPTIONS");
                         if ui.available_width() >= TWO_COLUMNS {
                             ui.columns(2, |columns| {
                                 picture(&mut columns[0], settings);
@@ -208,6 +207,47 @@ fn footer(ui: &mut Ui, text: &str) {
         });
 }
 
+/// a window's title as the game's menus draw it, across the window's width.
+pub fn title(ui: &mut Ui, text: &str) {
+    let (place, _) = ui.allocate_exact_size(vec2(ui.available_width(), 44.0), Sense::hover());
+    heavy_title(ui.painter(), text, place.center().x, place.min.y, 1.0);
+}
+
+/// the faint ink of hints and second lines, readable on the parchment.
+const FADED_INK: Color32 = Color32::from_rgb(98, 86, 74);
+
+/// Kid Icarus' parchment for everything the emulator shows, its windows,
+/// menus and notices, as the options window: ink on paper, red when touched,
+/// whatever theme the system asks for. one theme set once keeps the
+/// emulator's own windows as Zakuro wrote them.
+pub fn parchment(ctx: &egui::Context) {
+    ctx.all_styles_mut(|style| {
+        let visuals = &mut style.visuals;
+        *visuals = egui::Visuals::light();
+        paper(visuals);
+        // the windows' own colours, links and warnings stay theirs
+        visuals.override_text_color = None;
+        visuals.weak_text_color = Some(FADED_INK);
+        visuals.window_fill = PAPER;
+        visuals.panel_fill = PAPER;
+        visuals.faint_bg_color = PAPER_LINE;
+        visuals.code_bg_color = PAPER_LINE;
+        // the title bar of the window in front, and an open list's button
+        visuals.widgets.open.weak_bg_fill = PAPER_LINE;
+        visuals.window_stroke = Stroke::new(1.5, INK);
+        visuals.window_corner_radius = CornerRadius::same(8);
+        visuals.menu_corner_radius = CornerRadius::same(6);
+        visuals.window_shadow = egui::Shadow { offset: [3, 4], blur: 0, spread: 0, color: SHADOW };
+        visuals.popup_shadow = egui::Shadow { offset: [2, 3], blur: 0, spread: 0, color: SHADOW };
+        visuals.hyperlink_color = DARK_RED;
+        visuals.error_fg_color = DARK_RED;
+        visuals.warn_fg_color = Color32::from_rgb(150, 72, 0);
+    });
+}
+
+/// the banner red darkened to read as text on the parchment.
+const DARK_RED: Color32 = Color32::from_rgb(176, 20, 24);
+
 /// the parchment's look for the widgets: ink on white, red when touched.
 fn paper(visuals: &mut egui::Visuals) {
     visuals.override_text_color = Some(INK);
@@ -302,6 +342,41 @@ mod tests {
     fn the_options_open_tall_enough_to_read_on_a_big_window() {
         let (window, _) = shown(1920.0, 1080.0);
         assert!(window.height() > 300.0, "{window:?}");
+    }
+
+    /// how far apart two colours' lightness is, 1 to 21, as WCAG measures it.
+    fn contrast(a: Color32, b: Color32) -> f32 {
+        let lightness = |c: Color32| {
+            let channel = |v: u8| {
+                let v = v as f32 / 255.0;
+                if v <= 0.03928 { v / 12.92 } else { ((v + 0.055) / 1.055).powf(2.4) }
+            };
+            0.2126 * channel(c.r()) + 0.7152 * channel(c.g()) + 0.0722 * channel(c.b())
+        };
+        let (a, b) = (lightness(a), lightness(b));
+        (a.max(b) + 0.05) / (a.min(b) + 0.05)
+    }
+
+    #[test]
+    fn every_window_is_parchment_with_ink_that_reads_on_it() {
+        // whichever theme the system asks for
+        for theme in [egui::Theme::Dark, egui::Theme::Light] {
+            let ctx = egui::Context::default();
+            ctx.set_theme(theme);
+            parchment(&ctx);
+            let visuals = ctx.global_style().visuals.clone();
+            assert_eq!((visuals.window_fill, visuals.panel_fill), (PAPER, PAPER), "{theme:?}");
+            let widgets = &visuals.widgets;
+            for (name, widget) in [("still", widgets.noninteractive), ("button", widgets.inactive), ("hovered", widgets.hovered), ("pressed", widgets.active), ("open", widgets.open)] {
+                assert!(contrast(widget.fg_stroke.color, widget.bg_fill) >= 4.5, "{name} text on its fill, {theme:?}");
+                assert!(contrast(widget.fg_stroke.color, widget.weak_bg_fill) >= 4.5, "{name} text on its weak fill, {theme:?}");
+            }
+            assert!(contrast(visuals.weak_text_color(), PAPER) >= 4.5, "faint text, {theme:?}");
+            assert!(contrast(visuals.selection.stroke.color, visuals.selection.bg_fill) >= 4.5, "chosen text, {theme:?}");
+            for (name, colour) in [("warning", visuals.warn_fg_color), ("error", visuals.error_fg_color), ("link", visuals.hyperlink_color)] {
+                assert!(contrast(colour, PAPER) >= 4.5, "{name}, {theme:?}");
+            }
+        }
     }
 
     #[test]
