@@ -47,6 +47,9 @@ pub struct RomFs {
     pub header: Level3Header,
     dir_meta: Vec<u8>,
     file_meta: Vec<u8>,
+    /// every file's bytes, start and end in the backing image, with its path,
+    /// in order, made the first time an offset is looked up.
+    by_offset: std::sync::OnceLock<Vec<(u64, u64, String)>>,
 }
 
 impl RomFs {
@@ -111,6 +114,7 @@ impl RomFs {
             header,
             dir_meta,
             file_meta,
+            by_offset: std::sync::OnceLock::new(),
         })
     }
 
@@ -207,6 +211,31 @@ impl RomFs {
             .ok_or_else(|| FsError::PathNotFound(path.to_owned()))
     }
 
+    /// the path of the file whose bytes are at this offset of the backing
+    /// image, as `lookup` takes it.
+    pub fn path_at(&self, offset: u64) -> Option<&str> {
+        let files = self.by_offset.get_or_init(|| {
+            let mut files = Vec::new();
+            let mut dirs = self.root().map(|root| vec![(root, String::new())]).unwrap_or_default();
+            while let Some((dir, path)) = dirs.pop() {
+                for (_, file) in self.files(&dir) {
+                    let start = self.file_data_offset(&file);
+                    files.push((start, start + file.data_size, format!("{path}{}", file.name)));
+                }
+                for (_, sub) in self.subdirs(&dir) {
+                    // the nameless directory an image's contents hang off is no part of a path
+                    let sub_path = if sub.name.is_empty() { path.clone() } else { format!("{path}{}/", sub.name) };
+                    dirs.push((sub, sub_path));
+                }
+            }
+            files.sort_unstable();
+            files
+        });
+        let i = files.partition_point(|(start, ..)| *start <= offset).checked_sub(1)?;
+        let (_, end, path) = &files[i];
+        (offset < *end).then_some(path.as_str())
+    }
+
     /// absolute offset of a file's bytes in the backing image.
     pub fn file_data_offset(&self, file: &FileEntry) -> u64 {
         self.base + self.header.file_data_offset as u64 + file.data_offset
@@ -238,4 +267,25 @@ fn utf16_name(raw: &[u8]) -> String {
 #[inline]
 fn align_up(value: u64, align: u64) -> u64 {
     (value + align - 1) & !(align - 1)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::romfs_build::{build, BuildFile};
+
+    #[test]
+    fn an_offset_names_the_file_whose_bytes_are_there() {
+        let file = |path: &str, size| BuildFile { path: path.into(), data: vec![1; size] };
+        let image = build(&[file("us/stage/a0100.zrc", 300), file("us/voice/v.bin", 40), file("top.bin", 2)]);
+        let romfs = RomFs::parse_level3(&image, 0).unwrap();
+        for path in ["us/stage/a0100.zrc", "us/voice/v.bin", "top.bin"] {
+            let entry = romfs.lookup(path).unwrap();
+            let start = romfs.file_data_offset(&entry);
+            assert_eq!(romfs.path_at(start), Some(path));
+            assert_eq!(romfs.path_at(start + entry.data_size - 1), Some(path));
+        }
+        // the tables before the files' bytes are no file's
+        assert_eq!(romfs.path_at(0), None);
+    }
 }

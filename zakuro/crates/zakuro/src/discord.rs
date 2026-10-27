@@ -39,8 +39,20 @@ impl Doing {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Activity {
     pub doing: Doing,
+    /// the story's chapter being played, when it is one.
+    pub chapter: Option<u8>,
     /// when the game started, in seconds since 1970, for the time played.
     pub since: u64,
+}
+
+/// the story's chapter the game is in, from the stage it last read: chapter
+/// NN flies in `stage/aNNxx.zrc` and lands in `gNNxx.zrc` (seen in chapter 1),
+/// with `bNNxx.zrc` beside them, in both releases' RomFS (`us/`, `eu/`).
+pub fn chapter(last_read: &std::collections::HashMap<String, String>) -> Option<u8> {
+    let (_, stage) = last_read.iter().find(|(folder, _)| folder.ends_with("stage"))?;
+    let digits = stage.strip_prefix(['a', 'b', 'g'])?.get(..2)?;
+    // the menus' backgrounds and the tutorial are stages too, numbered past the 25 chapters
+    digits.parse().ok().filter(|chapter| (1..=25).contains(chapter))
 }
 
 /// the presence shown, kept up to date by a thread of its own so a slow or
@@ -144,7 +156,12 @@ fn set_activity(pipe: &mut impl Pipe, activity: Option<Activity>, pid: u32) -> i
     // ponytail: the JSON is written by hand, its strings are this file's own and need no escaping
     let activity = match activity {
         Some(activity) => {
-            format!(r#"{{"details":"{}","timestamps":{{"start":{}}}}}"#, activity.doing.text(), activity.since)
+            // a menu in a chapter is its pause menu or its results, no part of the chapter
+            let state = match activity.chapter {
+                Some(chapter) if activity.doing != Doing::Menus => format!(r#""state":"Chapter {chapter}","#),
+                _ => String::new(),
+            };
+            format!(r#"{{"details":"{}",{state}"timestamps":{{"start":{}}}}}"#, activity.doing.text(), activity.since)
         }
         None => "null".to_owned(),
     };
@@ -203,7 +220,7 @@ mod tests {
 
     #[test]
     fn the_activity_goes_out_framed_and_a_close_is_an_error() {
-        let flying = Activity { doing: Doing::Flying, since: 1_700_000_000 };
+        let flying = Activity { doing: Doing::Flying, chapter: None, since: 1_700_000_000 };
         let mut pipe = Fake { answers: io::Cursor::new(frame(FRAME, r#"{"evt":null}"#)), written: Vec::new() };
         set_activity(&mut pipe, Some(flying), 42).unwrap();
         let json = r#"{"cmd":"SET_ACTIVITY","args":{"pid":42,"activity":{"details":"Flying","timestamps":{"start":1700000000}}},"nonce":"42"}"#;
@@ -213,5 +230,32 @@ mod tests {
         let mut pipe = Fake { answers: io::Cursor::new(frame(CLOSE, r#"{"code":4000}"#)), written: Vec::new() };
         assert!(set_activity(&mut pipe, None, 42).is_err());
         assert!(String::from_utf8_lossy(&pipe.written).contains(r#""activity":null"#));
+    }
+
+    #[test]
+    fn a_chapter_shows_under_what_the_game_is_doing_while_it_is_played() {
+        let written = |doing, chapter| {
+            let mut pipe = Fake { answers: io::Cursor::new(frame(FRAME, r#"{"evt":null}"#)), written: Vec::new() };
+            set_activity(&mut pipe, Some(Activity { doing, chapter, since: 1 }), 42).unwrap();
+            String::from_utf8_lossy(&pipe.written[8..]).into_owned()
+        };
+        assert!(written(Doing::OnFoot, Some(4)).contains(r#""activity":{"details":"Fighting on foot","state":"Chapter 4","timestamps":{"start":1}}"#));
+        assert!(!written(Doing::Menus, Some(4)).contains("Chapter"));
+        assert!(!written(Doing::Flying, None).contains("state"));
+    }
+
+    #[test]
+    fn the_chapter_is_the_last_stage_read_when_it_is_a_chapter() {
+        let read = |pairs: &[(&str, &str)]| pairs.iter().map(|(folder, file)| (folder.to_string(), file.to_string())).collect();
+        assert_eq!(chapter(&read(&[("us/stage", "a0100.zrc"), ("us/voice", "v.bcwav")])), Some(1));
+        assert_eq!(chapter(&read(&[("eu/stage", "a2503.zrc")])), Some(25));
+        assert_eq!(chapter(&read(&[("us/stage", "b1201.zrc")])), Some(12));
+        assert_eq!(chapter(&read(&[("us/stage", "g0101.zrc")])), Some(1));
+        // the landing's tutorial in chapter 1
+        assert_eq!(chapter(&read(&[("us/stage", "a7028.zrc")])), None);
+        // the Solo menu's stage, the epilogue and nothing read yet
+        assert_eq!(chapter(&read(&[("us/stage", "a7026.zrc")])), None);
+        assert_eq!(chapter(&read(&[("eu/stage", "a2800.zrc")])), None);
+        assert_eq!(chapter(&read(&[("us/info", "a010.zrc")])), None);
     }
 }

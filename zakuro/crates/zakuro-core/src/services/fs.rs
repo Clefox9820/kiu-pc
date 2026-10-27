@@ -215,6 +215,11 @@ pub struct FsState {
     /// the tick each medium, the game's and the SD card, is busy until. a
     /// medium reads one request after another.
     pub busy_until: [u64; 2],
+    /// the file of the game's RomFS each of its folders last had read, by
+    /// folder: which level or scene a game loads shows in what it reads.
+    // ponytail: not in saved states, a loaded state knows it again at the next read
+    #[serde(skip)]
+    pub last_read: HashMap<String, String>,
 }
 
 impl Default for FsState {
@@ -229,6 +234,7 @@ impl Default for FsState {
             next_directory: 0,
             busy_until: [0; 2],
             priority: 0,
+            last_read: HashMap::new(),
         }
     }
 }
@@ -1200,6 +1206,9 @@ fn read_file(system: &mut System, file_id: u32, offset: u64, size: u32, dest: u3
             // overlapping the mutable borrow of memory.
             let data = slice.to_vec();
             system.write_from_service(dest, &data);
+            if count > 0 {
+                note_romfs_read(system, &file.path, offset);
+            }
             count as u32
         }
         FileBacking::Host(path) => {
@@ -1224,6 +1233,30 @@ fn read_file(system: &mut System, file_id: u32, offset: u64, size: u32, dest: u3
             count as u32
         }
     }
+}
+
+/// keeps which file of the game's own RomFS a read was in, by its folder.
+// ponytail: a RomFS with mods over it is read through its layers and not followed
+fn note_romfs_read(system: &mut System, path: &str, offset: u64) {
+    let Some(title) = system.title.as_ref() else { return };
+    let title = match path {
+        "romfs:/" => title,
+        "patch:/" => match title.update() {
+            Some(update) => &update.title,
+            None => return,
+        },
+        _ => return,
+    };
+    let Some(file) = title.romfs.as_ref().and_then(|romfs| romfs.path_at(romfs.base + offset)) else {
+        return;
+    };
+    let (folder, name) = file.rsplit_once('/').unwrap_or(("", file));
+    let last_read = &mut system.services.fs.last_read;
+    if last_read.get(folder).is_some_and(|last| last == name) {
+        return;
+    }
+    log::debug!("fs: reads {file}");
+    last_read.insert(folder.to_owned(), name.to_owned());
 }
 
 fn decode_path(system: &mut System, path_type: u32, path_size: u32, path_ptr: u32) -> String {
@@ -1252,3 +1285,34 @@ fn decode_path(system: &mut System, path_type: u32, path_size: u32, path_ptr: u3
 /// kept so the descriptor helper stays in scope for the mapped-buffer replies
 /// above, which build their descriptors by hand.
 pub const _MAPPED_BUFFER_RW: u32 = Descriptor::static_buffer(0, 0);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use zakuro_fs::testing::{ncch, write};
+
+    #[test]
+    fn a_read_of_the_romfs_is_kept_by_its_folder() {
+        let game = write("fs-last-read", "game.cxi", &ncch(0x0004_0000_0FF3_DE02, Some(&[0; 8]), &[
+            ("us/stage/a0100.zrc", &[1; 64]),
+            ("us/stage/b0100.zrc", &[2; 64]),
+            ("us/voice/v.bin", &[3; 64]),
+        ]));
+        let mut system = crate::loader::load(&game, crate::Config::default()).unwrap();
+        let at = |system: &System, path: &str| {
+            let romfs = system.title.as_ref().unwrap().romfs.as_ref().unwrap();
+            romfs.file_data_offset(&romfs.lookup(path).unwrap()) - romfs.base
+        };
+        for path in ["us/stage/a0100.zrc", "us/voice/v.bin", "us/stage/b0100.zrc"] {
+            let offset = at(&system, path);
+            note_romfs_read(&mut system, "romfs:/", offset + 10);
+        }
+        let last_read = &system.services.fs.last_read;
+        assert_eq!(last_read.get("us/stage").map(String::as_str), Some("b0100.zrc"));
+        assert_eq!(last_read.get("us/voice").map(String::as_str), Some("v.bin"));
+        // a file that is not the RomFS is not looked into
+        let offset = at(&system, "us/stage/a0100.zrc");
+        note_romfs_read(&mut system, "sdmc:/save.bin", offset);
+        assert_eq!(system.services.fs.last_read.get("us/stage").map(String::as_str), Some("b0100.zrc"));
+    }
+}

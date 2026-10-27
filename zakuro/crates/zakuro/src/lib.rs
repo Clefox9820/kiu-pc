@@ -1419,6 +1419,7 @@ impl App {
                 (true, false) => discord::Doing::OnFoot,
                 (true, true) => discord::Doing::Flying,
             },
+            chapter: discord::chapter(&game.system.services.fs.last_read),
             since: game.started,
         });
         self.presence.show(activity);
