@@ -412,6 +412,8 @@ impl Menus {
             .title_bar(false)
             .collapsible(false)
             .resizable(false)
+            // as wide as its buttons, not egui's 320, so the title centres over them
+            .default_width(0.0)
             .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
             .show(&ctx, |ui| {
                 crate::kiu_options::title(ui, "PAUSED");
@@ -437,11 +439,11 @@ impl Menus {
                     ui.label(RichText::new(saved.unwrap_or("empty")).weak());
                 });
                 ui.horizontal(|ui| {
-                    if ui.add_sized([98.0, 28.0], egui::Button::new("Save state")).on_hover_text("F5 saves to this slot while playing.").clicked() {
+                    if ui.add_sized([96.0, 28.0], egui::Button::new("Save state")).on_hover_text("F5 saves to this slot while playing.").clicked() {
                         actions.push(Action::SaveState);
                     }
                     if ui
-                        .add_enabled(saved.is_some(), egui::Button::new("Load state").min_size(Vec2::new(98.0, 28.0)))
+                        .add_enabled(saved.is_some(), egui::Button::new("Load state").min_size(Vec2::new(96.0, 28.0)))
                         .on_hover_text("F8 loads this slot while playing.")
                         .clicked()
                     {

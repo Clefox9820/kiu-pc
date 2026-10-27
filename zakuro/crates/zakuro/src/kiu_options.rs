@@ -380,6 +380,35 @@ mod tests {
     }
 
     #[test]
+    fn the_pause_menu_is_centred_under_its_title() {
+        let ctx = egui::Context::default();
+        parchment(&ctx);
+        let mut menus = Menus::default();
+        menus.menu_open = true;
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::Vec2::new(1200.0, 720.0));
+        for _ in 0..3 {
+            let input = egui::RawInput { screen_rect: Some(screen), ..Default::default() };
+            ctx.run_ui(input, |ui| {
+                menus.game(ui, "Kid Icarus: Uprising", None, true, false, &[], None);
+            })
+            .drop_without_applying_deltas();
+        }
+        let buttons: Vec<egui::WidgetRect> = ctx.viewport(|viewport| {
+            viewport.prev_pass.widgets.layers().flat_map(|(_, widgets)| widgets.iter())
+                .filter(|widget| (widget.rect.width() - 200.0).abs() < 0.5)
+                .copied()
+                .collect()
+        });
+        assert!(!buttons.is_empty());
+        let window = ctx.memory(|memory| memory.area_rect(buttons[0].layer_id.id)).unwrap();
+        let buttons = buttons.iter().map(|widget| widget.rect);
+        for button in buttons {
+            let (left, right) = (button.min.x - window.min.x, window.max.x - button.max.x);
+            assert!((left - right).abs() < 4.0, "{button:?} in {window:?}: {left} left, {right} right");
+        }
+    }
+
+    #[test]
     fn closed_options_show_nothing() {
         let ctx = egui::Context::default();
         let mut menus = Menus::default();
