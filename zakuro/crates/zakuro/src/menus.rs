@@ -451,9 +451,7 @@ impl Menus {
                     }
                 });
                 ui.add_space(4.0);
-                if wide(ui, "Settings") {
-                    self.settings_open = true;
-                }
+                // the settings are reached through the options, which hold the ones a player wants
                 if wide(ui, "Cheats") {
                     self.cheats_open = true;
                 }

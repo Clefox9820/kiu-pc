@@ -65,7 +65,7 @@ impl Menus {
                             if ui.button("Back").clicked() {
                                 self.options_open = false;
                             }
-                            if ui.button("All settings").on_hover_text("The rest: controls, the controller, the 3D, the language.").clicked() {
+                            if ui.button("All settings").on_hover_text("The rest: controls, the controller, the 3D, the cameras.").clicked() {
                                 self.options_open = false;
                                 self.settings_open = true;
                             }
@@ -430,6 +430,36 @@ mod tests {
             let (left, right) = (button.min.x - window.min.x, window.max.x - button.max.x);
             assert!((left - right).abs() < 4.0, "{button:?} in {window:?}: {left} left, {right} right");
         }
+    }
+
+    /// every line of text a shape draws, inside groups too.
+    fn texts(shape: &Shape, into: &mut Vec<String>) {
+        match shape {
+            Shape::Text(text) => into.push(text.galley.text().to_owned()),
+            Shape::Vec(shapes) => shapes.iter().for_each(|shape| texts(shape, into)),
+            _ => {}
+        }
+    }
+
+    #[test]
+    fn the_pause_menu_leaves_the_settings_to_the_options() {
+        let ctx = egui::Context::default();
+        let mut menus = Menus::default();
+        menus.menu_open = true;
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::Vec2::new(1200.0, 720.0));
+        // a window's first pass only measures it
+        let mut shapes = Vec::new();
+        for _ in 0..3 {
+            let input = egui::RawInput { screen_rect: Some(screen), ..Default::default() };
+            shapes = ctx.run_ui(input, |ui| {
+                menus.game(ui, "Kid Icarus: Uprising", None, true, false, &[], None);
+            })
+            .shapes;
+        }
+        let mut shown = Vec::new();
+        shapes.iter().for_each(|clipped| texts(&clipped.shape, &mut shown));
+        assert!(shown.iter().any(|text| text == "Options"), "{shown:?}");
+        assert!(!shown.iter().any(|text| text == "Settings"), "one way in, through the options: {shown:?}");
     }
 
     #[test]

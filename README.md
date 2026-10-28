@@ -125,7 +125,8 @@ delete those too if you do not want to keep your saves.
 ## Controls
 
 Defaults are laid out for this game. They can be changed in
-**Settings > Controls**, where the mouse aim speeds are also set.
+**Settings > Controls** (Esc, **Options**, **All settings** while playing).
+The mouse aim speeds are in **Options**.
 
 | Input | 3DS / action |
 | --- | --- |
