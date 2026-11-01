@@ -289,6 +289,16 @@ Tools used to work on it:
   camera's projection. The HUD keeps the console's layout, stretched with
   the screen. A shape changed during play applies to each camera the next
   time the game asks for its projection.
+- **Screen filter: FSR (AMD)**, when the window is bigger than the
+  resolution the game is drawn at, first smooths each screen's jagged edges
+  with SMAA (iryoku/smaa, MIT), then upscales it with AMD FidelityFX Super
+  Resolution 1's EASU and sharpens it with its RCAS, instead of stretching
+  it. It covers everything on screen, subtitles and movies included.
+  Vulkan presenter only; the OpenGL one draws it as Smooth. Red and cyan
+  or interlaced 3D gets EASU alone. Checked in a flight and a land battle,
+  drawn at 1x in 2x and 3x windows on a Ryzen 5 5600G: smooth, sharp edges
+  where Smooth shows stairs, at frame times within 0.5 ms of Smooth's.
+  Long play was not checked.
 - Local wireless play (**Together > Nearby**) through a Zakuro room
   (**Esc > Multiplayer**): a European and a USA copy find each other's
   room, share the lobby and reach the warm-up arena together, but the

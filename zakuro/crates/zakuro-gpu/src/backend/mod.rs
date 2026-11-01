@@ -119,6 +119,13 @@ pub enum ScreenFilter {
     Sharp,
     /// every pixel a square of the nearest one.
     Pixels,
+    /// AMD FidelityFX Super Resolution 1's edge adaptive upscaling: edges
+    /// rebuilt along their direction, kept from ringing. the Vulkan
+    /// presenter antialiases a screen it draws bigger than its pixels with
+    /// SMAA 1x first and sharpens it with FSR 1's RCAS after, but the top
+    /// screen's two pictures in one for 3D. the GL presenter draws it
+    /// smooth.
+    Fsr,
 }
 
 impl ScreenFilter {
@@ -128,6 +135,7 @@ impl ScreenFilter {
             ScreenFilter::Smooth => 0,
             ScreenFilter::Pixels => 1,
             ScreenFilter::Sharp => 2,
+            ScreenFilter::Fsr => 3,
         }
     }
 }
