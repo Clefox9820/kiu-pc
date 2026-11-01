@@ -17,19 +17,71 @@ const STRETCH_BELOW: usize = TARGET / 2;
 /// how much faster or slower than the rates say playback may go to keep
 /// the queue near its target, too little to hear.
 const DRIFT: f64 = 0.005;
+/// how much of its level dry output keeps from one sample to the next, about
+/// 20 ms to fall to a third at 48 kHz.
+const FADE_OUT: f32 = 0.999;
+/// how many output samples sound takes to climb back to full level after
+/// running dry, about 10 ms at 48 kHz.
+const FADE_IN: f32 = 480.0;
+
+/// how many of the console's samples each output sample is made from, half
+/// before it and half after.
+const TAPS: usize = 16;
+/// the queue's sample just before the output's place, the ones ahead of it
+/// being history the filter still reads.
+const CENTRE: usize = TAPS / 2 - 1;
+/// how many places between two of the console's samples the filter is
+/// worked out for; the nearest is used.
+const PHASES: usize = 512;
+
+/// a windowed-sinc low-pass filter for turning the console's rate into the
+/// output's: for each place between two samples, the weights of the TAPS
+/// samples around it. it keeps what lies below the lower of the two rates'
+/// halves, with a little room for the filter to fall off, and drops what
+/// would fold back as false tones. each set of weights adds up to one, so
+/// a steady level stays the same.
+fn sinc_filter(step: f64) -> Vec<[f32; TAPS]> {
+    // as a part of the console's half rate, the output's when lower
+    let cutoff = (1.0 / step).min(1.0) * 0.9;
+    (0..PHASES)
+        .map(|phase| {
+            let fraction = phase as f64 / PHASES as f64;
+            let mut weights = [0.0f32; TAPS];
+            for (k, weight) in weights.iter_mut().enumerate() {
+                // how far the sample is from the output's place
+                let x = k as f64 - CENTRE as f64 - fraction;
+                let angle = std::f64::consts::PI * cutoff * x;
+                let sinc = if x == 0.0 { 1.0 } else { angle.sin() / angle };
+                // a Blackman window across the taps, 0 to 1
+                let n = (x + TAPS as f64 / 2.0) / TAPS as f64;
+                let tau = std::f64::consts::TAU;
+                let window = 0.42 - 0.5 * (tau * n).cos() + 0.08 * (2.0 * tau * n).cos();
+                *weight = (sinc * window) as f32;
+            }
+            let sum: f32 = weights.iter().sum();
+            weights.map(|w| w / sum)
+        })
+        .collect()
+}
 
 /// the console's samples waiting to be played.
 struct Queue {
     samples: VecDeque<[f32; 2]>,
-    /// how far the output is between the first two samples.
+    /// how far the output is between samples CENTRE and CENTRE + 1.
     fraction: f64,
     /// console samples per output sample.
     step: f64,
+    /// sinc_filter for step.
+    filter: Vec<[f32; TAPS]>,
     /// ran dry, and waits to fill up before it plays again.
     starved: bool,
-    /// the last sample played, which fades out when the queue runs dry
+    /// the last sample filtered, which fades out when the queue runs dry
     /// instead of stopping short.
     last: [f32; 2],
+    /// how loud what comes out is, 0 to 1: it falls slowly while the queue
+    /// is dry and climbs back over FADE_IN when it plays again, so neither
+    /// end of a shortfall clicks.
+    level: f32,
     /// times the queue ran dry.
     underruns: u64,
     /// how much a queue that ran dry waits for before it plays again.
@@ -37,28 +89,33 @@ struct Queue {
 }
 
 impl Queue {
-    /// the next output sample, between two of the console's.
+    /// the next output sample, filtered from the console's around it.
     fn next(&mut self) -> [f32; 2] {
-        if !self.starved && self.samples.len() < 2 {
+        if !self.starved && self.samples.len() < TAPS {
             self.starved = true;
             self.underruns += 1;
         }
         if self.starved {
             if self.samples.len() < self.refill {
-                self.last = self.last.map(|v| v * 0.995);
-                return self.last;
+                self.level *= FADE_OUT;
+                return self.last.map(|v| v * self.level);
             }
             self.starved = false;
             self.refill = RESUME;
         }
-        let (a, b) = (self.samples[0], self.samples[1]);
-        let t = self.fraction as f32;
-        let out = [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t];
+        let weights = &self.filter[((self.fraction * PHASES as f64) as usize).min(PHASES - 1)];
+        let mut out = [0.0f32; 2];
+        for (sample, weight) in self.samples.iter().zip(weights) {
+            out[0] += sample[0] * weight;
+            out[1] += sample[1] * weight;
+        }
         self.last = out;
+        self.level = (self.level + 1.0 / FADE_IN).min(1.0);
+        let out = out.map(|v| v * self.level);
         // a longer queue plays a little faster, a shorter one slower
         let error = (self.samples.len() as f64 - TARGET as f64) / TARGET as f64;
         self.fraction += self.step * (1.0 + error.clamp(-1.0, 1.0) * DRIFT);
-        while self.fraction >= 1.0 && self.samples.len() > 1 {
+        while self.fraction >= 1.0 && self.samples.len() >= TAPS {
             self.samples.pop_front();
             self.fraction -= 1.0;
         }
@@ -206,12 +263,15 @@ impl Audio {
         let supported = device.default_output_config().map_err(|e| e.to_string())?;
         let format = supported.sample_format();
         let config: cpal::StreamConfig = supported.into();
+        let step = rate / config.sample_rate.0 as f64;
         let queue = Arc::new(Mutex::new(Queue {
             samples: VecDeque::new(),
             fraction: 0.0,
-            step: rate / config.sample_rate.0 as f64,
+            step,
+            filter: sinc_filter(step),
             starved: true,
             last: [0.0; 2],
+            level: 0.0,
             underruns: 0,
             refill: RESUME,
         }));
@@ -315,8 +375,10 @@ mod tests {
             samples: (0..samples).map(|i| [i as f32, -(i as f32)]).collect(),
             fraction: 0.0,
             step,
+            filter: sinc_filter(step),
             starved: false,
             last: [0.0; 2],
+            level: 1.0,
             underruns: 0,
             refill: RESUME,
         }
@@ -427,24 +489,87 @@ mod tests {
         assert!((pitch - 440.0).abs() < 10.0, "pitch {pitch}");
     }
 
+    /// a straight line of samples comes out on the line, between them.
     #[test]
     fn output_falls_between_the_consoles_samples() {
         let mut queue = queue(TARGET, 0.5);
-        assert_eq!(queue.next(), [0.0, 0.0]);
-        assert_eq!(queue.next(), [0.5, -0.5]);
-        assert_eq!(queue.next(), [1.0, -1.0]);
+        let centre = CENTRE as f32;
+        for expected in [centre, centre + 0.5, centre + 1.0] {
+            let [left, right] = queue.next();
+            assert!((left - expected).abs() < 0.01 && (right + expected).abs() < 0.01, "{left} for {expected}");
+        }
     }
 
+    /// how strong the frequency is in samples at rate, by the Goertzel
+    /// algorithm, as the amplitude of a sine.
+    fn strength(samples: &[f32], frequency: f64, rate: f64) -> f64 {
+        let coefficient = 2.0 * (std::f64::consts::TAU * frequency / rate).cos();
+        let (mut s1, mut s2) = (0.0, 0.0);
+        for &x in samples {
+            let s0 = x as f64 + coefficient * s1 - s2;
+            s2 = s1;
+            s1 = s0;
+        }
+        (s1 * s1 + s2 * s2 - coefficient * s1 * s2).sqrt() * 2.0 / samples.len() as f64
+    }
+
+    /// a sine at the console's rate played out at 48 kHz.
+    fn played_at_48k(frequency: f64) -> Vec<f32> {
+        const CONSOLE: f64 = 32728.0;
+        let mut queue = queue(0, CONSOLE / 48000.0);
+        queue.starved = false;
+        let sine = |i: usize| (std::f64::consts::TAU * frequency * i as f64 / CONSOLE).sin() as f32 * 0.5;
+        let mut made = 0;
+        // kept at its target, so DRIFT leaves the pitch alone
+        let mut out = Vec::new();
+        for _ in 0..8192 {
+            while queue.samples.len() < TARGET {
+                queue.samples.push_back([sine(made); 2]);
+                made += 1;
+            }
+            out.push(queue.next()[0]);
+        }
+        // past the filter's start
+        out.split_off(TAPS)
+    }
+
+    /// a tone well within what the console plays keeps its level.
     #[test]
-    fn a_queue_that_ran_dry_fades_and_waits_to_fill_up() {
+    fn a_tone_keeps_its_level_at_the_outputs_rate() {
+        let level = strength(&played_at_48k(1000.0), 1000.0, 48000.0);
+        assert!((level - 0.5).abs() < 0.01, "level {level}");
+    }
+
+    /// a high tone does not come out with a false one where its copy above
+    /// the console's rate folds down, 32728 - 10000 Hz, as straight
+    /// interpolation lets through at about a seventh of the level.
+    #[test]
+    fn a_high_tone_brings_no_false_tone_with_it() {
+        let out = played_at_48k(10_000.0);
+        let tone = strength(&out, 10_000.0, 48000.0);
+        let false_tone = strength(&out, 22_728.0, 48000.0);
+        assert!(tone > 0.45, "the tone itself at {tone}");
+        assert!(false_tone < tone / 100.0, "a false tone at {false_tone} beside {tone}");
+    }
+
+    /// running dry, the sound fades out slowly rather than stopping short,
+    /// and once there is enough again it climbs back rather than jumping.
+    #[test]
+    fn a_queue_that_ran_dry_fades_out_and_back_in() {
         let mut queue = queue(1, 1.0);
         queue.last = [0.5, 0.5];
+        queue.level = 1.0;
         let faded = queue.next();
         assert!(queue.starved);
         assert_eq!(queue.underruns, 1);
-        assert!(faded[0] < 0.5 && faded[0] > 0.4, "it fades out rather than stopping short");
+        assert!(faded[0] < 0.5 && faded[0] > 0.49, "it fades out rather than stopping short");
+        let later = (0..100).map(|_| queue.next()[0]).last().unwrap();
+        assert!(later > 0.4, "slowly, at {later} 2 ms on");
         queue.samples.extend((0..RESUME).map(|_| [1.0, 1.0]));
-        assert_eq!(queue.next(), [0.0, -0.0], "it starts again from where it stopped");
+        let first = queue.next()[0];
+        assert!(first < 0.95, "it climbs back rather than jumping, at {first}");
+        let full = (0..FADE_IN as usize).map(|_| queue.next()[0]).last().unwrap();
+        assert!((full - 1.0).abs() < 0.01, "back to full level, at {full}");
     }
 
     /// stopped while the game is, it does not count running dry, and plays
@@ -459,14 +584,15 @@ mod tests {
         queue.samples.extend((0..RESUME).map(|_| [1.0, 1.0]));
         assert!(queue.next()[0] < 0.5, "what is enough after running dry is not after a hold");
         queue.samples.extend((0..TARGET).map(|_| [1.0, 1.0]));
-        assert_eq!(queue.next(), [1.0, 1.0]);
+        let played = (0..FADE_IN as usize).map(|_| queue.next()[0]).last().unwrap();
+        assert!((played - 1.0).abs() < 0.01, "it plays once full, at {played}");
         assert_eq!(queue.underruns, 0);
         // running dry later is counted, and waits for the usual amount
         queue.samples.clear();
         queue.next();
         assert_eq!(queue.underruns, 1);
         queue.samples.extend((0..RESUME).map(|_| [1.0, 1.0]));
-        assert_eq!(queue.next(), [1.0, 1.0]);
+        assert!(queue.next()[0] > 0.99, "it plays again after the usual amount");
     }
 
     /// a game starting or stopping drops what the last one queued, and the
@@ -477,7 +603,10 @@ mod tests {
         queue.clear();
         queue.next();
         queue.samples.extend((0..TARGET).map(|_| [-1.0, -1.0]));
-        assert_eq!(queue.next(), [-1.0, -1.0]);
+        // the old sound's left channel was all above zero
+        let played: Vec<f32> = (0..FADE_IN as usize).map(|_| queue.next()[0]).collect();
+        assert!(played.iter().all(|&v| v <= 0.0), "none of the old sound");
+        assert!((played.last().unwrap() + 1.0).abs() < 0.01);
         assert_eq!(queue.underruns, 0);
     }
 
