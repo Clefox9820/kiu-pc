@@ -111,7 +111,8 @@ enum Format {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 enum Interpolation {
-    /// the firmware's polyphase filter, played as linear.
+    /// the firmware's polyphase filter, played with a 4-point cubic
+    /// Hermite curve through the samples around.
     Polyphase,
     Linear,
     None,
@@ -461,7 +462,7 @@ impl Voice {
             self.frame[output] = if self.interpolation == Interpolation::None || self.fraction == 0.0 {
                 x0
             } else {
-                lerp::<STEREO>(x0, read((at + 1).min(last)), self.fraction)
+                between::<STEREO>(self.interpolation == Interpolation::Polyphase, x0, at, last, self.fraction, &mut read)
             };
             output += 1;
             // each output sample consumes rate input samples
@@ -490,10 +491,11 @@ impl Voice {
         let (mut remaining, mut fraction) = (self.remaining, self.fraction);
         let whole = rate as u32;
         let (below, above) = (whole as f64, whole as f64 + 1.0);
+        let cubic = self.interpolation == Interpolation::Polyphase;
         loop {
             let at = length - remaining;
             let x0 = read(at.min(last));
-            self.frame[output] = if LERP { lerp::<STEREO>(x0, read((at + 1).min(last)), fraction) } else { x0 };
+            self.frame[output] = if LERP { between::<STEREO>(cubic, x0, at, last, fraction, &mut read) } else { x0 };
             output += 1;
             let input = fraction + rate;
             let over = input >= above;
@@ -540,12 +542,50 @@ impl Voice {
     }
 }
 
-/// the sample a fraction of the way from one input to the next, both
-/// channels or, without STEREO, the first for both.
+/// the sample a fraction of the way from input at, which is x0, to the
+/// next, read up to last: on a cubic Hermite curve through the one before
+/// and the two after when cubic, else on a straight line. both channels or,
+/// without STEREO, the first for both.
+fn between<const STEREO: bool>(
+    cubic: bool,
+    x0: [i16; 2],
+    at: u32,
+    last: u32,
+    fraction: f64,
+    read: &mut impl FnMut(u32) -> [i16; 2],
+) -> [i16; 2] {
+    let x1 = read((at + 1).min(last));
+    if !cubic {
+        return lerp::<STEREO>(x0, x1, fraction);
+    }
+    // past either end of the buffer, the line through the two nearest goes on
+    let before = if at == 0 { extend(x1, x0) } else { read((at - 1).min(last)) };
+    let after = if at + 2 > last { extend(x0, x1) } else { read(at + 2) };
+    let left = hermite([before[0], x0[0], x1[0], after[0]], fraction);
+    [left, if STEREO { hermite([before[1], x0[1], x1[1], after[1]], fraction) } else { left }]
+}
+
+/// the sample one step on from `to` along the line from `from`, both channels.
+fn extend(from: [i16; 2], to: [i16; 2]) -> [i16; 2] {
+    [0, 1].map(|c| (2 * to[c] as i32 - from[c] as i32).clamp(i16::MIN as i32, i16::MAX as i32) as i16)
+}
+
+/// the sample a fraction of the way from one input to the next, rounded,
+/// both channels or, without STEREO, the first for both.
 fn lerp<const STEREO: bool>(x0: [i16; 2], x1: [i16; 2], fraction: f64) -> [i16; 2] {
-    let between = |a: i16, b: i16| (a as f64 + (b as f64 - a as f64) * fraction) as i16;
+    let between = |a: i16, b: i16| (a as f64 + (b as f64 - a as f64) * fraction).round() as i16;
     let left = between(x0[0], x1[0]);
     [left, if STEREO { between(x0[1], x1[1]) } else { left }]
+}
+
+/// the point a fraction of the way from x[1] to x[2] on the Catmull-Rom
+/// cubic through the four, rounded and kept within 16 bits.
+fn hermite(x: [i16; 4], fraction: f64) -> i16 {
+    let [a, b, c, d] = x.map(f64::from);
+    let slope_b = 0.5 * (c - a);
+    let curve = a - 2.5 * b + 2.0 * c - 0.5 * d;
+    let turn = 0.5 * (d - a) + 1.5 * (b - c);
+    (((turn * fraction + curve) * fraction + slope_b) * fraction + b).round() as i16
 }
 
 /// one sample of a PCM buffer read from memory by itself, both channels.
@@ -1017,6 +1057,26 @@ mod tests {
 
     /// a ramp of PCM16 samples, played at half speed, comes out with the
     /// samples between them filled in.
+    /// a sine slowed to a quarter comes out closer to the true curve in
+    /// the firmware's polyphase mode than in its linear one.
+    #[test]
+    fn polyphase_follows_a_curve_closer_than_linear() {
+        let sine = |at: f64| (std::f64::consts::TAU * at / 16.0).sin() * 10_000.0;
+        let bytes: Vec<u8> = (0..400).flat_map(|i| (sine(i as f64) as i16).to_le_bytes()).collect();
+        let error = |interpolation| {
+            let mut memory = Samples(bytes.clone());
+            let mut voice = voice_with(&[(1, 400)]);
+            voice.rate = 0.25;
+            voice.interpolation = interpolation;
+            voice.play_frame(&mut memory); // starts the buffer
+            voice.play_frame(&mut memory);
+            let squares: f64 = voice.frame.iter().enumerate().map(|(n, [left, _])| (*left as f64 - sine(n as f64 * 0.25)).powi(2)).sum();
+            (squares / FRAME_SAMPLES as f64).sqrt()
+        };
+        let (cubic, linear) = (error(Interpolation::Polyphase), error(Interpolation::Linear));
+        assert!(cubic < linear / 2.0, "off by {cubic:.1} on the curve and {linear:.1} on lines");
+    }
+
     #[test]
     fn pcm16_is_read_and_interpolated() {
         let bytes: Vec<u8> = (0..400i16).flat_map(|i| i.wrapping_mul(100).to_le_bytes()).collect();
@@ -1174,7 +1234,13 @@ mod tests {
                 return x0;
             }
             let x1 = input(voice, memory, at + 1);
-            let between = |a: i16, b: i16| (a as f64 + (b as f64 - a as f64) * voice.fraction) as i16;
+            if voice.interpolation == Interpolation::Polyphase {
+                let last = voice.playing.as_ref().map_or(0, |buffer| buffer.length.saturating_sub(1));
+                let before = if at == 0 { extend(x1, x0) } else { input(voice, memory, at - 1) };
+                let after = if at + 2 > last { extend(x0, x1) } else { input(voice, memory, at + 2) };
+                return [0, 1].map(|c| hermite([before[c], x0[c], x1[c], after[c]], voice.fraction));
+            }
+            let between = |a: i16, b: i16| (a as f64 + (b as f64 - a as f64) * voice.fraction).round() as i16;
             [between(x0[0], x1[0]), between(x0[1], x1[1])]
         }
 
