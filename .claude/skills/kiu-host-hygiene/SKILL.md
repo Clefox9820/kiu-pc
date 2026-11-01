@@ -22,7 +22,10 @@ Load before launching or closing the game, touching Zakuro settings, saves or lo
 - Never capture the screen while the maintainer's own game is open: bringing a test window forward steals their focus. Capture only the test instance's window by its PID, and fail rather than fall back to the whole screen, which can show their private windows; delete any such capture at once.
 - Inside the Claude desktop app (MSIX), your processes see a virtualized `%APPDATA%` and `%LOCALAPPDATA%`. Changes you make there do not reach the user. To read or write their real files, write a `.bat` with the Write tool on a normal drive and run it with `explorer.exe <bat>`.
 - Back up the user's real `settings.toml` before changing it.
+- `explorer.exe <bat>` passes no arguments to the `.bat`; have it read them from a small text file instead (see `build\prueba-fsr.bat`).
 - Never answer Windows security prompts (firewall, UAC) for the user.
+- `E:\3dsrecomp-work\Jugar Kid Icarus.bat` is the maintainer's own launcher (it sets `ZAKURO_PORTRAITS` and `ZAKURO_UPSCALER`); back it up before editing it.
+- E: is a slow hard disk: `du` over the whole drive ran for 2+ hours. Measure folder by folder with `timeout`, and read game sizes from Steam `appmanifest_*.acf` (`SizeOnDisk`) and Epic `C:/ProgramData/Epic/EpicGamesLauncher/Data/Manifests/*.item` (`InstallSize`).
 
 ## Decision Gates
 

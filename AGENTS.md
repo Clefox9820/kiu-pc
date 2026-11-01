@@ -22,6 +22,10 @@ Always:
 - Reply to the maintainer in Spanish; write code, comments and docs in English.
 - Use Conventional Commits without AI attribution lines.
 - Measure before changing performance code, and report what was not verified.
+- When you hit a gotcha (a surprise that cost time, a wrong assumption, a
+  tool behaving unexpectedly), add it as one short line to the Hard Rules of
+  the skill it belongs to before you finish, so the next agent does not pay
+  for it again.
 - Keep both releases working: Europe (`build/port`) and USA (`build/port-usa`).
   A change to `overrides/` needs its USA addresses (`scripts/find-usa-addresses.ps1`)
   and a rebuild of both; see `kiu-build`.
