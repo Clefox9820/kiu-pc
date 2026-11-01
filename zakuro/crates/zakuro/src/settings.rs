@@ -115,6 +115,38 @@ impl Filter {
     }
 }
 
+/// how far behind the picture sound plays: less answers sooner, more rides
+/// out uneven frames without running dry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Latency {
+    Low,
+    #[default]
+    Normal,
+    High,
+}
+
+impl Latency {
+    pub const ALL: [Latency; 3] = [Latency::Low, Latency::Normal, Latency::High];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Latency::Low => "Low (about 60 ms)",
+            Latency::Normal => "Normal (about 125 ms)",
+            Latency::High => "High (about 250 ms)",
+        }
+    }
+
+    /// how much sound the output keeps waiting, in the console's samples.
+    pub fn samples(self) -> usize {
+        match self {
+            Latency::Low => 2048,
+            Latency::Normal => 4096,
+            Latency::High => 8192,
+        }
+    }
+}
+
 /// the top screen's shape. a game draws into 400x240 whatever this is, so
 /// anything but the console's own only looks right with a widescreen code
 /// on, which makes the game draw a wider scene into those pixels.
@@ -508,6 +540,9 @@ pub struct Settings {
     /// 0 to 1.
     pub volume: f32,
     pub mute: bool,
+    pub sound_latency: Latency,
+    /// the sound output device's name, or empty for the system's default.
+    pub sound_device: String,
     pub show_fps: bool,
     /// the keyboard controls, drawn where the window has no screen.
     pub show_controls: bool,
@@ -568,6 +603,8 @@ impl Default for Settings {
             swap_eyes: false,
             volume: 1.0,
             mute: false,
+            sound_latency: Latency::Normal,
+            sound_device: String::new(),
             show_fps: false,
             show_controls: true,
             air_aim_speed: 0.5,
@@ -678,6 +715,19 @@ mod tests {
         settings.pad.a = Button::South;
         let text = toml::to_string_pretty(&settings).unwrap();
         assert_eq!(toml::from_str::<Settings>(&text).unwrap(), settings);
+    }
+
+    /// settings saved before the sound output could be chosen play on the
+    /// default device at normal latency, and a choice comes back as made.
+    #[test]
+    fn sound_output_settings_default_and_come_back() {
+        let old: Settings = toml::from_str("volume = 0.5\nmute = false\n").unwrap();
+        assert_eq!((old.sound_latency, old.sound_device.as_str()), (Latency::Normal, ""));
+        assert_eq!(Latency::Normal.samples(), 4096, "the latency sound had before it could be chosen");
+        let chosen = Settings { sound_latency: Latency::Low, sound_device: "Headphones (USB)".into(), ..Settings::default() };
+        let text = toml::to_string_pretty(&chosen).unwrap();
+        assert!(text.contains("sound_latency = \"low\""), "{text}");
+        assert_eq!(toml::from_str::<Settings>(&text).unwrap(), chosen);
     }
 
     #[test]

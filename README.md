@@ -310,6 +310,11 @@ Tools used to work on it:
   `Play.bat` points the game at it with `ZAKURO_UPSCALER`; without it the
   option does nothing. Everything is made on your computer from your own
   ROM and nothing is shared. Subtitles are not sharper.
+- Sound: the console's 32.7 kHz output reaches your device's rate through
+  a windowed-sinc filter, voices the game plays at another pitch follow a
+  cubic curve, and loud peaks are softened instead of cut off. Settings >
+  Sound picks the latency (Low, Normal, High) and the output device. When
+  the game falls behind, sound fades out and back in instead of clicking.
 - Local wireless play (**Together > Nearby**) through a Zakuro room
   (**Esc > Multiplayer**): a European and a USA copy find each other's
   room, share the lobby and reach the warm-up arena together, but the

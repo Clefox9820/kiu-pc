@@ -1,4 +1,5 @@
-//! the console's sound, played on the host's default output device.
+//! the console's sound, played on the host's chosen or default output
+//! device.
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
@@ -6,14 +7,15 @@ use std::sync::{Arc, Mutex};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{FromSample, SampleFormat, SizedSample};
 
-/// how much sound to keep waiting, in the console's samples, about 125 ms.
-/// more rides out uneven frames, less answers sooner.
-const TARGET: usize = 4096;
-/// how much a queue that ran dry waits for before it plays again.
-const RESUME: usize = TARGET / 4;
-/// the queue stretches sound only once it is down to this, about 63 ms.
+/// how much sound the queue keeps waiting by default, in the console's
+/// samples, about 125 ms; Queue::target holds what the settings chose. a
+/// queue that ran dry waits for a quarter of its target before it plays
+/// again, and sound is stretched only once the queue is down to half of it:
 /// every stretch splices the sound, so smaller shortfalls are left to DRIFT.
-const STRETCH_BELOW: usize = TARGET / 2;
+#[cfg(test)]
+const TARGET: usize = 4096;
+#[cfg(test)]
+const RESUME: usize = TARGET / 4;
 /// how much faster or slower than the rates say playback may go to keep
 /// the queue near its target, too little to hear.
 const DRIFT: f64 = 0.005;
@@ -86,6 +88,9 @@ struct Queue {
     underruns: u64,
     /// how much a queue that ran dry waits for before it plays again.
     refill: usize,
+    /// how much sound to keep waiting, in the console's samples: more
+    /// rides out uneven frames, less answers sooner.
+    target: usize,
 }
 
 impl Queue {
@@ -101,7 +106,7 @@ impl Queue {
                 return self.last.map(|v| v * self.level);
             }
             self.starved = false;
-            self.refill = RESUME;
+            self.refill = self.target / 4;
         }
         let weights = &self.filter[((self.fraction * PHASES as f64) as usize).min(PHASES - 1)];
         let mut out = [0.0f32; 2];
@@ -113,7 +118,7 @@ impl Queue {
         self.level = (self.level + 1.0 / FADE_IN).min(1.0);
         let out = out.map(|v| v * self.level);
         // a longer queue plays a little faster, a shorter one slower
-        let error = (self.samples.len() as f64 - TARGET as f64) / TARGET as f64;
+        let error = (self.samples.len() as f64 - self.target as f64) / self.target as f64;
         self.fraction += self.step * (1.0 + error.clamp(-1.0, 1.0) * DRIFT);
         while self.fraction >= 1.0 && self.samples.len() >= TAPS {
             self.samples.pop_front();
@@ -127,7 +132,7 @@ impl Queue {
     /// first frames after do not run it dry either.
     fn hold(&mut self) {
         self.starved = true;
-        self.refill = TARGET;
+        self.refill = self.target;
         self.underruns = 0;
     }
 
@@ -256,10 +261,21 @@ pub struct Audio {
 }
 
 impl Audio {
-    /// opens the default output for sound made at rate samples a second.
-    pub fn open(rate: f64) -> Result<Audio, String> {
+    /// opens the output named device, or the default one when it is empty
+    /// or not there, for sound made at rate samples a second, keeping target
+    /// of them waiting.
+    pub fn open(rate: f64, target: usize, device: &str) -> Result<Audio, String> {
         let host = cpal::default_host();
-        let device = host.default_output_device().ok_or("there is no sound output device")?;
+        let chosen = (!device.is_empty())
+            .then(|| host.output_devices().ok()?.find(|found| found.name().is_ok_and(|name| name == device)))
+            .flatten();
+        if chosen.is_none() && !device.is_empty() {
+            log::warn!("no sound output named {device}, playing on the default one");
+        }
+        let device = match chosen {
+            Some(device) => device,
+            None => host.default_output_device().ok_or("there is no sound output device")?,
+        };
         let supported = device.default_output_config().map_err(|e| e.to_string())?;
         let format = supported.sample_format();
         let config: cpal::StreamConfig = supported.into();
@@ -273,7 +289,8 @@ impl Audio {
             last: [0.0; 2],
             level: 0.0,
             underruns: 0,
-            refill: RESUME,
+            refill: target / 4,
+            target,
         }));
         let stream = match format {
             SampleFormat::F32 => stream::<f32>(&device, &config, queue.clone()),
@@ -284,6 +301,12 @@ impl Audio {
         }?;
         stream.play().map_err(|e| e.to_string())?;
         Ok(Audio { queue, volume: std::cell::Cell::new(1.0), stretch: std::cell::RefCell::new(Stretch::new()), _stream: stream })
+    }
+
+    /// the names of the sound output devices there are.
+    pub fn devices() -> Vec<String> {
+        let Ok(devices) = cpal::default_host().output_devices() else { return Vec::new() };
+        devices.filter_map(|device| device.name().ok()).collect()
     }
 
     /// how many times the sound ran dry since the last call.
@@ -324,14 +347,14 @@ impl Audio {
 /// adds what the console played to the queue, stretched by how far the
 /// queue has run down.
 fn enqueue(queue: &mut Queue, stretch: &mut Stretch, samples: &[[f32; 2]]) {
-    let short = STRETCH_BELOW.saturating_sub(queue.samples.len()) as f64 / STRETCH_BELOW as f64;
+    let short = (queue.target / 2).saturating_sub(queue.samples.len()) as f64 / (queue.target / 2) as f64;
     let mut stretched = Vec::with_capacity(samples.len() * 2);
     stretch.process(samples, (1.0 + short).min(MOST_STRETCH), &mut stretched);
     queue.samples.extend(stretched);
     // far ahead, after a stall on the output side, it drops the oldest
     // rather than lag behind the picture
-    if queue.samples.len() > TARGET * 4 {
-        let excess = queue.samples.len() - TARGET;
+    if queue.samples.len() > queue.target * 4 {
+        let excess = queue.samples.len() - queue.target;
         queue.samples.drain(..excess);
     }
 }
@@ -381,6 +404,7 @@ mod tests {
             level: 1.0,
             underruns: 0,
             refill: RESUME,
+            target: TARGET,
         }
     }
 

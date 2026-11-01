@@ -11,7 +11,7 @@ use zakuro_core::services::keyboard::Request;
 use crate::library::{Library, ICON_SIZE};
 use crate::recompile::{Job, Stage};
 use crate::gamepad::button_name;
-use crate::settings::{CameraSource, Filter, Keys, Language, PadButtons, Renderer, Screens, Settings, Stereo3d, TopShape};
+use crate::settings::{CameraSource, Filter, Keys, Language, Latency, PadButtons, Renderer, Screens, Settings, Stereo3d, TopShape};
 
 /// what the user asked for.
 #[derive(Debug, Clone, PartialEq)]
@@ -71,6 +71,8 @@ pub struct Menus {
     cheat_name: String,
     cheat_code: String,
     pub settings_open: bool,
+    /// the sound output devices, looked up the first time settings show.
+    sound_devices: Option<Vec<String>>,
     /// Kid Icarus' own options, over the menu of the running game.
     pub options_open: bool,
     /// the binding waiting for a key, by its place in Keys::all_mut.
@@ -778,6 +780,24 @@ impl Menus {
                 ui.heading("Sound");
                 ui.add(egui::Slider::new(&mut settings.volume, 0.0..=1.0).text("Volume").show_value(false));
                 ui.checkbox(&mut settings.mute, "Mute");
+                egui::ComboBox::from_label("Latency").selected_text(settings.sound_latency.name()).show_ui(ui, |ui| {
+                    for latency in Latency::ALL {
+                        ui.selectable_value(&mut settings.sound_latency, latency, latency.name());
+                    }
+                })
+                .response
+                .on_hover_text("How far behind the picture sound plays. Lower answers sooner; higher crackles less when the game slows down.");
+                // looked up once, as asking the system takes a moment
+                let devices = self.sound_devices.get_or_insert_with(crate::audio::Audio::devices);
+                let shown = if settings.sound_device.is_empty() { "System default" } else { settings.sound_device.as_str() };
+                egui::ComboBox::from_label("Output").selected_text(shown).show_ui(ui, |ui| {
+                    ui.selectable_value(&mut settings.sound_device, String::new(), "System default");
+                    for device in devices.iter() {
+                        ui.selectable_value(&mut settings.sound_device, device.clone(), device);
+                    }
+                })
+                .response
+                .on_hover_text("The speakers or headphones sound plays on.");
 
                 ui.separator();
                 ui.heading("Interface");

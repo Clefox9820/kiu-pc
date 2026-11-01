@@ -105,6 +105,7 @@ pub fn run(linked: Option<Linked>) {
         backend: None,
         window: None,
         audio: None,
+        audio_output: Default::default(),
         mouse_down: false,
         tilting_from: None,
         cursor: (0.0, 0.0),
@@ -143,12 +144,9 @@ pub fn run(linked: Option<Linked>) {
     if let Some(folder) = app.settings.games.clone() {
         app.library.scan(&folder);
     }
-    app.audio = if app.options.mute {
-        None
-    } else {
-        audio::Audio::open(zakuro_core::AUDIO_SAMPLE_RATE).inspect_err(|error| log::warn!("no sound, {error}")).ok()
-    };
-    app.apply_volume();
+    if !app.options.mute {
+        app.open_audio();
+    }
 
     let event_loop = EventLoop::new().expect("create an event loop");
     event_loop.set_control_flow(ControlFlow::Poll);
@@ -450,6 +448,8 @@ struct App {
     keyboard: Keyboard,
     gamepads: gamepad::Gamepads,
     audio: Option<audio::Audio>,
+    /// the latency and device the sound output was opened with.
+    audio_output: (settings::Latency, String),
     /// the window's size, times the console's.
     scale: u32,
     /// how the screens are arranged.
@@ -1094,6 +1094,18 @@ impl App {
         }
     }
 
+    /// opens the sound output the settings choose, in place of the one open.
+    fn open_audio(&mut self) {
+        let wanted = (self.settings.sound_latency, self.settings.sound_device.clone());
+        // the old stream goes first, as a device may play one at a time
+        self.audio = None;
+        self.audio = audio::Audio::open(zakuro_core::AUDIO_SAMPLE_RATE, wanted.0.samples(), &wanted.1)
+            .inspect_err(|error| log::warn!("no sound, {error}"))
+            .ok();
+        self.audio_output = wanted;
+        self.apply_volume();
+    }
+
     fn apply_volume(&self) {
         if let Some(audio) = &self.audio {
             audio.set_volume(if self.settings.mute { 0.0 } else { self.settings.volume });
@@ -1117,6 +1129,10 @@ impl App {
         self.apply_camera();
         self.keyboard.set_keys(self.settings.keys.clone());
         self.gamepads.set_buttons(self.settings.pad.clone());
+        // another latency or device takes the output opened again
+        if !self.options.mute && self.audio_output != (self.settings.sound_latency, self.settings.sound_device.clone()) {
+            self.open_audio();
+        }
         self.apply_volume();
         self.apply_layout();
     }
