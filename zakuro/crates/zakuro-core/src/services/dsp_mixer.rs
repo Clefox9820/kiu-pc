@@ -84,13 +84,14 @@ impl Mixer {
             }
         }
 
-        let mut frame = [[0i16; 2]; FRAME_SAMPLES];
+        let mut sum = [[0i32; 2]; FRAME_SAMPLES];
         for (volume, mix) in self.volume.iter().zip(&self.mixes) {
             // a mix at no volume adds nothing
             if *volume != 0.0 {
-                downmix(&mut frame, mix, *volume, self.output);
+                downmix(&mut sum, mix, *volume, self.output);
             }
         }
+        let frame: Frame = sum.map(|pair| pair.map(limit));
         write_frame(memory, layout.final_samples + write * REGION_STRIDE, &frame);
         frame
     }
@@ -211,21 +212,39 @@ fn write_frame(memory: &mut Memory, address: u32, frame: &Frame) {
     memory.write_bytes(address, &bytes);
 }
 
-/// adds a four channel mix to the stereo output at a volume.
-fn downmix(frame: &mut Frame, mix: &QuadFrame, volume: f32, output: Output) {
-    let clamp = |value: f32| (value as i32).clamp(-32768, 32767);
-    for (sample, out) in frame.iter_mut().enumerate() {
+/// adds a four channel mix to the stereo sum at a volume, unclipped, see
+/// limit.
+fn downmix(sum: &mut [[i32; 2]; FRAME_SAMPLES], mix: &QuadFrame, volume: f32, output: Output) {
+    for (sample, out) in sum.iter_mut().enumerate() {
         let [a, b, c, d] = std::array::from_fn(|channel| mix[channel][sample] as f32 * volume);
         let (left, right) = match output {
             Output::Mono => {
-                let mono = clamp((a + b + c + d) / 2.0);
+                let mono = ((a + b + c + d) / 2.0) as i32;
                 (mono, mono)
             }
-            Output::Stereo => (clamp(a + c), clamp(b + d)),
+            Output::Stereo => ((a + c) as i32, (b + d) as i32),
         };
-        out[0] = (out[0] as i32 + left).clamp(-32768, 32767) as i16;
-        out[1] = (out[1] as i32 + right).clamp(-32768, 32767) as i16;
+        out[0] = out[0].saturating_add(left);
+        out[1] = out[1].saturating_add(right);
     }
+}
+
+/// where the limiter starts to bend loud sound, three quarters of the way
+/// to the most 16 bits hold.
+const KNEE: f32 = 24576.0;
+
+/// a sample of the sum as 16 bits: as it is up to KNEE, and past it bent
+/// smoothly toward the most 16 bits hold rather than cut off there, so
+/// many sounds peaking together soften instead of breaking up. the console
+/// cuts them off.
+fn limit(value: i32) -> i16 {
+    let size = value.unsigned_abs() as f32;
+    if size <= KNEE {
+        return value as i16;
+    }
+    let room = i16::MAX as f32 - KNEE;
+    let bent = KNEE + room * ((size - KNEE) / room).tanh();
+    (bent.round() as i16) * value.signum() as i16
 }
 
 #[cfg(test)]
@@ -234,20 +253,28 @@ mod tests {
 
     #[test]
     fn mixes_come_down_to_stereo_at_their_volume() {
-        let mut frame = [[0i16; 2]; FRAME_SAMPLES];
+        let mut sum = [[0i32; 2]; FRAME_SAMPLES];
         let mix = [1000, 2000, 300, 400].map(|value| [value; FRAME_SAMPLES]);
-        downmix(&mut frame, &mix, 0.5, Output::Stereo);
-        assert_eq!(frame[0], [650, 1200]);
-        downmix(&mut frame, &mix, 0.5, Output::Mono);
-        assert_eq!(frame[0], [650 + 925, 1200 + 925]);
+        downmix(&mut sum, &mix, 0.5, Output::Stereo);
+        assert_eq!(sum[0], [650, 1200]);
+        downmix(&mut sum, &mix, 0.5, Output::Mono);
+        assert_eq!(sum[0], [650 + 925, 1200 + 925]);
     }
 
+    /// up to the knee sound is left as it is; past it, loud sound bends
+    /// toward the most 16 bits hold, louder still a little louder, never
+    /// past it and never wrapping round.
     #[test]
-    fn the_output_clips_instead_of_wrapping() {
-        let mut frame = [[30000i16, -30000]; FRAME_SAMPLES];
-        let mix = [10000, -10000, 0, 0].map(|value| [value; FRAME_SAMPLES]);
-        downmix(&mut frame, &mix, 1.0, Output::Stereo);
-        assert_eq!(frame[0], [32767, -32768]);
+    fn loud_sound_bends_instead_of_clipping() {
+        for quiet in [0, 1, -1, 1000, -20000, KNEE as i32, -(KNEE as i32)] {
+            assert_eq!(limit(quiet) as i32, quiet);
+        }
+        let loud = [26000, 30000, 32767, 40000, 60000, 1 << 20].map(limit);
+        assert!(loud.windows(2).all(|pair| pair[0] < pair[1] || pair[1] == i16::MAX), "louder in, louder out: {loud:?}");
+        assert!(loud[0] < 26000 && loud[1] < 30000, "bent below what came in: {loud:?}");
+        assert!(loud[3] < i16::MAX, "40000 still has room under the top: {loud:?}");
+        assert_eq!(limit(-(1 << 20)), -limit(1 << 20));
+        assert_eq!(limit(i32::MIN), -i16::MAX);
     }
 
     /// the mixer as it was, a word of memory and a sample at a time, with
@@ -287,10 +314,11 @@ mod tests {
                     kept[aux + 1] = mixes[aux + 1];
                 }
             }
-            let mut frame = [[0i16; 2]; FRAME_SAMPLES];
+            let mut sum = [[0i32; 2]; FRAME_SAMPLES];
             for (volume, mix) in mixer.volume.iter().zip(kept.iter()) {
-                downmix(&mut frame, mix, *volume, mixer.output);
+                downmix(&mut sum, mix, *volume, mixer.output);
             }
+            let frame: Frame = sum.map(|pair| pair.map(limit));
             let samples = layout.final_samples + write * REGION_STRIDE;
             for (i, pair) in frame.iter().enumerate() {
                 memory.write16(samples + i as u32 * 4, pair[0] as u16);
@@ -299,19 +327,18 @@ mod tests {
             frame
         }
 
-        fn downmix(frame: &mut Frame, mix: &Interleaved, volume: f32, output: Output) {
-            let clamp = |value: f32| (value as i32).clamp(-32768, 32767);
-            for (out, sample) in frame.iter_mut().zip(mix) {
+        fn downmix(sum: &mut [[i32; 2]; FRAME_SAMPLES], mix: &Interleaved, volume: f32, output: Output) {
+            for (out, sample) in sum.iter_mut().zip(mix) {
                 let [a, b, c, d] = sample.map(|s| s as f32 * volume);
                 let (left, right) = match output {
                     Output::Mono => {
-                        let mono = clamp((a + b + c + d) / 2.0);
+                        let mono = ((a + b + c + d) / 2.0) as i32;
                         (mono, mono)
                     }
-                    Output::Stereo => (clamp(a + c), clamp(b + d)),
+                    Output::Stereo => ((a + c) as i32, (b + d) as i32),
                 };
-                out[0] = (out[0] as i32 + left).clamp(-32768, 32767) as i16;
-                out[1] = (out[1] as i32 + right).clamp(-32768, 32767) as i16;
+                out[0] = out[0].saturating_add(left);
+                out[1] = out[1].saturating_add(right);
             }
         }
     }
