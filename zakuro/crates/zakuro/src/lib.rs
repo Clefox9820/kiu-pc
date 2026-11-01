@@ -861,6 +861,13 @@ impl App {
             ));
         }
         self.game = Some(game);
+        // a game starts out of play, so the automatic layout shows its menus
+        // again, whatever the game before it, reset in the middle of play,
+        // left the window showing
+        let screens = self.screens();
+        if let Some(backend) = &mut self.backend {
+            backend.set_layout(screens);
+        }
         // the new game's cameras see what the settings say, and it plays
         // in the room the player is in
         self.camera = None;
