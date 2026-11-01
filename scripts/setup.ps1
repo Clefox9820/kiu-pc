@@ -47,6 +47,8 @@ $UsaAddresses = @{
     "0x00A426AC" = "0x00A42428"
     "0x0070419C" = "0x00704004"
     "0x00606534" = "0x006063E8"
+    "0x0039025C" = "0x003901C4"
+    "0x003902B0" = "0x00390218"
 }
 $RecompRepo = "https://github.com/fearkov/3dsrecomp"
 $RecompCommit = "c3f21f94ba50d688025febc8974ff348d471b587"

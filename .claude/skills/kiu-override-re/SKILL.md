@@ -17,6 +17,8 @@ Load when a change needs the game itself to behave differently (true mouse camer
 - Overrides are hand-written C in this repo; they may reference addresses but must not copy disassembly or game bytes.
 - Never edit generated code in `build/port/code/`.
 - Overrides are written with European addresses only. Every address they name, comments included, needs its USA address in `$UsaAddresses` in `scripts/setup.ps1`; otherwise the USA build stops. Get it with `scripts\find-usa-addresses.ps1 -Europe <eur rom> -Usa <usa rom>`, never by guessing an offset. If it reports `not found`, the function changed between releases: find it by hand and say so.
+- A save state holds what the game worked out before it was saved: values cached at boot (the camera's projection matrix at camera+0x6C) never change when you patch their inputs from a state. Trace from boot instead: a scratch `zakuro-core` example that steps the interpreter and prints the PC writing a watched address found 0x003902B0 that way.
+- Gateway cheats: the first hex digit of a line is the code type; an address at 0x10000000 or above needs a `D3000000 <base>` offset line, or the write lands elsewhere.
 - Every override needs an in-game verification step the user can run, plus a RAM or image check when possible.
 
 ## Decision Gates

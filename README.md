@@ -284,7 +284,11 @@ Tools used to work on it:
   A new override needs its USA address added there too:
   `scripts\find-usa-addresses.ps1 -Europe <eur rom> -Usa <usa rom>` finds
   them from both ROMs and checks the table. It prints only addresses.
-- Widescreen would need more 3dsrecomp overrides and is not done.
+- Widescreen: **Top screen shape** (16:9 or 21:9) makes the game draw a
+  wider 3D scene instead of stretching it, through an override of the
+  camera's projection. The HUD keeps the console's layout, stretched with
+  the screen. A shape changed during play applies to each camera the next
+  time the game asks for its projection.
 - Local wireless play (**Together > Nearby**) through a Zakuro room
   (**Esc > Multiplayer**): a European and a USA copy find each other's
   room, share the lobby and reach the warm-up arena together, but the

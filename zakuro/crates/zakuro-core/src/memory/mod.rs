@@ -885,12 +885,13 @@ mod tests {
     #[test]
     fn the_host_mailbox_answers_where_nothing_is_mapped() {
         let mut memory = Memory::new(false, 0);
-        memory.host_mailbox = [1, 2, 3, 4];
+        memory.host_mailbox = [1, 2, 3, 4, 5];
         assert_eq!(memory.read32(HOST_MAILBOX_VADDR + 4), 2);
+        assert_eq!(memory.read32(HOST_MAILBOX_VADDR + 0x10), 5, "the fifth word, the top screen's widening");
         memory.write32(HOST_MAILBOX_VADDR + 8, 0);
-        assert_eq!(memory.host_mailbox, [1, 2, 0, 4]);
+        assert_eq!(memory.host_mailbox, [1, 2, 0, 4, 5]);
         assert!(memory.fault_summary().is_empty(), "the mailbox is no fault");
-        assert_eq!(memory.read32(HOST_MAILBOX_VADDR + 0x10), 0, "past it is unmapped as ever");
+        assert_eq!(memory.read32(HOST_MAILBOX_VADDR + 0x14), 0, "past it is unmapped as ever");
         assert_eq!(memory.fault_summary(), vec![(HOST_MAILBOX_VADDR, 1)]);
     }
 

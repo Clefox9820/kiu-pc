@@ -1575,6 +1575,9 @@ impl App {
         game.system.set_input(input);
         // mouse look on foot, for a game override to take, see input::MOUSE_LOOK
         self.keyboard.feed_mailbox(&mut game.system.memory.host_mailbox);
+        // how much wider than the console's the top screen shows, for a game
+        // override to draw a wider scene into the same 400x240
+        game.system.memory.host_mailbox[4] = (self.settings.top_shape.width() / 400.0).to_bits();
         let interpreted =|system: &System| system.interpreted_instructions + system.recompiled.as_ref().map_or(0, |library| library.fallbacks());
         let before = interpreted(&game.system);
         let faults = warm::page_faults();

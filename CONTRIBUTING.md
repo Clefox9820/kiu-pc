@@ -82,8 +82,8 @@ not be committed.
 - **Land aim feedback.** Mouse aim mode 3 (on foot) is new and has not been
   confirmed in real play. Reports on how it feels, and when it misbehaves,
   are very useful.
-- **Overrides.** A true mouse-controlled camera and widescreen would need
-  3dsrecomp overrides: hand-written C replacing specific game functions by
+- **Overrides.** A true mouse-controlled camera, or a HUD laid out for
+  widescreen instead of stretched, would need more 3dsrecomp overrides: hand-written C replacing specific game functions by
   address. Overrides are human-written and may be committed; the generated
   code around them may not.
 - **Upstreaming.** Several changes in `zakuro/` are general fixes (for
