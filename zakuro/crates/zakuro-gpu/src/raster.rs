@@ -1379,6 +1379,7 @@ fn mirror_portrait(registers: &[u32], resources: &mut Resources, vertices: Verti
     const SCALE: f32 = 0.4;
     const MARGIN: f32 = 0.0;
     let Some(top) = resources.portraits.top else { return };
+    resources.textures.note_portrait(loc_register(registers, TEXTURE_UNIT_BASES[0] + 4));
     let Some(vertices) = shaded_in_order(registers, vertices) else { return };
     // the screen's edge cuts it, so that edge goes on the top screen's
     // bottom edge and the cut does not show
@@ -1716,9 +1717,22 @@ pub struct TextureCache {
     /// texture is laid out to hash it as Citra did.
     pack: Option<Arc<crate::pack::Pack>>,
     rows: Vec<u8>,
+    /// the AI upscaler's HD pictures, which take the place of small
+    /// textures once made, see crate::hd.
+    hd: Option<Arc<crate::hd::HdCache>>,
+    /// the physical addresses of the textures portraits were drawn with, and
+    /// the addresses those were found at, so that they are taken for small
+    /// pictures though compressed as models' textures are.
+    portrait_sources: std::collections::HashSet<u32>,
+    portraits: std::collections::HashSet<u32>,
 }
 
 type TextureKey = (u32, TextureFormat, u32, u32);
+
+/// the largest texture, across and down, that HD pictures replace: the
+/// size of a HUD's or a menu's sheet of pictures. bigger ones are most
+/// often a model's, which draws no sharper this way.
+const UPSCALED_SIZE: u32 = 256;
 
 /// a texture's texels, and the texture pack's picture replacing it.
 type Found = (Arc<[[u8; 4]]>, Option<Arc<crate::pack::Material>>);
@@ -1733,6 +1747,8 @@ struct Decoded {
     /// made by then.
     checked: (u64, usize),
     replacement: Option<Arc<crate::pack::Material>>,
+    /// the hash of the HD picture asked for in its place, or 0.
+    hd: u64,
 }
 
 /// how many texels the cache holds before it starts over, 256 MiB of them.
@@ -1746,6 +1762,30 @@ impl TextureCache {
         self.texels = 0;
     }
 
+    /// has small textures replaced by the AI upscaler's HD pictures, made the
+    /// first time each shows, see crate::hd, or by none.
+    pub fn set_hd(&mut self, hd: Option<Arc<crate::hd::HdCache>>) {
+        self.hd = hd;
+        self.entries.clear();
+        self.texels = 0;
+    }
+
+    /// a portrait was drawn with the texture at the physical address.
+    pub fn note_portrait(&mut self, physical: u32) {
+        self.portrait_sources.insert(physical);
+    }
+
+    /// a texture at the physical address is about to be looked up by key: one
+    /// a portrait was drawn with is a small picture from now on, decoded
+    /// again to be one.
+    fn bound(&mut self, physical: u32, key: TextureKey) {
+        if self.portrait_sources.contains(&physical) && self.portraits.insert(key.0) {
+            if let Some(old) = self.entries.remove(&key) {
+                self.texels -= old.texels.len();
+            }
+        }
+    }
+
     /// lets go of every texture, memory having been put back as a saved
     /// state had it.
     pub fn forget(&mut self) {
@@ -1757,6 +1797,13 @@ impl TextureCache {
     pub fn begin_list(&mut self) {
         self.list += 1;
         self.written.clear();
+        // HD pictures made since, in place of what showed meanwhile
+        if let Some(hd) = &self.hd {
+            let done = hd.take_done();
+            for decoded in self.entries.values_mut().filter(|decoded| decoded.hd != 0 && done.contains(&decoded.hd)) {
+                decoded.replacement = Some(Arc::new(crate::pack::Material::file(decoded.hd, hd.path(decoded.hd))));
+            }
+        }
     }
 
     /// a draw writes to size bytes at addr.
@@ -1803,7 +1850,9 @@ impl TextureCache {
                 decoded.bytes.copy_from_slice(data);
                 decoded.texels = copy;
                 decoded.hash = hash;
-                decoded.replacement = picture_for(self.pack.as_deref(), data, &decoded.texels, key, &mut self.rows);
+                let portrait = self.portraits.contains(&key.0);
+                (decoded.replacement, decoded.hd) =
+                    picture_for(self.pack.as_deref(), self.hd.as_deref(), portrait, data, &decoded.texels, key, &mut self.rows);
             }
             if decoded.hash == hash {
                 decoded.checked = checked;
@@ -1819,8 +1868,10 @@ impl TextureCache {
             .flat_map(|y| (0..width).map(move |x| (x, y)))
             .map(|(x, y)| crate::texture::sample_texel(data, format, width, x, y))
             .collect();
-        let replacement = picture_for(self.pack.as_deref(), data, &texels, key, &mut self.rows);
-        let decoded = Decoded { hash, bytes: data.to_vec(), texels: texels.clone(), checked, replacement: replacement.clone() };
+        let portrait = self.portraits.contains(&key.0);
+        let (replacement, hd) =
+            picture_for(self.pack.as_deref(), self.hd.as_deref(), portrait, data, &texels, key, &mut self.rows);
+        let decoded = Decoded { hash, bytes: data.to_vec(), texels: texels.clone(), checked, replacement: replacement.clone(), hd };
         if let Some(old) = self.entries.insert(key, decoded) {
             self.texels -= old.texels.len();
         }
@@ -1829,19 +1880,62 @@ impl TextureCache {
     }
 }
 
-/// the pack's picture for a texture of these bytes, whenever they change.
+/// the pack's picture for a texture of these bytes, whenever they change,
+/// or else, for a small picture rather than a model's texture, the AI
+/// upscaler's HD picture once made, asking for it when it is not. with the
+/// hash of the HD picture asked for, or 0.
 fn picture_for(
     pack: Option<&crate::pack::Pack>,
+    hd: Option<&crate::hd::HdCache>,
+    portrait: bool,
     data: &[u8],
-    texels: &[[u8; 4]],
+    texels: &Arc<[[u8; 4]]>,
     key: TextureKey,
     rows: &mut Vec<u8>,
-) -> Option<Arc<crate::pack::Material>> {
+) -> (Option<Arc<crate::pack::Material>>, u64) {
     let (_, format, width, height) = key;
     if crate::pack::recording() {
         crate::pack::record(data, texels, format, width, height);
     }
-    pack?.find(data, format, width, height, rows)
+    if let Some(found) = pack.and_then(|pack| pack.find(data, format, width, height, rows)) {
+        return (Some(found), 0);
+    }
+    let small = width <= UPSCALED_SIZE && height <= UPSCALED_SIZE;
+    // compressed ones are models' but for portraits, and hilo8 holds
+    // normals, not colors
+    let picture = match format {
+        TextureFormat::Etc1 => portrait,
+        TextureFormat::Hilo8 => false,
+        _ => true,
+    };
+    if !small || !picture {
+        return (None, 0);
+    }
+    // pictures of grey and alpha alone are a HUD's letters, digits and
+    // plain shapes, which the AI upscaler, drawn for pictures, bends out of
+    // shape, so they keep their own
+    let letters = matches!(
+        format,
+        TextureFormat::La4 | TextureFormat::La8 | TextureFormat::L4 | TextureFormat::L8 | TextureFormat::A4 | TextureFormat::A8
+    );
+    // a texture of a few texels gains nothing
+    let Some(hd) = hd.filter(|_| !letters && width * height >= 256) else { return (None, 0) };
+    let hash = hd_hash(data, key);
+    if hd.made(hash) {
+        return (Some(Arc::new(crate::pack::Material::file(hash, hd.path(hash)))), hash);
+    }
+    hd.ask(hash, texels.clone(), width, height);
+    (None, hash)
+}
+
+/// what an HD picture is named by: its texture's bytes, format and size,
+/// with a hash that stays the same from one run and one build to the next.
+fn hd_hash(data: &[u8], key: TextureKey) -> u64 {
+    let (_, format, width, height) = key;
+    let mut bytes = Vec::with_capacity(data.len() + 32);
+    bytes.extend_from_slice(data);
+    bytes.extend_from_slice(format!("{format:?} {width}x{height}").as_bytes());
+    cityhasher::hash::<u64>(&bytes)
 }
 
 /// a quick hash of a texture's bytes, to notice when they change. four
@@ -2005,6 +2099,9 @@ fn bind_texture<M: GpuMemory>(
     let size = bits.div_ceil(8) as usize;
 
     let key = (addr, format, width, height);
+    if format == TextureFormat::Etc1 {
+        cache.bound(address, key);
+    }
     let (texels, replacement) = match (drawn, cache.checked(key, size as u32)) {
         (Some(_), _) if !past => (Arc::default(), None),
         (_, Some(found)) => found,
@@ -4103,6 +4200,56 @@ mod tests {
     /// within a command list memory changes only where draws write, so a
     /// texture is checked once, and again after a draw over it or in the
     /// next list.
+    /// with HD pictures on, a small picture is asked for once, shows its HD
+    /// picture once made, and portraits count as small pictures though
+    /// compressed like models' textures, which do not.
+    #[test]
+    fn hd_pictures_take_the_place_of_small_pictures_once_made() {
+        let dir = std::env::temp_dir().join(format!("zakuro-hd-cache-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let copy = |input: &std::path::Path, output: &std::path::Path| std::fs::copy(input, output).is_ok();
+        let hd = Arc::new(crate::hd::HdCache::with(&dir, Box::new(copy)).unwrap());
+        let mut cache = TextureCache::default();
+        cache.set_hd(Some(hd.clone()));
+
+        let rgba4 = (0x1000, TextureFormat::Rgba4, 16, 16);
+        let (_, meanwhile) = cache.decoded(rgba4, &[0x5A; 512]);
+        assert!(meanwhile.is_none(), "no sharp picture asked for, nothing meanwhile");
+        // each list takes the pictures made since, and looks the bytes up
+        // again as a draw does
+        let start = std::time::Instant::now();
+        let made = loop {
+            cache.begin_list();
+            if let (_, Some(made)) = cache.decoded(rgba4, &[0x5A; 512]) {
+                break made;
+            }
+            assert!(start.elapsed() < std::time::Duration::from_secs(5), "never made");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        };
+        assert!(hd.made(made.hash()) && hd.path(made.hash()).is_file());
+
+        let etc1 = (0x2000, TextureFormat::Etc1, 16, 16);
+        assert!(cache.decoded(etc1, &[0; 128]).1.is_none(), "a model's");
+        cache.note_portrait(0x2000);
+        cache.bound(0x2000, etc1);
+        assert!(cache.checked(etc1, 128).is_none(), "decoded again as a portrait");
+        cache.decoded(etc1, &[0; 128]);
+        assert!(cache.portraits.contains(&0x2000));
+        let asked = cache.entries[&etc1].hd;
+        assert_ne!(asked, 0, "a portrait's HD picture is asked for");
+
+        let tiny = (0x3000, TextureFormat::Rgba4, 8, 8);
+        cache.decoded(tiny, &[0; 128]);
+        assert_eq!(cache.entries[&tiny].hd, 0, "too small to be worth it");
+
+        // letters and digits, grey and alpha alone, are not given to the AI,
+        // which bends them, and keep their own
+        let letters = (0x4000, TextureFormat::La4, 16, 16);
+        assert!(cache.decoded(letters, &[0x5A; 128]).1.is_none(), "kept as they are");
+        assert_eq!(cache.entries[&letters].hd, 0, "no HD picture asked for");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn textures_are_checked_once_a_list_unless_drawn_over() {
         let mut cache = TextureCache::default();

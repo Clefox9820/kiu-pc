@@ -19,6 +19,7 @@ pub mod state;
 pub mod stats;
 pub mod tev;
 pub mod texture;
+pub mod hd;
 
 use format::ColorFormat;
 pub use interpolation::Matches;
@@ -647,6 +648,20 @@ impl Gpu {
         let pack = pack.filter(|_| false);
         let drawn = pack.is_some();
         self.resources.textures.set_pack(pack);
+        drawn
+    }
+
+    /// has the small textures no pack replaces, a HUD's, menus' and
+    /// portraits', replaced by the AI upscaler's HD pictures as they are
+    /// made, see hd, or by none. only the host's GPU draws them, so it waits
+    /// for enable_hardware_renderer, and says whether they are drawn.
+    pub fn set_texture_hd(&mut self, hd: Option<std::sync::Arc<hd::HdCache>>) -> bool {
+        #[cfg(feature = "vulkan")]
+        let hd = hd.filter(|_| self.resources.hardware.is_some());
+        #[cfg(not(feature = "vulkan"))]
+        let hd = hd.filter(|_| false);
+        let drawn = hd.is_some();
+        self.resources.textures.set_hd(hd);
         drawn
     }
 

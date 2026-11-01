@@ -147,6 +147,12 @@ impl Pack {
 }
 
 impl Material {
+    /// the picture in the PNG at path, its rows from the top, told apart
+    /// from every other picture by hash.
+    pub fn file(hash: u64, path: PathBuf) -> Material {
+        Material { hash, path, flipped: false, state: Mutex::new(State::OnDisk) }
+    }
+
     /// the hash of the textures it replaces, which tells its pictures apart.
     pub fn hash(&self) -> u64 {
         self.hash
@@ -191,6 +197,11 @@ impl Material {
             // let go of while it was read
             _ => State::OnDisk,
         };
+    }
+
+    /// whether the picture has been read, and waits for the GPU.
+    pub fn ready(&self) -> bool {
+        matches!(*self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner()), State::Read(_))
     }
 
     /// the GPU has the picture, or no longer draws what it replaces, so the
@@ -584,7 +595,7 @@ fn read_png(path: &Path, flipped: bool, kept: u32) -> Result<Picture, String> {
         png::ColorType::Indexed => return Err("its palette was not expanded".to_owned()),
     };
     let (w, h) = (width as usize, height as usize);
-    let mut texels = if channels == 4 && !flipped && info.line_size == w * 4 {
+    let texels = if channels == 4 && !flipped && info.line_size == w * 4 {
         buffer.truncate(w * h * 4);
         buffer
     } else {
@@ -601,6 +612,12 @@ fn read_png(path: &Path, flipped: bool, kept: u32) -> Result<Picture, String> {
         }
         texels
     };
+    Ok(picture(texels, width, height, kept))
+}
+
+/// a picture of RGBA8 texels, halved down to kept when it is bigger, with
+/// each smaller level after it.
+fn picture(mut texels: Vec<u8>, width: u32, height: u32, kept: u32) -> Picture {
     let mut top = Level { offset: 0, width, height };
     while top.width > kept || top.height > kept {
         let smaller = halve(&mut texels, top);
@@ -612,7 +629,7 @@ fn read_png(path: &Path, flipped: bool, kept: u32) -> Result<Picture, String> {
     while let Some(&above) = levels.last().filter(|level| level.width > 1 || level.height > 1) {
         levels.push(halve(&mut texels, above));
     }
-    Ok(Picture { width: top.width, height: top.height, texels, levels })
+    Picture { width: top.width, height: top.height, texels, levels }
 }
 
 /// adds the level half the size of above to texels, each of its texels the

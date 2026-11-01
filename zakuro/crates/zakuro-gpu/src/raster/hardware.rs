@@ -994,6 +994,10 @@ const REPLACED_IDLE: u64 = 60;
 /// uploaded before the memory it takes goes.
 const WAITING_IDLE: u64 = 120;
 
+/// how many batches a picture already read waits for its texture to be
+/// drawn again before it goes, about a minute.
+const WAITING_READY_IDLE: u64 = 3600;
+
 /// batches pictures wait to be read and uploaded after the GPU had no
 /// memory for one.
 const REPLACING_PAUSE: u64 = 60;
@@ -1653,6 +1657,11 @@ pub struct Hardware {
     /// how many of them may stay, each being memory of its own, of which
     /// some drivers give out 4096 in all.
     replaced_most: usize,
+    /// the GPU is part of the processor, its memory the computer's, so an
+    /// image that does not fit in what is set aside for it goes in the rest.
+    integrated: bool,
+    /// whether the log heard the pictures fill their room, once is enough.
+    said_crowded: bool,
     /// how long the batch being recorded spent uploading them, and how many
     /// bytes it uploaded.
     replacing: (std::time::Duration, u64),
@@ -1922,18 +1931,23 @@ impl Hardware {
                 copies: HashMap::new(),
                 replaced: HashMap::new(),
                 replaced_bytes: 0,
-                // half the GPU's own memory, up to 4 GiB, and a quarter, up
-                // to 2, of an integrated one's, which is the computer's
+                // half the GPU's own memory, up to 4 GiB; an integrated one's
+                // own is a little of the computer's set aside, often 256 MiB,
+                // and the rest is as much its own, so an eighth of the largest
+                // heap there, at least a quarter of its own, up to 1 GiB
                 replaced_budget: {
                     let heaps = &memory_types.memory_heaps[..memory_types.memory_heap_count as usize];
                     let local = heaps.iter().filter(|heap| heap.flags.contains(vk::MemoryHeapFlags::DEVICE_LOCAL)).map(|heap| heap.size);
                     let local = local.max().unwrap_or(1 << 30);
+                    let largest = heaps.iter().map(|heap| heap.size).max().unwrap_or(local);
                     match properties.device_type {
-                        vk::PhysicalDeviceType::INTEGRATED_GPU => (local / 4).min(2 << 30),
+                        vk::PhysicalDeviceType::INTEGRATED_GPU => (largest / 8).max(local / 4).min(1 << 30),
                         _ => (local / 2).min(4 << 30),
                     }
                 },
+                integrated: properties.device_type == vk::PhysicalDeviceType::INTEGRATED_GPU,
                 replaced_most: (properties.limits.max_memory_allocation_count / 2).min(4096) as usize,
+                said_crowded: false,
                 replacing: (std::time::Duration::ZERO, 0),
                 staged: Vec::new(),
                 dropped: Vec::new(),
@@ -2113,13 +2127,34 @@ impl Hardware {
             .position(|(i, t)| requirements.memory_type_bits & (1 << i) != 0 && t.property_flags.contains(flags))
             .ok_or("no memory type fits")?;
         // SAFETY: an allocation of a type the device reported
-        let memory = unsafe {
+        let allocated = unsafe {
             self.device.allocate_memory(
                 &vk::MemoryAllocateInfo::default().allocation_size(requirements.size).memory_type_index(index as u32),
                 None,
             )
-        }
-        .map_err(vk_error("allocate memory"))?;
+        };
+        let memory = match allocated {
+            Ok(memory) => memory,
+            // on an integrated GPU device memory is the computer's too: what
+            // does not fit in the part set aside goes in the rest
+            Err(vk::Result::ERROR_OUT_OF_DEVICE_MEMORY) if self.integrated && flags == vk::MemoryPropertyFlags::DEVICE_LOCAL => {
+                let other = types
+                    .iter()
+                    .enumerate()
+                    .position(|(i, t)| i != index && requirements.memory_type_bits & (1 << i) != 0 && !t.property_flags.contains(flags))
+                    .ok_or("no memory type fits")?;
+                // SAFETY: as above, of another type the device reported
+                let memory = unsafe {
+                    self.device.allocate_memory(
+                        &vk::MemoryAllocateInfo::default().allocation_size(requirements.size).memory_type_index(other as u32),
+                        None,
+                    )
+                }
+                .map_err(vk_error("allocate memory"))?;
+                return Ok((memory, types[other].property_flags));
+            }
+            Err(error) => return Err(vk_error("allocate memory")(error)),
+        };
         Ok((memory, types[index].property_flags))
     }
 
@@ -3403,6 +3438,15 @@ impl Hardware {
             return Some((replaced.image.view, replaced.smallest(size)));
         }
         if self.crowded() || batch < self.replacing_from {
+            if self.crowded() && !self.said_crowded {
+                self.said_crowded = true;
+                log::warn!(
+                    "replacement pictures fill the room they may take, {} of them in {} of {} MiB, so new ones wait for old ones to go",
+                    self.replaced.len(),
+                    self.replaced_bytes >> 20,
+                    self.replaced_budget >> 20
+                );
+            }
             return None;
         }
         // read meanwhile, uploaded in a batch with room for it
@@ -5775,7 +5819,10 @@ impl Hardware {
     fn let_go_of_pictures(&mut self) {
         let batch = self.batch;
         self.waiting.retain(|_, (material, asked)| {
-            let wanted = batch - *asked <= WAITING_IDLE;
+            // one read waits longer, for a texture drawn only now and then,
+            // as a font is when new text comes, to find it read next time
+            let idle = if material.ready() { WAITING_READY_IDLE } else { WAITING_IDLE };
+            let wanted = batch - *asked <= idle;
             if !wanted {
                 material.release();
             }
