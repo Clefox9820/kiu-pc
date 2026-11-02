@@ -2253,10 +2253,15 @@ const ISLANDS: [Island; 2] = [
 ];
 
 /// Kid Icarus Uprising's retro scenes, Medusa and Hewdraw as the NES game
-/// drew them, a band across the bottom screen whose 256x128 RGB565 picture
-/// is drawn first: on the top screen at 0.6 in its middle, so it shows who
+/// drew them, in a band across the bottom screen, see is_retro: on the top screen at 0.6 in its middle, so it shows who
 /// speaks, its edges fading out, see feathered.
 const RETRO: Island = Island { from: [0.0, 56.0, 320.0, 184.0], to: [200.0 - 320.0 * 0.6 / 2.0, 120.0 - 128.0 * 0.6 / 2.0], scale: 0.6 };
+
+/// how many of the bottom screen's pixels across and down a retro scene's
+/// picture takes at least to start one, see mirror_hud: Medusa's band takes
+/// 220 by 128, Hewdraw's sprite 96 by 124, the battle display's own
+/// pictures of those formats about 46 by 39 at most.
+const RETRO_SIZE: f32 = 64.0;
 
 /// how many of the top screen's pixels the retro scene fades out over at
 /// each of its edges.
@@ -2355,14 +2360,16 @@ fn retro_alpha(alpha: f32, drawn: bool) -> f32 {
     }
 }
 
-/// a draw of a retro scene's picture, see RETRO: Medusa's 256x128 RGB565
-/// band, or Hewdraw's 64x32 RGBA5551 sprite alone in it.
-// ponytail: matched by their shapes alone, as is_portrait is
+/// a draw of a retro scene's picture, see RETRO: in play, the bottom
+/// screen's pictures in RGB565 or RGBA5551 are the NES game's, Medusa's
+/// band and Hewdraw's sprite among them; its battle display's are ETC1,
+/// L4, LA4, L8 or RGBA4.
+// ponytail: told by format alone, as seen in chapters 1 to 3; a picture of
+// those formats there that is not retro shows on the top screen too
 fn is_retro(registers: &[u32]) -> bool {
     let base = TEXTURE_UNIT_BASES[0];
-    let shape = (registers[base + 1], TextureFormat::from_raw(registers[base + 13]));
     registers[REG_TEXTURE_CONFIG] & 1 != 0
-        && (shape == (256 << 16 | 128, TextureFormat::Rgb565) || shape == (64 << 16 | 32, TextureFormat::Rgba5551))
+        && matches!(TextureFormat::from_raw(registers[base + 13]), TextureFormat::Rgb565 | TextureFormat::Rgba5551)
 }
 
 /// takes a bottom-screen draw that lies in one of the islands for the top
@@ -2379,9 +2386,12 @@ fn mirror_hud(registers: &[u32], resources: &mut Resources, vertices: Vertices) 
         let [x0, y0, x1, y1] = island.from;
         left >= x0 - SLACK && upper >= y0 - SLACK && right <= x1 + SLACK && lower <= y1 + SLACK
     };
-    // the retro scene's picture and what is drawn over it, once it is there
-    resources.portraits.retro |= is_retro(registers) && inside(&&RETRO);
-    let in_retro = resources.portraits.retro && inside(&&RETRO);
+    // a retro scene starts with a big picture in the band, then its smaller
+    // ones go with it, the names over it; the battle display's own small
+    // pictures of those formats do not start one
+    let retro = is_retro(registers) && inside(&&RETRO);
+    resources.portraits.retro |= retro && right - left >= RETRO_SIZE && lower - upper >= RETRO_SIZE;
+    let in_retro = resources.portraits.retro && retro;
     let Some(island) = (if in_retro { Some(&RETRO) } else { ISLANDS.iter().find(inside) }) else {
         return;
     };
@@ -9702,8 +9712,8 @@ mod tests {
         // the band's rows 56 to 184 from the top are 56 to 184 up the buffer
         let band = quad((-0.5333, 0.5333), (-1.0, 1.0), RED);
         let label = quad((0.25, 0.4167), (-0.4375, 0.3125), RED);
-        // a draw there with no retro picture under it stays below
-        mirror_hud(&textured(128, 64, 3), &mut resources, Vertices::Shaded(&label));
+        // a draw there that is no retro picture, with none under it, stays below
+        mirror_hud(&textured(128, 64, 12), &mut resources, Vertices::Shaded(&label));
         assert!(resources.portraits.hud.is_empty() && resources.portraits.retro_draws.is_empty(), "nothing taken without the retro picture");
         mirror_hud(&textured(256, 128, 3), &mut resources, Vertices::Shaded(&band));
         mirror_hud(&textured(128, 64, 2), &mut resources, Vertices::Shaded(&label));
@@ -9723,6 +9733,22 @@ mod tests {
         let sprite = quad((56.0 / 120.0 - 1.0, 180.0 / 120.0 - 1.0), (112.0 / 160.0 - 1.0, 208.0 / 160.0 - 1.0), RED);
         mirror_hud(&textured(64, 32, 2), &mut resources, Vertices::Shaded(&sprite));
         assert_eq!(resources.portraits.retro_draws.len(), 1, "Hewdraw's sprite taken");
+        // any RGB565 or RGBA5551 picture there is one, the NES game's look;
+        // the battle display's ETC1 and RGBA4 pictures are not
+        for (format, retro) in [(3, true), (2, true), (12, false), (4, false)] {
+            let mut resources = Resources::default();
+            resources.portraits.top = Some([0x1F08_0000 >> 3, 0, 256 | (511 << 12)]);
+            mirror_hud(&textured(32, 32, format), &mut resources, Vertices::Shaded(&sprite));
+            assert_eq!(resources.portraits.retro_draws.len() == 1, retro, "format {format}");
+        }
+        // a small one of those, as the battle display draws while Pit
+        // fights, 46 by 39 across 193 to 239 and down 82 to 121, is no
+        // retro scene
+        let mut resources = Resources::default();
+        resources.portraits.top = Some([0x1F08_0000 >> 3, 0, 256 | (511 << 12)]);
+        let small = quad(((240.0 - 121.0) / 120.0 - 1.0, (240.0 - 82.0) / 120.0 - 1.0), ((320.0 - 239.0) / 160.0 - 1.0, (320.0 - 193.0) / 160.0 - 1.0), RED);
+        mirror_hud(&textured(64, 64, 3), &mut resources, Vertices::Shaded(&small));
+        assert!(resources.portraits.retro_draws.is_empty() && !resources.portraits.retro, "a small picture");
     }
 
     /// the retro scene's edges fade out: a draw over its bounds is cut a
