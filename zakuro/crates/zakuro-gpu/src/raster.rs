@@ -1028,6 +1028,8 @@ pub struct Resources {
     /// how many times wider than the console's the top screen shows, which
     /// squeeze_hud takes back out of its 2D draws; 1 or less for not at all.
     pub(crate) top_widening: f32,
+    /// the 2D pieces squeeze_hud kept against an edge this frame.
+    pub(crate) hud_edges: Vec<EdgePiece>,
 }
 
 /// a 2D draw of the top screen, every vertex at w 1, kept in proportion on
@@ -1036,25 +1038,49 @@ pub struct Resources {
 /// edge it starts at, for a HUD's pieces along an edge, which keep their
 /// places there and to one another, or else toward its own middle, for
 /// what follows the scene, as markers do. none for a draw left as it is.
-fn squeeze_hud(vertices: &[Vertex], factor: f32) -> Option<Vec<Vertex>> {
+/// a 2D draw squeeze_hud kept against an edge this frame, by where it was
+/// across the top screen's 400 and down its height in clip x, and the edge.
+#[derive(Clone, Copy)]
+pub(crate) struct EdgePiece {
+    across: (f32, f32),
+    down: (f32, f32),
+    edge: f32,
+}
+
+/// a piece overlapping one already kept against an edge goes with it,
+/// within this many pixels, as a figure on its badge.
+const HUD_TOUCH: f32 = 8.0;
+
+fn squeeze_hud(vertices: &[Vertex], factor: f32, edges: &mut Vec<EdgePiece>) -> Option<Vec<Vertex>> {
     if factor <= 1.0 || vertices.is_empty() || vertices.iter().any(|v| (v.clip[3] - 1.0).abs() > 1e-4) {
         return None;
     }
     // across the top screen's 400 pixels from its left edge; a vertex's
     // clip y runs the other way, from 1 on the left to -1 on the right
     let across = |v: &Vertex| 200.0 * (1.0 - v.clip[1]);
-    let (left, right) = vertices.iter().map(across).fold((f32::MAX, f32::MIN), |(l, r), x| (l.min(x), r.max(x)));
+    let span = |values: &mut dyn Iterator<Item = f32>| values.fold((f32::MAX, f32::MIN), |(l, r), x| (l.min(x), r.max(x)));
+    let (left, right) = span(&mut vertices.iter().map(across));
     // as wide as the screen: a fade, a flash or the scene put together
     if right - left > 360.0 {
         return None;
     }
-    let anchor = if left < 48.0 && right < 200.0 {
-        0.0
+    let down = span(&mut vertices.iter().map(|v| v.clip[0]));
+    // down the 240 rows, clip x runs 2 for the lot
+    let (reach, reach_down) = (HUD_TOUCH, HUD_TOUCH * 2.0 / 240.0);
+    let touching = edges.iter().find(|piece| {
+        left < piece.across.1 + reach && right > piece.across.0 - reach && down.0 < piece.down.1 + reach_down && down.1 > piece.down.0 - reach_down
+    });
+    let edge = if left < 48.0 && right < 200.0 {
+        Some(0.0)
     } else if right > 352.0 && left > 200.0 {
-        400.0
+        Some(400.0)
     } else {
-        (left + right) / 2.0
+        touching.map(|piece| piece.edge)
     };
+    if let Some(edge) = edge {
+        edges.push(EdgePiece { across: (left, right), down, edge });
+    }
+    let anchor = edge.unwrap_or((left + right) / 2.0);
     Some(
         vertices
             .iter()
@@ -3378,10 +3404,12 @@ fn assemble(topology: u32, count: usize) -> Vec<(usize, usize, usize)> {
 fn rasterize<M: GpuMemory>(registers: &[u32], memory: &mut M, resources: &mut Resources, vertices: Vertices) -> Option<u32> {
     // on a top screen shown wider than the console's, its HUD kept in
     // proportion: 2D draws go without a depth test, and the CPU decodes
-    // their arrays so their vertices say where they are
+    // their arrays so their vertices say where they are. portraits and
+    // islands come back through here as they are added; subtitles too,
+    // centered, and are squeezed then rather than twice
     let squeezed;
     let vertices = if resources.top_widening > 1.0
-        && !resources.portraits.adding
+        && (resources.portraits.adding || !(portraits_on() && is_subtitle(registers)))
         && registers[REG_DEPTH_COLOR_MASK] & 1 == 0
         && read_float24(registers, REG_VIEWPORT_WIDTH) == 120.0
         && read_float24(registers, REG_VIEWPORT_HEIGHT) == 200.0
@@ -3390,7 +3418,7 @@ fn rasterize<M: GpuMemory>(registers: &[u32], memory: &mut M, resources: &mut Re
         if matches!(vertices, Vertices::Raw { .. }) {
             return None;
         }
-        squeezed = shaded_in_order(registers, vertices).and_then(|shaded| squeeze_hud(&shaded, resources.top_widening));
+        squeezed = shaded_in_order(registers, vertices).and_then(|shaded| squeeze_hud(&shaded, resources.top_widening, &mut resources.hud_edges));
         match &squeezed {
             Some(squeezed) => Vertices::Shaded(squeezed),
             None => vertices,
@@ -7673,17 +7701,26 @@ mod tests {
         let piece = |left: f32, right: f32| quad((-0.9, -0.8), (1.0 - right / 200.0, 1.0 - left / 200.0), RED);
         let near = |a: f32, b: f32| (a - b).abs() < 1e-3;
         let factor = 1.25;
-        let (left, right) = span(&squeeze_hud(&piece(14.0, 143.0), factor).unwrap());
+        let mut edges = Vec::new();
+        let (left, right) = span(&squeeze_hud(&piece(14.0, 143.0), factor, &mut edges).unwrap());
         assert!(near(left, 14.0 / factor) && near(right, 143.0 / factor), "the health bar, {left} to {right}");
-        let (left, right) = span(&squeeze_hud(&piece(312.0, 400.0), factor).unwrap());
+        let (left, right) = span(&squeeze_hud(&piece(312.0, 400.0), factor, &mut edges).unwrap());
         assert!(near(right, 400.0) && near(left, 400.0 - 88.0 / factor), "the score, {left} to {right}");
-        let (left, right) = span(&squeeze_hud(&piece(180.0, 240.0), factor).unwrap());
+        let (left, right) = span(&squeeze_hud(&piece(180.0, 240.0), factor, &mut edges).unwrap());
         assert!(near((left + right) / 2.0, 210.0) && near(right - left, 60.0 / factor), "a marker, {left} to {right}");
-        assert!(squeeze_hud(&piece(0.0, 400.0), factor).is_none(), "across the whole screen");
+        // a figure on a badge against the right edge goes with the badge,
+        // though it does not reach the edge itself
+        let (left, right) = span(&squeeze_hud(&piece(340.0, 350.0), factor, &mut edges).unwrap());
+        assert!(near(left, 352.0) && near(right, 360.0), "the figure on the score's badge, {left} to {right}");
+        // the same place lower down, touching nothing, keeps its middle
+        let lower = quad((0.0, 0.1), (1.0 - 350.0 / 200.0, 1.0 - 340.0 / 200.0), RED);
+        let (left, right) = span(&squeeze_hud(&lower, factor, &mut edges).unwrap());
+        assert!(near((left + right) / 2.0, 345.0), "a marker lower down, {left} to {right}");
+        assert!(squeeze_hud(&piece(0.0, 400.0), factor, &mut edges).is_none(), "across the whole screen");
         let mut scene = piece(100.0, 200.0);
         scene[0].clip[3] = 2.0;
-        assert!(squeeze_hud(&scene, factor).is_none(), "the 3D scene");
-        assert!(squeeze_hud(&piece(14.0, 143.0), 1.0).is_none(), "the console's shape");
+        assert!(squeeze_hud(&scene, factor, &mut edges).is_none(), "the 3D scene");
+        assert!(squeeze_hud(&piece(14.0, 143.0), 1.0, &mut edges).is_none(), "the console's shape");
     }
 
     /// a portrait on one side of the bottom screen goes to the top screen's

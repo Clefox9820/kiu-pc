@@ -714,6 +714,8 @@ impl Gpu {
     /// so that its HUD's 2D draws keep their proportions; 1 for as it is.
     pub fn set_top_widening(&mut self, factor: f32) {
         self.resources.top_widening = factor;
+        // a new frame, whose pieces start afresh
+        self.resources.hud_edges.clear();
     }
 
     /// says which screens the window shows now, the top one and the bottom
