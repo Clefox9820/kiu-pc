@@ -160,14 +160,22 @@ impl System {
         }
         let length = reader.u32()? as usize;
         let version = String::from_utf8_lossy(reader.take(length)?).into_owned();
-        if version != VERSION {
-            return Err(format!("it was saved by Zakuro {version}, and this is {VERSION}"));
-        }
         if reader.u64()? != self.kernel.program_id {
             return Err("it was saved from another game".into());
         }
         let state = reader.section()?;
-        let saved: Saved = postcard::from_bytes(&state).map_err(|error| format!("the state could not be read, {error}"))?;
+        let saved: Saved = match version == VERSION {
+            true => postcard::from_bytes(&state).map_err(|error| format!("the state could not be read, {error}"))?,
+            // another version's state is taken only when it reads to the last
+            // byte as this one's does: what it saves has the same shape
+            false => match postcard::take_from_bytes::<Saved>(&state) {
+                Ok((saved, [])) => {
+                    log::warn!("a state saved by Zakuro {version}, read as this {VERSION} saves them");
+                    saved
+                }
+                _ => return Err(format!("it was saved by Zakuro {version}, and this is {VERSION}")),
+            },
+        };
         let memories = [reader.section()?, reader.section()?, reader.section()?, reader.section()?];
         let phys = &self.memory.phys;
         let sizes = [phys.fcram.len(), phys.vram.len(), phys.dsp_ram.len(), phys.axi_wram.len()];
@@ -334,6 +342,43 @@ mod tests {
         crate::cheats::run(&mut system);
         system.memory.read_bytes(0x0800_0000, &mut byte);
         assert_eq!(byte, [1]);
+    }
+
+    /// a state another Zakuro saved is taken when what it saves reads to
+    /// the last byte as this one's does, and turned down, changing nothing,
+    /// when it does not.
+    #[test]
+    fn a_state_of_another_version_is_taken_when_it_reads_the_same() {
+        let (mut system, _) = system_with_thread();
+        system.cpu.regs[3] = 7;
+        let state = system.save_state().unwrap();
+        // the same state as another version labels it, with what it saves
+        // one byte longer when extra
+        let relabel = |extra: bool| {
+            let mut reader = super::Reader(&state);
+            reader.take(super::MAGIC.len()).unwrap();
+            let length = reader.u32().unwrap() as usize;
+            reader.take(length).unwrap();
+            let program_id = reader.u64().unwrap();
+            let mut saved = reader.section().unwrap();
+            if extra {
+                saved.push(0);
+            }
+            let mut out = super::MAGIC.to_vec();
+            out.extend_from_slice(&5u32.to_le_bytes());
+            out.extend_from_slice(b"0.0.1");
+            out.extend_from_slice(&program_id.to_le_bytes());
+            super::section(&mut out, &saved);
+            out.extend_from_slice(reader.0);
+            out
+        };
+        system.cpu.regs[3] = 9;
+        system.load_state(&relabel(false)).unwrap();
+        assert_eq!(system.cpu.regs[3], 7);
+        system.cpu.regs[3] = 9;
+        let error = system.load_state(&relabel(true)).unwrap_err();
+        assert!(error.contains("saved by Zakuro 0.0.1"), "{error}");
+        assert_eq!(system.cpu.regs[3], 9, "nothing changes");
     }
 
     /// a state of another game, or not a state at all, is turned down and
