@@ -73,9 +73,11 @@ impl log::Log for Logger {
 }
 
 /// logs what RUST_LOG asks for, info and up without it, and puts a panic in
-/// the file as well, the terminal shows it as it always has.
+/// the file as well, the terminal shows it as it always has. Cranelift's
+/// JIT logs each shader it compiles whole at info, megabytes of it, which
+/// only RUST_LOG brings back.
 pub fn init() {
-    let terminal = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).build();
+    let terminal = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info,cranelift_jit=warn")).build();
     let level = terminal.filter();
     let started = Instant::now();
     if log::set_boxed_logger(Box::new(Logger { terminal, started })).is_ok() {

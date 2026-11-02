@@ -96,7 +96,7 @@ impl System {
         // what the host's GPU drew comes down first, so that memory holds
         // all of it
         let linear_base = self.kernel.linear_base;
-        self.gpu.write_back_all(&mut GuestMemory { memory: &mut self.memory, linear_base });
+        self.gpu.write_back_all(&mut GuestMemory { memory: &mut self.memory, linear_base, writes: 0 });
         let (images, layers) = images(self);
         let mut files = Vec::with_capacity(self.services.fs.files.len());
         for (&handle, file) in &self.services.fs.files {

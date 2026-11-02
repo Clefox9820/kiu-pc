@@ -6,11 +6,11 @@
 
 layout(location = 0) in vec4 in_color;
 layout(location = 1) in vec4 in_texcoords01;
-// texture coordinate set 2, and set 0's w, which a projected texture divides by
-layout(location = 2) in vec3 in_texcoord2;
+layout(location = 2) in vec2 in_texcoord2;
 layout(location = 3) noperspective in float in_depth;
 layout(location = 4) in vec4 in_quaternion;
-layout(location = 5) in vec3 in_view;
+// the view vector, and in w texture coordinate set 0's w
+layout(location = 5) in vec4 in_view;
 
 layout(location = 0) out vec4 out_color;
 
@@ -332,7 +332,7 @@ void shade(vec4 textures[4], out vec4 diffuse_out, out vec4 specular_out) {
     vec3 tangent = config == 8u ? rotate(q, surface_tangent) : surface_tangent;
     bool needs_half = (light_flags.w & 1u) != 0u;
     bool needs_view = (light_flags.w & 2u) != 0u;
-    vec3 view = in_view;
+    vec3 view = in_view.xyz;
     vec3 norm_view = needs_view ? normalize(view) : vec3(0.0);
 
     precise vec4 diffuse_sum = vec4(0.0, 0.0, 0.0, 1.0);
@@ -652,20 +652,20 @@ void main() {
     uint texture_config = DYNAMIC != 0u ? (misc.w & 0x2307u) | (TEXTURE_CONFIG & 0x400u) : TEXTURE_CONFIG;
     vec4 textures[4] = vec4[4](vec4(0.0, 0.0, 0.0, 1.0), vec4(0.0, 0.0, 0.0, 1.0), vec4(0.0, 0.0, 0.0, 1.0), vec4(0.0, 0.0, 0.0, 1.0));
     if ((texture_config & 1u) != 0u) {
-        // a projected texture, type 3 in unit 0's PARAM bits 28-30, divides
-        // its coordinates by their w
+        // a projected texture, type 3 in bits 28-30 of the unit's
+        // configuration, divides its coordinates by set 0's w
         bool projected = ((units[0].x >> 28) & 7u) == 3u;
-        textures[0] = sample_unit(0u, projected ? in_texcoords01.xy / in_texcoord2.z : in_texcoords01.xy);
+        textures[0] = sample_unit(0u, projected ? in_texcoords01.xy / in_view.w : in_texcoords01.xy);
     }
     if ((texture_config & 2u) != 0u) {
         textures[1] = sample_unit(1u, in_texcoords01.zw);
     }
     if ((texture_config & 4u) != 0u) {
-        textures[2] = sample_unit(2u, (texture_config & (1u << 13)) != 0u ? in_texcoords01.zw : in_texcoord2.xy);
+        textures[2] = sample_unit(2u, (texture_config & (1u << 13)) != 0u ? in_texcoords01.zw : in_texcoord2);
     }
     if ((texture_config & (1u << 10)) != 0u) {
         uint set = min((texture_config >> 8) & 3u, 2u);
-        textures[3] = procedural(set == 0u ? in_texcoords01.xy : (set == 1u ? in_texcoords01.zw : in_texcoord2.xy));
+        textures[3] = procedural(set == 0u ? in_texcoords01.xy : (set == 1u ? in_texcoords01.zw : in_texcoord2));
     }
 
     // without fragment lighting the primary fragment color is the vertex

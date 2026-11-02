@@ -30,6 +30,14 @@ fn invalid_handle(system: &mut System, handle: u32, what: &str) -> u32 {
     errors::INVALID_HANDLE.0
 }
 
+/// whether recompiled code can have an svc run in place, from inside the
+/// code. the ones that map memory, start or end threads or the process,
+/// reach services, which load code, or that nothing implements stop the
+/// code, and the step runs them.
+pub fn in_place(number: u32) -> bool {
+    matches!(number, 0x02 | 0x0A..=0x0C | 0x11 | 0x13..=0x1D | 0x21..=0x25 | 0x27 | 0x28 | 0x2A | 0x2B | 0x35 | 0x37..=0x3A | 0x3D | 0x54..=0x56)
+}
+
 /// runs one supervisor call.
 pub fn dispatch(system: &mut System, number: u32) {
     if log::log_enabled!(log::Level::Trace) {
@@ -969,7 +977,20 @@ fn send_sync_request(system: &mut System) {
 
     system.cpu.regs[0] = 0;
     crate::services::handle_request(system, target);
+    // on the console a service runs in a process of its own and the thread
+    // waits for its reply, while the threads below it run. Star Fox 64 3D
+    // marks a job running once the more urgent thread doing it is made,
+    // which has to be waiting on its first request by then, or the job is
+    // done before it is marked and stays running forever
+    if system.kernel.current().is_some_and(|thread| thread.status == ThreadStatus::Running) {
+        let tick = system.cpu.cycles;
+        system.kernel.sleep_current(REQUEST_TICKS, tick);
+    }
 }
+
+/// how long a request to a service keeps the thread waiting, what Citra
+/// measured for one to GSP on a New 3DS.
+pub(crate) const REQUEST_TICKS: u64 = nanos_to_ticks(39_000);
 
 // ---------------------------------------------------------------------------
 // Information

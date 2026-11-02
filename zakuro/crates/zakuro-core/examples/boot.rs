@@ -6,7 +6,8 @@ use zakuro_core::services::hid::{InputState, PadState};
 use zakuro_core::{loader, Config, FrameOutcome};
 
 fn main() {
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+    // Cranelift's JIT logs each shader it compiles whole at info
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info,cranelift_jit=warn")).init();
 
     let mut args = std::env::args().skip(1);
     let Some(path) = args.next() else {

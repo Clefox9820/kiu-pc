@@ -8,11 +8,11 @@
 
 layout(location = 0) out vec4 out_color;
 layout(location = 1) out vec4 out_texcoords01;
-// texture coordinate set 2, and set 0's w, which a projected texture divides by
-layout(location = 2) out vec3 out_texcoord2;
+layout(location = 2) out vec2 out_texcoord2;
 layout(location = 3) noperspective out float out_depth;
 layout(location = 4) out vec4 out_quaternion;
-layout(location = 5) out vec3 out_view;
+// the view vector, and in w texture coordinate set 0's w
+layout(location = 5) out vec4 out_view;
 
 layout(std430, set = 0, binding = 5) readonly buffer Program {
     uint code[4096];
@@ -436,8 +436,8 @@ void main() {
     // no color is white, an untextured draw comes out lit
     out_color = vec4(semantic(4u, 1.0), semantic(5u, 1.0), semantic(6u, 1.0), semantic(7u, 1.0));
     out_texcoords01 = vec4(semantic(8u, 0.0), semantic(9u, 0.0), semantic(10u, 0.0), semantic(11u, 0.0));
-    out_texcoord2 = vec3(semantic(12u, 0.0), semantic(13u, 0.0), semantic(21u, 1.0));
+    out_texcoord2 = vec2(semantic(12u, 0.0), semantic(13u, 0.0));
     out_depth = position.z / position.w * depth_map.x + depth_map.y;
     out_quaternion = vec4(semantic(14u, 0.0), semantic(15u, 0.0), semantic(16u, 0.0), semantic(17u, 0.0));
-    out_view = vec3(semantic(18u, 0.0), semantic(19u, 0.0), semantic(20u, 0.0));
+    out_view = vec4(semantic(18u, 0.0), semantic(19u, 0.0), semantic(20u, 0.0), semantic(21u, 1.0));
 }

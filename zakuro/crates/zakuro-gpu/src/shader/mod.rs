@@ -166,6 +166,37 @@ impl ShaderUnit {
         self.decoded = Some(program);
     }
 
+    /// a copy to shade a draw with on another thread, without the programs
+    /// decoded before.
+    pub fn for_draw(&self) -> ShaderUnit {
+        ShaderUnit {
+            program: self.program.clone(),
+            descriptors: self.descriptors.clone(),
+            float_uniforms: self.float_uniforms.clone(),
+            int_uniforms: self.int_uniforms,
+            bool_uniforms: self.bool_uniforms,
+            entry_point: self.entry_point,
+            program_write_offset: self.program_write_offset,
+            descriptor_write_offset: self.descriptor_write_offset,
+            float_uniform_index: self.float_uniform_index,
+            float_uniform_component: self.float_uniform_component,
+            float_uniform_wide: self.float_uniform_wide,
+            float_uniform_staging: self.float_uniform_staging,
+            decoded: self.decoded.clone(),
+            decoded_before: HashMap::new(),
+        }
+    }
+
+    /// whether the unit shades as other does: the same program from the
+    /// same entry point, with the same uniforms, NaNs included.
+    pub fn runs_like(&self, other: &ShaderUnit) -> bool {
+        self.entry_point == other.entry_point
+            && self.bool_uniforms == other.bool_uniforms
+            && self.int_uniforms == other.int_uniforms
+            && self.fingerprint() == other.fingerprint()
+            && self.float_uniforms.iter().zip(other.float_uniforms.iter()).all(|(a, b)| a.map(f32::to_bits) == b.map(f32::to_bits))
+    }
+
     /// the input registers the program reads, one bit each, all of them
     /// until it is prepared.
     pub fn inputs_read(&self) -> u16 {
@@ -1140,12 +1171,21 @@ mod tests {
         outputs
     }
 
-    /// the unit's program compiles, as it has to wherever there is a
-    /// compiler.
-    fn assert_compiled(unit: &ShaderUnit) {
+    /// the unit's program compiles at each tier, as it has to wherever there
+    /// is a compiler, and shades the inputs as one vertex at a time does.
+    #[cfg_attr(not(feature = "jit"), allow(unused_variables))]
+    fn assert_compiled(unit: &ShaderUnit, inputs: &[[Vec4; INPUT_REGISTERS]], single: &[[Vec4; OUTPUT_REGISTERS]]) {
         #[cfg(feature = "jit")]
-        if let Err(error) = jit::compile(unit.decoded.as_ref().expect("a prepared unit"), unit.entry_point) {
-            panic!("the program did not compile, {error}");
+        for tier in [jit::Tier::Quick, jit::Tier::Full] {
+            let program = unit.decoded.as_ref().expect("a prepared unit");
+            let compiled = jit::compile(program, unit.entry_point, tier).unwrap_or_else(|error| panic!("the program did not compile, {error}"));
+            let mut outputs = vec![[ZERO; OUTPUT_REGISTERS]; inputs.len()];
+            let uniforms = batch::Uniforms::new(unit);
+            let (mut blocks, mut forks) = (Vec::new(), Vec::new());
+            jit::run_vertices(&compiled, unit, program, inputs, &mut outputs, |inputs, outputs| {
+                batch::run(unit, &uniforms, program, inputs, outputs, &mut blocks, &mut forks)
+            });
+            assert!(same(&outputs, single), "compiled {tier:?}");
         }
     }
 
@@ -1263,7 +1303,7 @@ mod tests {
                 .collect();
             let single = one_by_one(&unit, &inputs);
             assert!(same(&run_vertices(&unit, &inputs), &single), "program {program:08X?}");
-            assert_compiled(&unit);
+            assert_compiled(&unit, &inputs, &single);
             assert!(same(&batched(&unit, &inputs), &single), "program {program:08X?} batched");
         }
     }
@@ -1346,12 +1386,13 @@ mod tests {
                 .collect();
             let single = one_by_one(&unit, &inputs);
             assert!(same(&run_vertices(&unit, &inputs), &single), "program {program:08X?}");
-            assert_compiled(&unit);
+            assert_compiled(&unit, &inputs, &single);
             assert!(same(&batched(&unit, &inputs), &single), "program {program:08X?} batched");
         }
     }
 
-    /// ifs nested in ifs, on conditions and on booleans, and a call, whose
+    /// ifs nested in ifs, on conditions and on booleans, jumps ahead and
+    /// ifs and elses made of jumps, in loops and in a call too, whose
     /// vertices part ways at every one, come out the same compiled as one
     /// vertex at a time, without a batch going back.
     #[test]
@@ -1359,7 +1400,40 @@ mod tests {
         fn block(random: &mut Random, program: &mut Vec<u32>, depth: u32) {
             let arithmetic = [0x00, 0x01, 0x02, 0x03, 0x08, 0x0B, 0x0C, 0x0D, 0x0E, 0x12, 0x13];
             for _ in 0..1 + random.below(3) {
-                match random.below(if depth < 3 { 5 } else { 3 }) {
+                // loops only where nothing parts around them
+                let choices = match depth {
+                    0 => 8,
+                    1 | 2 => 7,
+                    _ => 3,
+                };
+                match random.below(choices) {
+                    7 => {
+                        // a loop over a block, whose jumps may land at its end
+                        let at = program.len();
+                        program.push(0);
+                        block(random, program, depth + 1);
+                        program[at] = (0x29 << 26) | (((program.len() - 1) as u32) << 10);
+                    }
+                    5 | 6 => {
+                        // a jump ahead over a block, or over the block that
+                        // is an else, the one before it, the then, ending in
+                        // a jump on a boolean over it
+                        let at = program.len();
+                        program.push(0);
+                        block(random, program, depth + 1);
+                        let lands = match random.below(2) {
+                            0 => program.len() as u32,
+                            _ => {
+                                let jump = program.len();
+                                program.push(0);
+                                let otherwise = program.len() as u32;
+                                block(random, program, depth + 1);
+                                program[jump] = (0x2D << 26) | (random.below(16) << 22) | ((program.len() as u32) << 10) | random.below(2);
+                                otherwise
+                            }
+                        };
+                        program[at] = (0x2C << 26) | (random.below(4) << 24) | (random.below(4) << 22) | (lands << 10);
+                    }
                     0 | 1 => {
                         let op = arithmetic[random.below(arithmetic.len() as u32) as usize];
                         let (destination, wide, narrow) = (random.below(32), random.below(0x80), random.below(0x20));
@@ -1397,6 +1471,7 @@ mod tests {
                 *descriptor = (random.next() & 0x7FFF_FFF0) | (random.below(15) + 1);
             }
             unit.bool_uniforms = random.next() as u16;
+            unit.int_uniforms[0] = [random.below(3) as u8, 0, 1, 0];
             // the address registers and conditions from the inputs first
             let mut program = vec![(0x12 << 26) | (random.below(16) << 12) | random.below(32)];
             block(&mut random, &mut program, 0);
@@ -1406,7 +1481,7 @@ mod tests {
             block(&mut random, &mut program, 2);
             program.push(0x22 << 26);
             let routine = program.len() as u32;
-            block(&mut random, &mut program, 3);
+            block(&mut random, &mut program, 1);
             let count = program.len() as u32 - routine;
             program[call] = (0x25 << 26) | (random.below(4) << 24) | (random.below(4) << 22) | (routine << 10) | count;
             for (i, &word) in program.iter().enumerate() {
@@ -1556,6 +1631,30 @@ mod tests {
         assert!(same(&outputs, &one_by_one(&unit, &inputs)));
     }
 
+    /// zero times infinity is zero compiled as in the interpreter, without
+    /// the batch going back.
+    #[test]
+    fn zero_times_infinity_stays_compiled() {
+        // mul o0, c0, v0, then dp4 o1, c0, v0
+        let mul = (0x08 << 26) | (0x20 << 12);
+        let dp4 = (0x02 << 26) | (0x01 << 21) | (0x20 << 12);
+        let mut unit = unit_with(&[mul, dp4, 0x22 << 26], &[IDENTITY]);
+        unit.float_uniforms[0] = [f32::INFINITY, 0.0, f32::NEG_INFINITY, 2.0];
+        unit.prepare();
+        let inputs: Vec<[Vec4; INPUT_REGISTERS]> = (0..8)
+            .map(|i| {
+                let mut input = [ZERO; INPUT_REGISTERS];
+                input[0] = [0.0, f32::INFINITY, -0.0, i as f32];
+                input
+            })
+            .collect();
+        let outputs = run_vertices(&unit, &inputs);
+        assert!(same(&outputs, &one_by_one(&unit, &inputs)));
+        assert_eq!(outputs[3][0], [0.0, 0.0, 0.0, 6.0]);
+        #[cfg(feature = "jit")]
+        assert_eq!(jit::compiled(&unit, unit.decoded.as_ref().expect("prepared")).expect("compiled").returned(), 0);
+    }
+
     /// a loop adds up the uniforms its counter walks over.
     #[test]
     fn a_loop_walks_uniforms_the_same_way() {
@@ -1638,8 +1737,23 @@ mod tests {
         let mut unit = unit_with(&[0x2C << 26], &[IDENTITY]);
         unit.prepare();
         let inputs = vec![[[1.0; 4]; INPUT_REGISTERS]; 4];
-        assert_compiled(&unit);
-        assert!(same(&run_vertices(&unit, &inputs), &one_by_one(&unit, &inputs)));
+        let single = one_by_one(&unit, &inputs);
+        assert_compiled(&unit, &inputs, &single);
+        assert!(same(&run_vertices(&unit, &inputs), &single));
+    }
+
+    /// a break outside any loop leaves the call that came to it and goes on
+    /// after itself, before that call, forever, and stops compiled where the
+    /// interpreter stops it.
+    #[test]
+    fn a_break_outside_a_loop_stops_the_same_compiled() {
+        // break, then call 0 for one instruction
+        let mut unit = unit_with(&[0x20 << 26, (0x24 << 26) | 1], &[IDENTITY]);
+        unit.prepare();
+        let inputs = vec![[[1.0; 4]; INPUT_REGISTERS]; 4];
+        let single = one_by_one(&unit, &inputs);
+        assert_compiled(&unit, &inputs, &single);
+        assert!(same(&run_vertices(&unit, &inputs), &single));
     }
 
     /// a program calling itself goes too deep to compile, and the batches
@@ -1650,7 +1764,9 @@ mod tests {
         let mut unit = unit_with(&[(0x24 << 26) | 1, 0x22 << 26], &[IDENTITY]);
         unit.prepare();
         #[cfg(feature = "jit")]
-        assert!(jit::compile(unit.decoded.as_ref().expect("prepared"), 0).is_err());
+        for tier in [jit::Tier::Quick, jit::Tier::Full] {
+            assert!(jit::compile(unit.decoded.as_ref().expect("prepared"), 0, tier).is_err());
+        }
         let inputs = vec![[[1.0; 4]; INPUT_REGISTERS]; 4];
         assert!(same(&run_vertices(&unit, &inputs), &one_by_one(&unit, &inputs)));
     }

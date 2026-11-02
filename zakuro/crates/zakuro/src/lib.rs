@@ -41,11 +41,35 @@ use present::Backend;
 use recompile::{Job, Stage, Toolchain};
 use settings::{CameraSource, Renderer, Screens, Settings};
 
+pub use zakuro_core::memory::Memory;
 pub use zakuro_core::recompiled::Linked;
+
+/// what a program built on Zakuro shows over its game, worked out from the
+/// game's memory: a line kept in a corner, and a notice shown for a moment.
+/// a recompiled game can show what the game keeps hidden this way, its
+/// alignment, a timer, without drawing into the game's own screens.
+pub trait GameOverlay {
+    /// called after each frame the game runs, with its memory.
+    fn frame(&mut self, memory: &mut Memory) -> OverlayText;
+}
+
+/// what a GameOverlay shows after a frame.
+#[derive(Default, Clone, Debug, PartialEq, Eq)]
+pub struct OverlayText {
+    /// a line in the bottom right corner while it is some.
+    pub corner: Option<String>,
+    /// a notice at the top for a moment, as a saved state's.
+    pub notice: Option<String>,
+}
 
 /// runs the emulator as the command line says, on recompiled code linked
 /// into the program when there is some.
 pub fn run(linked: Option<Linked>) {
+    run_with(linked, None)
+}
+
+/// runs the emulator as run does, with an overlay over the game.
+pub fn run_with(linked: Option<Linked>, overlay: Option<Box<dyn GameOverlay>>) {
     report::init();
 
     let options = match cli::parse() {
@@ -92,6 +116,8 @@ pub fn run(linked: Option<Linked>) {
         options,
         settings,
         linked,
+        overlay,
+        overlay_corner: None,
         library: Library::new(data_dir.clone()),
         data_dir,
         game: None,
@@ -433,6 +459,10 @@ struct App {
     options: cli::Options,
     settings: Settings,
     linked: Option<Linked>,
+    /// what the program built on Zakuro shows over the game, and the line it
+    /// keeps in the corner now.
+    overlay: Option<Box<dyn GameOverlay>>,
+    overlay_corner: Option<String>,
     data_dir: Option<PathBuf>,
     game: Option<Running>,
     library: Library,
@@ -608,6 +638,10 @@ struct Away {
 fn leave(pause: bool, already_paused: bool, aim: Option<AimMode>, recapture: bool) -> Away {
     Away { paused: pause && !already_paused, aim: aim.filter(|_| recapture) }
 }
+/// what the player is told when the 3D can't be drawn on the GPU.
+const GPU_FALLBACK: &str = "The 3D can't be drawn on the GPU, as Vulkan isn't working on this computer, so it's drawn in software. \
+Games run much slower that way, and texture packs are left out. Updating the graphics driver usually fixes it; the log says \
+what went wrong. To draw in software without this message, turn off \"Draw the 3D on the GPU\" in Settings, Graphics.";
 
 impl ApplicationHandler for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
@@ -807,8 +841,10 @@ impl App {
 
     /// starts the game at path, in place of any other.
     fn play(&mut self, path: &Path) -> Result<(), String> {
-        // the old game and what it holds on the GPU go first, its sound too
+        // the old game and what it holds on the GPU go first, its sound too,
+        // and the overlay's line about it
         self.game = None;
+        self.overlay_corner = None;
         if let Some(audio) = &self.audio {
             audio.clear();
         }
@@ -822,6 +858,12 @@ impl App {
             config.update = game.update.as_ref().map(|update| update.path.clone());
             config.dlc = game.dlc.iter().map(|dlc| dlc.path.clone()).collect();
             config.dlp_child = game.dlp_child.as_ref().map(|child| child.path.clone());
+        } else if let Some((update, dlc, dlp_child)) = library::addons_beside(path) {
+            // one from the command line starts before the library's scan is
+            // in, or isn't in its folder: what's next to it goes with it
+            config.update = update.map(|update| update.path);
+            config.dlc = dlc.into_iter().map(|dlc| dlc.path).collect();
+            config.dlp_child = dlp_child.map(|child| child.path);
         }
         // a recording starts the clock at a known time, for playing it back
         let record = std::env::var_os("ZAKURO_RECORD").map(PathBuf::from);
@@ -847,6 +889,9 @@ impl App {
             let side = library::ICON_SIZE as u32;
             window.set_window_icon(smdh.as_ref().and_then(|smdh| winit::window::Icon::from_rgba(smdh.icon.clone(), side, side).ok()));
         }
+        // the settings ask for the 3D on the GPU, but Vulkan didn't start:
+        // only the log said so, while the game ran slowly
+        let in_software = system.config.hardware_renderer && !system.gpu.draws_on_gpu();
         let name = self
             .library
             .games
@@ -867,11 +912,21 @@ impl App {
                 Err(error) => log::warn!("could not record to {}, {error}", record.display()),
             }
         }
-        if outdated {
-            self.menus.message = Some(format!(
-                "{} was recompiled by an older version of Zakuro. Recompile it again from the library to get the newest improvements.",
-                game.name
-            ));
+        // both can be so, and the GPU's is what explains a slow game
+        let notes: Vec<String> = [
+            in_software.then(|| GPU_FALLBACK.to_owned()),
+            outdated.then(|| {
+                format!(
+                    "{} was recompiled by an older version of Zakuro. Recompile it again from the library to get the newest improvements.",
+                    game.name
+                )
+            }),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        if !notes.is_empty() {
+            self.menus.message = Some(notes.join("\n\n"));
         }
         self.game = Some(game);
         // a game starts out of play, so the automatic layout shows its menus
@@ -904,6 +959,7 @@ impl App {
         if let Some(window) = &self.window {
             window.set_window_icon(None);
         }
+        self.overlay_corner = None;
         if let Some(room) = &self.room {
             room.playing("");
         }
@@ -1676,6 +1732,16 @@ impl App {
                 warm::page_faults() - faults
             );
         }
+        // the overlay reads the game the program was built on, not another
+        // one its library opened
+        let ours = self.linked.as_ref().is_none_or(|linked| game.system.title.as_ref().is_some_and(|title| title.program_id() == linked.program_id()));
+        if let Some(overlay) = self.overlay.as_mut().filter(|_| ours) {
+            let text = overlay.frame(&mut game.system.memory);
+            self.overlay_corner = text.corner;
+            if let Some(notice) = text.notice {
+                self.menus.toast = Some((notice, Instant::now()));
+            }
+        }
         game.count_frame();
         let sound = game.system.take_audio();
         // fast forward plays no sound, there is too much of it too soon
@@ -1862,6 +1928,9 @@ impl App {
                 log::info!("loaded the state from {}", path.display());
                 self.menus.toast = Some((format!("Loaded slot {slot}"), Instant::now()));
                 self.menus.menu_open = false;
+                // the overlay's line was about the memory before, the next
+                // frame gives the one about the state
+                self.overlay_corner = None;
                 if let Some(audio) = &self.audio {
                     audio.clear();
                 }
@@ -1929,6 +1998,7 @@ impl App {
             None => "1",
         };
         let warming = self.game.as_ref().and(warm::progress());
+        let corner = self.overlay_corner.clone().filter(|_| game.is_some());
         let (menus, library, settings, jobs) = (&mut self.menus, &self.library, &mut self.settings, &self.jobs);
         let mut actions = Vec::new();
         let overlay = gui.frame(window, |ui| {
@@ -1954,7 +2024,10 @@ impl App {
             }
             match &game {
                 Some((name, fps, recompiled)) => {
-                    actions.extend(menus.game(ui, name, show_fps.then_some(*fps), *recompiled, fast, jobs, saved.as_deref()))
+                    actions.extend(menus.game(ui, name, show_fps.then_some(*fps), *recompiled, fast, jobs, saved.as_deref()));
+                    if let Some(text) = &corner {
+                        menus::corner(ui.ctx(), text);
+                    }
                 }
                 None => actions.extend(menus.library(ui, library, settings, jobs)),
             }
