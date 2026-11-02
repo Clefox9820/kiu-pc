@@ -232,6 +232,12 @@ pub fn load(path: impl AsRef<std::path::Path>, mut config: Config) -> Result<Sys
             system.gpu.set_texture_pack(Some(std::sync::Arc::new(pack)));
         }
     }
+    if system.config.upscale_textures {
+        match system.gpu.set_texture_upscale(true) {
+            true => log::info!("small textures drawn twice as big by Anime4K"),
+            false => log::warn!("Anime4K's textures take the 3D drawn on the GPU, they are left out"),
+        }
+    }
 
     system.title = Some(title);
     Ok(system)

@@ -812,6 +812,7 @@ impl App {
             find_recompiled: !interpret,
             hardware_renderer: self.options.hardware_rasterizer.unwrap_or(self.settings.hardware_rasterizer),
             texture_packs: self.settings.texture_packs,
+            upscale_textures: self.settings.upscale_textures,
             interpolate: self.settings.frame_interpolation,
             enhancements: self
                 .settings

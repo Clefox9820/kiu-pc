@@ -58,6 +58,9 @@ pub struct Config {
     /// draw the pictures of the texture pack in the title's mods folder in
     /// place of its textures, which takes the host's GPU.
     pub texture_packs: bool,
+    /// draw a title's small textures, its HUD's, menus' and portraits',
+    /// made twice as big by Anime4K, which takes the host's GPU.
+    pub upscale_textures: bool,
     /// the title's update, an update's CIA, whose code and data it runs.
     pub update: Option<std::path::PathBuf>,
     /// the title's downloadable content, DLC CIAs.
@@ -107,6 +110,7 @@ impl Default for Config {
             data_dir: None,
             hardware_renderer: false,
             texture_packs: true,
+            upscale_textures: false,
             update: None,
             dlc: Vec::new(),
             enhancements: std::collections::BTreeMap::new(),

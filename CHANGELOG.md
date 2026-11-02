@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Added **Sharp HUD** (off by default): small pictures, the HUD's, menus'
+  and portraits', remade twice as big by Anime4K inside the game, with no
+  separate program, download or cache.
 - Removed the AI option "HD HUD, menus and portraits" (Real-ESRGAN):
   `scripts\setup.ps1` no longer downloads it and `Play.bat` no longer sets
   `ZAKURO_UPSCALER`. A `cache\hd` folder an earlier build left in the data

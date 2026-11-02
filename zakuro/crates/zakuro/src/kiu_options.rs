@@ -94,6 +94,9 @@ fn picture(ui: &mut Ui, settings: &mut Settings) {
         row(ui, "Resolution", "How many times the console's resolution the 3D is drawn at. It changes with Reset or the next start.", |ui| {
             ui.add_enabled(gpu, egui::Slider::new(&mut settings.resolution, 1..=8).suffix("x"))
         });
+        row(ui, "Sharp HUD", "The HUD's, menus' and portraits' pictures remade twice as big by Anime4K the first time each shows. It changes with Reset or the next start.", |ui| {
+            ui.add_enabled(gpu, egui::Checkbox::without_text(&mut settings.upscale_textures))
+        });
         let interpolates = gpu && settings.renderer == Renderer::Vulkan;
         row(ui, "Smoother motion", "A picture drawn between each two of the game's 30 a second, so it moves at 60. It shows a 60th of a second late.", |ui| {
             ui.add_enabled(interpolates, egui::Checkbox::without_text(&mut settings.frame_interpolation))

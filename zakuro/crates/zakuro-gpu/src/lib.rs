@@ -1,5 +1,6 @@
 //! PICA200 GPU emulation.
 
+pub mod anime4k;
 pub mod backend;
 pub mod blend;
 #[cfg(feature = "vulkan")]
@@ -709,6 +710,16 @@ impl Gpu {
         let drawn = pack.is_some();
         self.resources.textures.set_pack(pack);
         drawn
+    }
+
+    /// has the small textures no pack replaces, a HUD's, menus' and
+    /// portraits', drawn from Anime4K's pictures of them twice as big, see
+    /// anime4k, or not. only the host's GPU draws them, so it waits for
+    /// enable_hardware_renderer, and says whether they are drawn.
+    pub fn set_texture_upscale(&mut self, upscale: bool) -> bool {
+        let upscale = upscale && self.draws_on_gpu() && anime4k::network().is_some();
+        self.resources.textures.set_upscale(upscale);
+        upscale
     }
 
     /// whether the 3D is drawn on the host's GPU, enable_hardware_renderer

@@ -39,6 +39,9 @@ pub struct Material {
     /// whether the rows are stored from the bottom up, so they get turned
     /// over on reading.
     flipped: bool,
+    /// the texels of a texture, width by height, it is made from by
+    /// Anime4K instead of being read from path, see Material::upscaled.
+    upscaled: Option<(Arc<[[u8; 4]]>, u32, u32)>,
     state: Mutex<State>,
 }
 
@@ -107,6 +110,7 @@ impl Pack {
                             hash,
                             path: path.clone(),
                             flipped: !config.upright,
+                            upscaled: None,
                             state: Mutex::new(State::OnDisk),
                         }));
                     }
@@ -150,7 +154,14 @@ impl Material {
     /// the picture in the PNG at path, its rows from the top, told apart
     /// from every other picture by hash.
     pub fn file(hash: u64, path: PathBuf) -> Material {
-        Material { hash, path, flipped: false, state: Mutex::new(State::OnDisk) }
+        Material { hash, path, flipped: false, upscaled: None, state: Mutex::new(State::OnDisk) }
+    }
+
+    /// the picture Anime4K makes of a texture's texels, width by height,
+    /// twice as big, made like a pack's picture is read: off the game's
+    /// thread when it is first drawn, and again after the GPU let go of it.
+    pub fn upscaled(hash: u64, texels: Arc<[[u8; 4]]>, width: u32, height: u32) -> Material {
+        Material { hash, path: PathBuf::new(), flipped: false, upscaled: Some((texels, width, height)), state: Mutex::new(State::OnDisk) }
     }
 
     /// the hash of the textures it replaces, which tells its pictures apart.
@@ -185,7 +196,13 @@ impl Material {
     }
 
     fn read(&self, kept: u32) {
-        let read = read_png(&self.path, self.flipped, kept);
+        let read = match &self.upscaled {
+            Some((texels, width, height)) => match crate::anime4k::network() {
+                Some(network) => Ok(picture(crate::anime4k::upscale(network, texels, *width, *height), width * 2, height * 2, kept)),
+                None => Err("Anime4K's network could not be read".to_owned()),
+            },
+            None => read_png(&self.path, self.flipped, kept),
+        };
         let mut state = self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         *state = match (&*state, read) {
             (State::Broken, _) => return,
@@ -916,7 +933,7 @@ mod tests {
         let format = TextureFormat::Rgba8;
         let bytes = hash(Hashing::Bytes, &data, format, 8, 8, &mut rows).unwrap();
         let laid_out = hash(Hashing::Rows, &data, format, 8, 8, &mut rows).unwrap();
-        let material = |hash| Arc::new(Material { hash, path: PathBuf::new(), flipped: false, state: Mutex::new(State::OnDisk) });
+        let material = |hash| Arc::new(Material { hash, path: PathBuf::new(), flipped: false, upscaled: None, state: Mutex::new(State::OnDisk) });
         for hashing in [Hashing::Bytes, Hashing::Rows] {
             for named in [bytes, laid_out] {
                 let pack = Pack { hashing, materials: HashMap::from([(named, material(named))]) };
@@ -931,7 +948,7 @@ mod tests {
     fn a_picture_let_go_of_while_read_is_not_kept() {
         let path = std::env::temp_dir().join(format!("zakuro-material-{}.png", std::process::id()));
         write_png(&path, 1, 1, &[1, 2, 3, 255]);
-        let material = Material { hash: 1, path: path.clone(), flipped: false, state: Mutex::new(State::Reading { wanted: true }) };
+        let material = Material { hash: 1, path: path.clone(), flipped: false, upscaled: None, state: Mutex::new(State::Reading { wanted: true }) };
         material.release();
         material.read(4096);
         assert!(matches!(*material.state.lock().unwrap(), State::OnDisk));

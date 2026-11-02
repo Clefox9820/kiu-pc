@@ -300,6 +300,13 @@ Tools used to work on it:
   or interlaced 3D gets EASU alone. Checked in a flight and a land battle,
   drawn at 1x in 2x and 3x windows on a Ryzen 5 5600G: smooth, sharp edges
   where Smooth shows stairs, at frame times within 0.5 ms of Smooth's.
+- **Sharp HUD** (off by default) remakes the game's small pictures, the
+  HUD's, menus' and portraits', twice as big with Anime4K's CNN x2 VL
+  (bloc97/Anime4K, MIT), run on the CPU off the game's thread the first
+  time each picture shows; meanwhile it shows as before. Colors and alpha
+  both go through the network, so letters and icon outlines sharpen too.
+  Nothing is downloaded or kept on disk. A 256x256 picture takes about
+  40 ms. It takes the 3D drawn on the GPU and applies on the next start.
   Long play was not checked.
 - Sound: the console's 32.7 kHz output reaches your device's rate through
   a windowed-sinc filter, voices the game plays at another pitch follow a

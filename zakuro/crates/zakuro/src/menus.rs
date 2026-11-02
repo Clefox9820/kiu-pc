@@ -700,6 +700,8 @@ impl Menus {
                 .on_hover_text("How many times the console's resolution the 3D is drawn at. Past what the window shows, the extra pixels smooth the edges, at a cost to the GPU that grows fast.");
                 ui.add_enabled(settings.hardware_rasterizer, egui::Checkbox::new(&mut settings.texture_packs, "Texture packs"))
                     .on_hover_text("Draw a game's texture pack, made for Citra or Azahar, put in the textures folder of the game's mods folder.");
+                ui.add_enabled(settings.hardware_rasterizer, egui::Checkbox::new(&mut settings.upscale_textures, "Sharp HUD, menus and portraits"))
+                    .on_hover_text("Draw a game's small pictures, its HUD's, menus' and portraits', twice as big, remade by Anime4K the first time each shows, while it shows as before. Takes effect when a game starts.");
                 let interpolates = settings.hardware_rasterizer && settings.renderer == Renderer::Vulkan;
                 ui.add_enabled(interpolates, egui::Checkbox::new(&mut settings.frame_interpolation, "Frame interpolation"))
                     .on_hover_text("A game at 30 frames a second gets a picture drawn in between each two of its own, with everything halfway between where it was in both, so it moves at 60. The screens show a 60th of a second late. It takes the 3D drawn on the GPU and the Vulkan presenter.");
