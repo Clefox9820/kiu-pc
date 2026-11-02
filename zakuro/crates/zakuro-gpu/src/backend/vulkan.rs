@@ -604,27 +604,23 @@ impl VulkanPresenter {
         }
     }
 
-    /// the frame's places, each marked when it is drawn through SMAA, EASU
-    /// and RCAS: a screen the FSR filter draws bigger than its pixels, but
-    /// the top one's two pictures in one for 3D, which keeps to EASU alone.
+    /// the frame's places, each marked with how it is drawn, see through.
     fn mark_sharpened(&self, places: Vec<(Viewport, Shown)>, sizes: &[(u32, u32); 3]) -> Vec<Place> {
         let usable = self.filter == ScreenFilter::Fsr && self.fsr.as_ref().is_some_and(|fsr| !fsr.broken);
         places
             .into_iter()
-            .map(|(viewport, shown)| {
-                let sharpened = usable && shown != Shown::Both && magnified(viewport, sizes[screen_index(shown)]);
-                (viewport, shown, sharpened)
-            })
+            .map(|(viewport, shown)| (viewport, shown, through(usable, shown, viewport, sizes[screen_index(shown)])))
             .collect()
     }
 
-    /// makes what the sharpened places need: SMAA's images for each of
-    /// their screens at its size, and the image they are upscaled into.
+    /// makes what the antialiased places need: SMAA's images for each of
+    /// their screens at its size, and the image the sharpened ones are
+    /// upscaled into.
     fn prepare_fsr(&mut self, places: &[Place], sizes: &[(u32, u32); 3]) -> Result<(), PresentError> {
         let Some(fsr) = &mut self.fsr else { return Ok(()) };
         let mut wanted = [false; 3];
-        for &(_, shown, sharpened) in places {
-            wanted[screen_index(shown)] |= sharpened;
+        for &(_, shown, through) in places {
+            wanted[screen_index(shown)] |= through != Through::Plain;
         }
         for index in 0..3 {
             let size = sizes[index];
@@ -639,7 +635,7 @@ impl VulkanPresenter {
             let smaa = fsr.smaa(&self.device, &self.memory_properties, self.descriptor_pool, self.descriptor_layout, self.sampler, size)?;
             fsr.screens[index] = Some(smaa);
         }
-        if wanted.contains(&true) && fsr.upscaled.is_none() {
+        if places.iter().any(|place| place.2 == Through::Sharpened) && fsr.upscaled.is_none() {
             let target = Target::new(&self.device, &self.memory_properties, fsr.colour_pass, COLOUR_FORMAT, (self.extent.width, self.extent.height))?;
             let set = picture_set(&self.device, self.descriptor_pool, self.descriptor_layout, self.sampler, &[target.texture.view]);
             match set {
@@ -849,9 +845,9 @@ impl VulkanPresenter {
                     Some((self.gpu_sets[self.frame][index], [x, y, width, height, left, top, right, bottom]))
                 }
             });
-            // the FSR filter's screens antialiased and upscaled before the
+            // the FSR filter's screens antialiased, and upscaled before the
             // window's pass sharpens them
-            if let Some(fsr) = self.fsr.as_ref().filter(|_| places.iter().any(|place| place.2)) {
+            if let Some(fsr) = self.fsr.as_ref().filter(|_| places.iter().any(|place| place.2 != Through::Plain)) {
                 fsr.record(device, command_buffer, places, &crops, self.extent);
             }
 
@@ -872,16 +868,25 @@ impl VulkanPresenter {
                     .clear_values(&clear),
                 vk::SubpassContents::INLINE,
             );
-            for &(viewport, shown, sharpened) in places {
-                if sharpened {
+            for &(viewport, shown, through) in places {
+                if through == Through::Sharpened {
                     if let Some(fsr) = &self.fsr {
                         fsr.sharpen(device, command_buffer, viewport, self.extent);
                     }
                     continue;
                 }
-                let Some((descriptor, area)) = crops[screen_index(shown)] else { continue };
+                // a screen through SMAA alone is drawn from SMAA's result,
+                // which holds just the screen, smoothly
+                let antialiased = self.fsr.as_ref().and_then(|fsr| fsr.screens[screen_index(shown)].as_ref()).filter(|_| through == Through::Smaa);
+                let Some((descriptor, area)) = (match antialiased {
+                    Some(smaa) => Some((smaa.result_input, WHOLE)),
+                    None => crops[screen_index(shown)],
+                }) else {
+                    continue;
+                };
+                let filter = if antialiased.is_some() { ScreenFilter::Smooth } else { self.filter };
                 let mut constants: Vec<u8> = area.iter().flat_map(|c| c.to_le_bytes()).collect();
-                constants.extend_from_slice(&self.filter.mode().to_le_bytes());
+                constants.extend_from_slice(&filter.mode().to_le_bytes());
                 let (pipeline, layout, set) = if shown == Shown::Both {
                     // then how the eyes show, and the right eye's place
                     let Some((_, right)) = crops[2] else { continue };
@@ -1001,7 +1006,7 @@ impl Presenter for VulkanPresenter {
         });
         let places = place(self.extent.width, self.extent.height, self.arrangement, self.top_width, self.integer, self.stereo, has_right);
         let mut places = self.mark_sharpened(places, &sizes);
-        if places.iter().any(|place| place.2) {
+        if places.iter().any(|place| place.2 != Through::Plain) {
             if let Err(error) = self.prepare_fsr(&places, &sizes) {
                 // the fence was reset, so the frame is drawn anyway, with
                 // EASU alone from now on
@@ -1010,7 +1015,7 @@ impl Presenter for VulkanPresenter {
                     fsr.broken = true;
                 }
                 for place in &mut places {
-                    place.2 = false;
+                    place.2 = Through::Plain;
                 }
             }
         }
@@ -1700,7 +1705,32 @@ impl Screen {
 
 /// where a screen goes in the window, which picture it shows, and whether
 /// the FSR filter antialiases and sharpens it there.
-type Place = (Viewport, Shown, bool);
+type Place = (Viewport, Shown, Through);
+
+/// how a place's screen goes onto the window.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Through {
+    /// as it is, through the present shader's filter
+    Plain,
+    /// through SMAA, then drawn as it is
+    Smaa,
+    /// through SMAA, EASU into the window's size, then RCAS
+    Sharpened,
+}
+
+/// how the FSR filter, when `fsr` it is on and works, draws a screen of
+/// `size` pixels into `viewport`: antialiased at any size, upscaled and
+/// sharpened as well when it is drawn bigger. the top screen's two pictures
+/// in one for 3D keep to the shader's EASU alone.
+fn through(fsr: bool, shown: Shown, viewport: Viewport, size: (u32, u32)) -> Through {
+    if !fsr || shown == Shown::Both || size.0 == 0 || size.1 == 0 {
+        Through::Plain
+    } else if magnified(viewport, size) {
+        Through::Sharpened
+    } else {
+        Through::Smaa
+    }
+}
 
 /// a pipeline and its layout.
 type Pipeline = (vk::PipelineLayout, vk::Pipeline);
@@ -2025,7 +2055,7 @@ impl Fsr {
         }
     }
 
-    /// records SMAA's passes over each sharpened place's screen, once
+    /// records SMAA's passes over each antialiased place's screen, once
     /// however many places show it, then EASU's of every sharpened place
     /// into the upscaled image, in the window's places.
     fn record(
@@ -2036,11 +2066,10 @@ impl Fsr {
         crops: &[Option<(vk::DescriptorSet, [f32; 8])>; 3],
         extent: vk::Extent2D,
     ) {
-        let Some((upscaled, _)) = &self.upscaled else { return };
         let mut done = [false; 3];
-        for &(_, shown, sharpened) in places {
+        for &(_, shown, through) in places {
             let index = screen_index(shown);
-            if !sharpened || std::mem::replace(&mut done[index], true) {
+            if through == Through::Plain || std::mem::replace(&mut done[index], true) {
                 continue;
             }
             let (Some(smaa), Some((source, area))) = (&self.screens[index], crops[index]) else { continue };
@@ -2070,13 +2099,14 @@ impl Fsr {
             }
         }
 
-        // the whole of each antialiased screen, through EASU
+        // the whole of each screen drawn bigger, through EASU
+        let Some((upscaled, _)) = self.upscaled.as_ref().filter(|_| places.iter().any(|place| place.2 == Through::Sharpened)) else { return };
         let mut constants = float_bytes(&WHOLE);
         constants.extend_from_slice(&ScreenFilter::Fsr.mode().to_le_bytes());
         let (layout, pipeline) = self.easu;
         begin_pass(device, command_buffer, self.colour_pass, upscaled.framebuffer, extent);
-        for &(viewport, shown, sharpened) in places {
-            let Some(smaa) = self.screens[screen_index(shown)].as_ref().filter(|_| sharpened) else { continue };
+        for &(viewport, shown, through) in places {
+            let Some(smaa) = self.screens[screen_index(shown)].as_ref().filter(|_| through == Through::Sharpened) else { continue };
             set_viewport(device, command_buffer, viewport, extent);
             unsafe {
                 device.cmd_bind_pipeline(command_buffer, vk::PipelineBindPoint::GRAPHICS, pipeline);
@@ -2330,6 +2360,21 @@ mod tests {
         assert!(!magnified(viewport(1120.0, 672.0), (0, 0)), "nothing to draw");
     }
 
+    /// the FSR filter antialiases a screen however big it is drawn, and
+    /// upscales and sharpens it only when it is drawn bigger; the top
+    /// screen's two pictures in one for 3D, and the other filters, draw as
+    /// they are.
+    #[test]
+    fn the_fsr_filter_antialiases_a_screen_at_any_size() {
+        let viewport = |width, height| Viewport { x: 0.0, y: 0.0, width, height };
+        assert_eq!(through(true, Shown::Top, viewport(1200.0, 720.0), (800, 480)), Through::Sharpened);
+        assert_eq!(through(true, Shown::Top, viewport(1200.0, 720.0), (1200, 720)), Through::Smaa, "1:1");
+        assert_eq!(through(true, Shown::Bottom, viewport(800.0, 480.0), (1200, 720)), Through::Smaa, "shrunk");
+        assert_eq!(through(true, Shown::Both, viewport(1200.0, 720.0), (800, 480)), Through::Plain, "3D");
+        assert_eq!(through(false, Shown::Top, viewport(1200.0, 720.0), (800, 480)), Through::Plain, "another filter");
+        assert_eq!(through(true, Shown::Top, viewport(1200.0, 720.0), (0, 0)), Through::Plain, "nothing to draw");
+    }
+
     #[test]
     fn the_pixels_covered_are_those_whose_centres_the_viewport_holds() {
         let extent = vk::Extent2D { width: 1280, height: 720 };
@@ -2491,7 +2536,7 @@ mod tests {
         let window = Target::new(device, &memory_properties, window_pass, COLOUR_FORMAT, (extent.width, extent.height)).unwrap();
         let viewport = Viewport { x: 0.0, y: 0.0, width: extent.width as f32, height: extent.height as f32 };
         assert!(magnified(viewport, (width, height)));
-        let places = [(viewport, Shown::Top, true)];
+        let places = [(viewport, Shown::Top, Through::Sharpened)];
         let crops = [Some((screen_set, WHOLE)), None, None];
         run(&shared, pool, |command_buffer| {
             fsr.record(device, command_buffer, &places, &crops, extent);
