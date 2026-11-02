@@ -1796,6 +1796,10 @@ pub(crate) struct Portraits {
     shake: (f32, f32),
     /// whether the bottom screen shows a retro scene this frame, see RETRO.
     retro: bool,
+    /// the retro scene's draws the bottom screen made this frame, and the
+    /// last ones taken with how much of them shows, fading in and out.
+    retro_draws: Vec<PortraitDraw>,
+    retro_shown: Option<Faded>,
 }
 
 /// a line of text in the title's 512x128 text buffer, in its pixels, rows
@@ -2254,6 +2258,21 @@ const ISLANDS: [Island; 2] = [
 /// on the left portrait's head, 144 down, so it shows who speaks.
 const RETRO: Island = Island { from: [0.0, 56.0, 320.0, 184.0], to: [0.0, 144.0 - 128.0 * 0.6], scale: 0.6 };
 
+/// how much of the retro scene shows at most on the top screen, so the
+/// scene behind it shows through a little, and how much more or less of it
+/// each frame as it fades in and out.
+const RETRO_ALPHA: f32 = 0.85;
+const RETRO_STEP: f32 = 1.0 / 8.0;
+
+/// how much of the retro scene shows the frame after one with alpha of it,
+/// whether the game drew it this frame or not.
+fn retro_alpha(alpha: f32, drawn: bool) -> f32 {
+    match drawn {
+        true => (alpha + RETRO_STEP).min(RETRO_ALPHA),
+        false => (alpha - RETRO_STEP).max(0.0),
+    }
+}
+
 /// a draw of the retro scene's picture, see RETRO.
 // ponytail: matched by its shape alone, as is_portrait is
 fn is_retro(registers: &[u32]) -> bool {
@@ -2279,8 +2298,8 @@ fn mirror_hud(registers: &[u32], resources: &mut Resources, vertices: Vertices) 
     };
     // the retro scene's picture and what is drawn over it, once it is there
     resources.portraits.retro |= is_retro(registers) && inside(&&RETRO);
-    let retro = Some(&RETRO).filter(|_| resources.portraits.retro).filter(inside);
-    let Some(island) = retro.or_else(|| ISLANDS.iter().find(inside)) else {
+    let in_retro = resources.portraits.retro && inside(&&RETRO);
+    let Some(island) = (if in_retro { Some(&RETRO) } else { ISLANDS.iter().find(inside) }) else {
         return;
     };
     // the island's top left on the bottom screen lands on its place on the
@@ -2304,7 +2323,11 @@ fn mirror_hud(registers: &[u32], resources: &mut Resources, vertices: Vertices) 
     }
     let mut registers = onto_top(registers, top, 1.0, 0.0, 0.0);
     registers[REG_VIEWPORT_HEIGHT] = float24(200.0);
-    resources.portraits.hud.push(PortraitDraw { registers, vertices });
+    let draw = PortraitDraw { registers, vertices };
+    match in_retro {
+        true => resources.portraits.retro_draws.push(draw),
+        false => resources.portraits.hud.push(draw),
+    }
 }
 
 /// draws the portraits the bottom screen took last frame into the top
@@ -2365,8 +2388,24 @@ fn draw_portraits<M: GpuMemory>(memory: &mut M, resources: &mut Resources) -> bo
     resources.portraits.sides = sides;
     // the battle display as the bottom screen had it, no fading, it is
     // there whenever the game draws it
-    let hud = std::mem::take(&mut resources.portraits.hud);
+    // the retro scene, fading in and out, partly see-through
     resources.portraits.retro = false;
+    let incoming = std::mem::take(&mut resources.portraits.retro_draws);
+    let mut retro = resources.portraits.retro_shown.take();
+    let alpha = retro_alpha(retro.as_ref().map_or(0.0, |shown| shown.alpha), !incoming.is_empty());
+    match (incoming.is_empty(), &mut retro) {
+        (false, _) => retro = Some(Faded { draws: incoming, alpha }),
+        (true, Some(shown)) => shown.alpha = alpha,
+        (true, None) => {}
+    }
+    if let Some(shown) = retro.as_ref().filter(|shown| shown.alpha > 0.0) {
+        for draw in &shown.draws {
+            draw_faded(memory, resources, draw, shown.alpha);
+            drew = true;
+        }
+    }
+    resources.portraits.retro_shown = retro.filter(|shown| shown.alpha > 0.0);
+    let hud = std::mem::take(&mut resources.portraits.hud);
     for mut draw in hud {
         // shaking with the top screen's HUD, as when Pit is hit
         shake(&mut draw.vertices, resources.portraits.shake);
@@ -9565,16 +9604,39 @@ mod tests {
         let label = quad((0.25, 0.4167), (-0.4375, 0.3125), RED);
         // a draw there with no retro picture under it stays below
         mirror_hud(&textured(128, 64, 3), &mut resources, Vertices::Shaded(&label));
-        assert!(resources.portraits.hud.is_empty(), "nothing taken without the retro picture");
+        assert!(resources.portraits.hud.is_empty() && resources.portraits.retro_draws.is_empty(), "nothing taken without the retro picture");
         mirror_hud(&textured(256, 128, 3), &mut resources, Vertices::Shaded(&band));
         mirror_hud(&textured(128, 64, 2), &mut resources, Vertices::Shaded(&label));
-        let [picture, _label] = &resources.portraits.hud[..] else { panic!("the picture and the label taken") };
+        assert!(resources.portraits.hud.is_empty(), "apart from the battle display, to fade");
+        let [picture, _label] = &resources.portraits.retro_draws[..] else { panic!("the picture and the label taken") };
         // its corner at the band's foot on the right, 320 across and 184
         // down below, lands 192 across and 144 down above, which in the top
         // screen's buffer is 96 up from its bottom edge and 208 left of its
         // right one
         let screen = to_screen(&picture.vertices[0], (0.0, 0.0, 240.0, 400.0)).unwrap();
         assert!((screen.x - 96.0).abs() < 0.1 && (screen.y - 208.0).abs() < 0.1, "at {}, {}", screen.x, screen.y);
+    }
+
+    /// a retro scene fades in over a few frames while the game draws it, up
+    /// to partly see-through, and out again over as many once it stops.
+    #[test]
+    fn a_retro_scene_fades_in_and_out() {
+        let mut alpha = 0.0;
+        let mut frames = 0;
+        while alpha < RETRO_ALPHA {
+            alpha = retro_alpha(alpha, true);
+            frames += 1;
+        }
+        assert_eq!(alpha, RETRO_ALPHA, "it stops there");
+        assert!((5..=10).contains(&frames), "in over {frames} frames");
+        assert!(RETRO_ALPHA < 1.0 && RETRO_ALPHA > 0.5, "partly see-through");
+        assert_eq!(retro_alpha(alpha, true), RETRO_ALPHA, "and stays");
+        let mut frames = 0;
+        while alpha > 0.0 {
+            alpha = retro_alpha(alpha, false);
+            frames += 1;
+        }
+        assert!((5..=10).contains(&frames), "out over {frames} frames");
     }
 
     /// a vertex at x, y of a viewport w by h, with texture coordinates u, v.
