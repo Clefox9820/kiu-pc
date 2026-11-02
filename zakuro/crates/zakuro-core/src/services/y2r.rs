@@ -536,36 +536,43 @@ fn convert_strips<const BYTES: usize>(
 /// smooths where a compressed video's 8 by 8 blocks meet, across and down
 /// a plane of samples width to a row: a seam whose sides are both flat and
 /// whose step is small is a block's edge, not the picture's, and becomes a
-/// ramp over the three samples on each side; any other is left alone.
+/// ramp over the four samples on each side, half a block; any other is
+/// left alone.
 // ponytail: one fixed strength, where a decoder's loop filter would follow
 // the stream's quantiser, which Y2R does not see
 fn deblock(plane: &mut [u8], width: usize, lines: usize) {
     const BLOCK: usize = 8;
-    /// the most a block's edge steps by, and the most its sides vary
-    const STEP: i32 = 24;
-    const FLAT: i32 = 8;
-    fn seam(plane: &mut [u8], at: [usize; 6]) {
+    /// the most a block's edge steps by, and the most its sides vary from
+    /// one sample to the next
+    const STEP: i32 = 32;
+    const FLAT: i32 = 10;
+    /// the samples a seam's ramp runs over, half a block on each side
+    const SPAN: usize = BLOCK;
+    fn seam(plane: &mut [u8], at: [usize; SPAN]) {
         let v = at.map(|i| plane[i] as i32);
-        let flat = (v[0] - v[1]).abs() < FLAT && (v[1] - v[2]).abs() < FLAT && (v[3] - v[4]).abs() < FLAT && (v[4] - v[5]).abs() < FLAT;
-        if !flat || (v[2] - v[3]).abs() >= STEP {
+        let half = SPAN / 2;
+        let flat = v[..half].windows(2).chain(v[half..].windows(2)).all(|pair| (pair[0] - pair[1]).abs() < FLAT);
+        if !flat || (v[half - 1] - v[half]).abs() >= STEP {
             return;
         }
-        for (k, &i) in at.iter().enumerate().take(5).skip(1) {
+        let last = (SPAN - 1) as i32;
+        for (k, &i) in at.iter().enumerate().take(SPAN - 1).skip(1) {
             let k = k as i32;
-            plane[i] = ((v[0] * (5 - k) + v[5] * k + 2) / 5) as u8;
+            plane[i] = ((v[0] * (last - k) + v[SPAN - 1] * k + last / 2) / last) as u8;
         }
     }
     if plane.len() < width * lines {
         return;
     }
+    let offsets = |step: usize| std::array::from_fn::<isize, SPAN, _>(|k| (k as isize - (SPAN / 2) as isize) * step as isize);
     for row in (0..lines).map(|y| y * width) {
-        for x in (BLOCK..width.saturating_sub(2)).step_by(BLOCK) {
-            seam(plane, [row + x - 3, row + x - 2, row + x - 1, row + x, row + x + 1, row + x + 2]);
+        for x in (BLOCK..width.saturating_sub(SPAN / 2 - 1)).step_by(BLOCK) {
+            seam(plane, offsets(1).map(|d| (row + x).wrapping_add_signed(d)));
         }
     }
-    for y in (BLOCK..lines.saturating_sub(2)).step_by(BLOCK) {
+    for y in (BLOCK..lines.saturating_sub(SPAN / 2 - 1)).step_by(BLOCK) {
         for x in 0..width {
-            seam(plane, [-3isize, -2, -1, 0, 1, 2].map(|d| (y as isize + d) as usize * width + x));
+            seam(plane, offsets(width).map(|d| (y * width + x).wrapping_add_signed(d)));
         }
     }
 }
@@ -806,6 +813,13 @@ mod tests {
         assert!(line.windows(2).all(|w| w[0] <= w[1]), "a ramp, {line:?}");
         assert!(line[8] - line[7] < 6, "no step left at the seam, {line:?}");
         assert!(flat.chunks(16).all(|row| row == line), "every row alike");
+        // a bigger step between flat blocks, as a dark scene's are, goes too,
+        // over a wider ramp
+        let mut bigger = plane(100, 128);
+        deblock(&mut bigger, 16, 8);
+        let line = bigger[..16].to_vec();
+        assert!(line.windows(2).all(|w| w[0] <= w[1]) && line[8] - line[7] < 6, "a bigger step smoothed, {line:?}");
+        assert!(line[5] > 100 && line[10] < 128, "over four samples on each side, {line:?}");
         let mut edge = plane(20, 200);
         deblock(&mut edge, 16, 8);
         assert_eq!(edge, plane(20, 200), "a real edge stays");
