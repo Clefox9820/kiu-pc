@@ -1686,22 +1686,27 @@ pub struct Resources {
 /// not as wide as the screen: squeezed across by factor toward the screen's
 /// edge it starts at, for a HUD's pieces along an edge, which keep their
 /// places there and to one another, or else toward its own middle, for
-/// what follows the scene, as markers do. the title's text, which it can
-/// write in several draws of a few letters each, goes toward the screen's
-/// middle instead, so the spaces between the draws shrink with the letters.
+/// what follows the scene, as markers do. a piece beside one squeezed
+/// before goes where that one went, as the pieces of a line of text. the title's text, which it can
+/// draw in several pieces, a few letters each or parts of its text buffer,
+/// goes toward the screen's middle instead, so the spaces between the
+/// pieces shrink with the letters.
 /// none for a draw left as it is.
-/// a 2D draw squeeze_hud kept against an edge this frame, by where it was
-/// across the top screen's 400 and down its height in clip x, and the edge.
+/// a 2D draw squeeze_hud squeezed this frame, by where it was across the
+/// top screen's 400 and down its height in clip x, and where it went toward.
 #[derive(Clone, Copy)]
 pub(crate) struct EdgePiece {
     across: (f32, f32),
     down: (f32, f32),
-    edge: f32,
+    anchor: f32,
 }
 
-/// a piece overlapping one already kept against an edge goes with it,
-/// within this many pixels, as a figure on its badge.
+/// a piece overlapping or beside one already squeezed goes with it, within
+/// this many pixels: a figure on its badge, the next piece of a line.
 const HUD_TOUCH: f32 = 8.0;
+
+/// and one on the same row as it within this many, a few letters.
+const HUD_ROW_GAP: f32 = 32.0;
 
 fn squeeze_hud(vertices: &[Vertex], factor: f32, text: bool, edges: &mut Vec<EdgePiece>) -> Option<Vec<Vertex>> {
     if factor <= 1.0 || vertices.is_empty() || vertices.iter().any(|v| (v.clip[3] - 1.0).abs() > 1e-4) {
@@ -1719,20 +1724,34 @@ fn squeeze_hud(vertices: &[Vertex], factor: f32, text: bool, edges: &mut Vec<Edg
     let down = span(&mut vertices.iter().map(|v| v.clip[0]));
     // down the 240 rows, clip x runs 2 for the lot
     let (reach, reach_down) = (HUD_TOUCH, HUD_TOUCH * 2.0 / 240.0);
+    // or on the same row, a few letters along, as the end of a line past
+    // a number drawn into it
+    let same_row = |piece: &EdgePiece| (down.0 - piece.down.0).abs() < 2.0 / 120.0 && (down.1 - piece.down.1).abs() < 2.0 / 120.0;
     let touching = edges.iter().find(|piece| {
-        left < piece.across.1 + reach && right > piece.across.0 - reach && down.0 < piece.down.1 + reach_down && down.1 > piece.down.0 - reach_down
+        let close = |reach: f32| left < piece.across.1 + reach && right > piece.across.0 - reach;
+        close(reach) && down.0 < piece.down.1 + reach_down && down.1 > piece.down.0 - reach_down || same_row(piece) && close(HUD_ROW_GAP)
     });
-    let edge = if left < 48.0 && right < 200.0 {
-        Some(0.0)
+    // ponytail: markers that overlap go toward the same place too, a
+    // little off theirs; tell them by texture if that shows
+    // a piece at the screen's very edge keeps to it; one beside a piece
+    // squeezed before goes with that one, the end of a line near an edge
+    // too; else one near an edge keeps to that edge
+    let anchor = if left < 1.0 {
+        0.0
+    } else if right > 399.0 {
+        400.0
+    } else if let Some(piece) = touching {
+        piece.anchor
+    } else if left < 48.0 && right < 200.0 {
+        0.0
     } else if right > 352.0 && left > 200.0 {
-        Some(400.0)
+        400.0
+    } else if text {
+        200.0
     } else {
-        touching.map(|piece| piece.edge)
+        (left + right) / 2.0
     };
-    if let Some(edge) = edge {
-        edges.push(EdgePiece { across: (left, right), down, edge });
-    }
-    let anchor = edge.unwrap_or(if text { 200.0 } else { (left + right) / 2.0 });
+    edges.push(EdgePiece { across: (left, right), down, anchor });
     Some(
         vertices
             .iter()
@@ -1784,14 +1803,14 @@ struct TextLine {
     right: f32,
 }
 
-/// a draw of letters from Kid Icarus Uprising's font, an A4 256x256
-/// picture, into its text buffer or straight onto a screen.
-// ponytail: matched by its shape alone, as is_portrait is
-fn is_font(registers: &[u32]) -> bool {
+/// a draw of Kid Icarus Uprising's text: letters from its font, an A4
+/// 256x256 picture, or its 512x128 text buffer the letters went into,
+/// which it shows in more than one piece.
+// ponytail: matched by their shapes alone, as is_portrait is
+fn is_text(registers: &[u32]) -> bool {
     let base = TEXTURE_UNIT_BASES[0];
-    registers[REG_TEXTURE_CONFIG] & 1 != 0
-        && registers[base + 1] == (256 << 16 | 256)
-        && TextureFormat::from_raw(registers[base + 13]) == TextureFormat::A4
+    let font = registers[base + 1] == (256 << 16 | 256) && TextureFormat::from_raw(registers[base + 13]) == TextureFormat::A4;
+    registers[REG_TEXTURE_CONFIG] & 1 != 0 && font || is_subtitle(registers)
 }
 
 /// a draw into Kid Icarus Uprising's 512x128 text buffer, where it writes
@@ -4338,7 +4357,7 @@ fn rasterize<M: GpuMemory>(registers: &[u32], memory: &mut M, resources: &mut Re
         if matches!(vertices, Vertices::Raw { .. }) {
             return None;
         }
-        let text = is_font(registers);
+        let text = is_text(registers);
         squeezed = shaded_in_order(registers, vertices).and_then(|shaded| squeeze_hud(&shaded, resources.top_widening, text, &mut resources.hud_edges));
         match &squeezed {
             Some(squeezed) => Vertices::Shaded(squeezed),
@@ -9257,9 +9276,50 @@ mod tests {
         let (second, end) = span(&squeeze_hud(&piece(190.0, 300.0), factor, true, &mut edges).unwrap());
         assert!(near(second - first, 10.0 / factor), "the space between them, {first} to {second}");
         assert!(near(end, 200.0 + 100.0 / factor), "toward the screen's middle, ending at {end}");
+        // its last piece, short of the right edge, goes with the line too
+        let (last, _) = span(&squeeze_hud(&piece(302.0, 353.0), factor, true, &mut edges).unwrap());
+        assert!(near(last, 200.0 + 102.0 / factor), "the line's last piece, from {last}");
         // text against an edge still keeps to it
         let (left, _) = span(&squeeze_hud(&piece(14.0, 60.0), factor, true, &mut edges).unwrap());
         assert!(near(left, 14.0 / factor), "text along the left edge, from {left}");
+    }
+
+    /// a line the title draws in pieces side by side, as a menu's help
+    /// line from two strips of pre-drawn text, keeps its spacing: a piece
+    /// touching one squeezed before goes toward the same place.
+    #[test]
+    fn pieces_side_by_side_keep_their_spacing_on_a_wider_top_screen() {
+        let across = |v: &Vertex| 200.0 * (1.0 - v.clip[1]);
+        let span = |vertices: &[Vertex]| vertices.iter().map(across).fold((f32::MAX, f32::MIN), |(l, r), x| (l.min(x), r.max(x)));
+        let piece = |left: f32, right: f32| quad((-0.9, -0.8), (1.0 - right / 200.0, 1.0 - left / 200.0), RED);
+        let near = |a: f32, b: f32| (a - b).abs() < 1e-3;
+        let factor = 1.25;
+        let mut edges = Vec::new();
+        let (_, first) = span(&squeeze_hud_plain(&piece(60.0, 200.0), factor, &mut edges).unwrap());
+        let (second, end) = span(&squeeze_hud_plain(&piece(204.0, 320.0), factor, &mut edges).unwrap());
+        assert!(near(second - first, 4.0 / factor), "the space between them, {first} to {second}");
+        // the end of the line, past a number drawn after it, on the same row
+        let (third, _) = span(&squeeze_hud_plain(&piece(340.0, 350.0), factor, &mut edges).unwrap());
+        assert!(near(third - end, 20.0 / factor), "the end of the line, {end} to {third}");
+    }
+
+    /// what squeeze_hud takes for the title's text: letters from its A4
+    /// font, and its 512x128 RGBA8 text buffer, which it shows in more
+    /// than one piece; any other picture is not.
+    #[test]
+    fn text_is_the_font_or_the_text_buffer() {
+        let base = TEXTURE_UNIT_BASES[0];
+        let texture = |width: u32, height: u32, format: u32| {
+            let mut registers = target_registers();
+            registers[REG_TEXTURE_CONFIG] |= 1;
+            registers[base + 1] = width << 16 | height;
+            registers[base + 13] = format;
+            registers
+        };
+        assert!(is_text(&texture(256, 256, 11)), "the font");
+        assert!(is_text(&texture(512, 128, 0)), "the text buffer");
+        assert!(!is_text(&texture(256, 256, 12)), "a portrait");
+        assert!(!is_text(&texture(128, 128, 11)), "another A4 picture");
     }
 
     #[test]
