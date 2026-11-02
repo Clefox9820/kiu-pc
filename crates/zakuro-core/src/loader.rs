@@ -65,9 +65,7 @@ const STACK_TOP: u32 = SHARED_MEMORY_VADDR;
 pub fn load(path: impl AsRef<std::path::Path>, mut config: Config) -> Result<System, LoadError> {
     let mut title = Title::load(path)?;
     log::info!("loaded {}", title.describe());
-    if let Some(update) = &config.update {
-        attach_update(&mut title, update);
-    }
+    let updated = config.update.as_ref().is_some_and(|update| attach_update(&mut title, update));
     crate::mods::lay(&mut title, config.data_dir.as_deref());
     let dlc = load_dlc(&title, &config.dlc);
 
@@ -152,8 +150,20 @@ pub fn load(path: impl AsRef<std::path::Path>, mut config: Config) -> Result<Sys
             );
         } else {
             match crate::recompiled::Library::linked(linked) {
-                Ok(library) => {
+                // code a mod or the update changed would go on running as it
+                // was recompiled, and crash where the update moved things
+                Ok(library) if (modded || updated) && !library.checks_itself() => log::warn!(
+                    "{} changed the game's code and the code linked in can't tell where, which a program 3dsrecomp port makes now can, interpreting everything",
+                    if modded { "a mod" } else { "the update" }
+                ),
+                Ok(mut library) => {
                     log::info!("running the recompiled code linked in, {}", library.describe());
+                    let stale = library.check(&mut system.memory);
+                    if stale > 0 {
+                        log::warn!(
+                            "{stale} functions changed since the game was recompiled, by a mod or in another version of the game, they run in the interpreter"
+                        );
+                    }
                     system.recompiled = Some(library);
                 }
                 Err(error) => log::warn!("could not use the code linked in, {error}, interpreting everything"),
@@ -162,9 +172,12 @@ pub fn load(path: impl AsRef<std::path::Path>, mut config: Config) -> Result<Sys
     } else if let Some(path) = system.config.recompiled.clone().or_else(|| installed(&system, &title)) {
         let path = if path.is_dir() { path.join(recomp_abi::library_name(title.program_id())) } else { path };
         match crate::recompiled::Library::open(&path) {
-            // code a mod changed would go on running as it was recompiled
-            Ok(library) if modded && !library.checks_itself() => log::warn!(
-                "a mod changed the game's code and {} can't tell where, which code recompiled again can, interpreting everything",
+            // code a mod or the update changed would go on running as it was
+            // recompiled. a library that can't tell is older than recompiling
+            // with the update, it was made from the game without it
+            Ok(library) if (modded || updated) && !library.checks_itself() => log::warn!(
+                "{} changed the game's code and {} can't tell where, which code recompiled again can, interpreting everything",
+                if modded { "a mod" } else { "the update" },
                 path.display()
             ),
             Ok(mut library) => {
@@ -237,8 +250,9 @@ pub fn swap_recompiled(system: &mut System, path: &std::path::Path) -> Result<()
     let mut library = crate::recompiled::Library::open(path).map_err(|error| format!("could not load {}, {error}", path.display()))?;
     if !library.checks_itself() {
         let modded = crate::mods::code(title, system.config.data_dir.as_deref()).is_ok_and(|(_, modded)| modded);
-        if modded {
-            return Err(format!("a mod changed the game's code and {} can't tell where", path.display()));
+        if modded || title.update().is_some() {
+            let what = if modded { "a mod" } else { "the update" };
+            return Err(format!("{what} changed the game's code and {} can't tell where", path.display()));
         }
     }
     log::info!("running recompiled code from {} from here on, {}", path.display(), library.describe());

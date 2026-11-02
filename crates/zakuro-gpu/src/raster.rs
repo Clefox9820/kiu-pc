@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 use std::ops::Range;
-use std::sync::Arc;
+use std::sync::{Arc, Condvar, Mutex};
 
 use rayon::prelude::*;
 
@@ -140,6 +140,7 @@ impl VertexLayout {
 /// a draw's vertices as the shader takes them, worked out once for the
 /// draw: what each input register holds when no array feeds it, and the
 /// fields the arrays do give, each going straight to its register.
+#[derive(Clone)]
 struct InputPlan {
     template: [Vec4; shader::INPUT_REGISTERS],
     /// for each input register, the fixed attribute it takes, if one does.
@@ -148,6 +149,7 @@ struct InputPlan {
 }
 
 /// the fields one array gives, and where a vertex of it is.
+#[derive(Clone)]
 struct LoaderPlan {
     /// the loader, 0 to 11, whose register holds the array's offset.
     index: usize,
@@ -158,6 +160,7 @@ struct LoaderPlan {
 }
 
 /// a field of an array's vertex, and the input register it lands in.
+#[derive(Clone)]
 struct PlacedField {
     offset: u32,
     ty: u32,
@@ -230,30 +233,101 @@ impl InputPlan {
         }
     }
 
-    /// one vertex's input registers.
-    fn fetch<M: GpuMemory>(&self, memory: &mut M, base: u32, vertex_index: u32) -> [Vec4; shader::INPUT_REGISTERS] {
-        let mut input = self.template;
+    /// the input registers of each of vertices, into inputs, written where
+    /// they stay: the template for each vertex, then each array's fields
+    /// over it. an array whose vertices sit together in memory, from the
+    /// first one used to the last, is looked up once for them all rather
+    /// than once a vertex.
+    fn fetch_all<M: GpuMemory>(&self, memory: &mut M, base: u32, vertices: &[u32], inputs: &mut Vec<[Vec4; shader::INPUT_REGISTERS]>) {
+        inputs.clear();
+        inputs.resize(vertices.len(), self.template);
+        let (Some(&low), Some(&high)) = (vertices.iter().min(), vertices.iter().max()) else {
+            return;
+        };
         for loader in &self.loaders {
-            // base is physical, and a loader's offset can carry it from one
-            // region into another, titles point the base at the start of VRAM
-            // and reach vertex data in FCRAM through the offset.
-            let vertex = memory.translate(base + loader.offset + vertex_index * loader.stride);
             let size = loader.size as usize;
-            match memory.slice(vertex, size) {
-                Some(bytes) => loader.place(bytes, &mut input),
-                None => {
-                    // twelve fields of sixteen bytes, and their alignment, fit
-                    let mut bytes = [0u8; 256];
-                    memory.read(vertex, &mut bytes[..size]);
-                    loader.place(&bytes[..size], &mut input);
+            let (first, last) = (base + loader.offset + low * loader.stride, base + loader.offset + high * loader.stride);
+            let start = memory.translate(first);
+            // the translation goes on in step to the last vertex, a region
+            // ending in between would not
+            let along = memory.translate(last) == start.wrapping_add(last - first);
+            if let Some(bytes) = along.then(|| memory.slice(start, (last - first) as usize + size)).flatten() {
+                loader.place_all(bytes, low, vertices, inputs);
+                continue;
+            }
+            for (input, &vertex) in inputs.iter_mut().zip(vertices) {
+                // base is physical, and a loader's offset can carry it from
+                // one region into another, titles point the base at the
+                // start of VRAM and reach vertex data in FCRAM through the
+                // offset.
+                let vertex = memory.translate(base + loader.offset + vertex * loader.stride);
+                match memory.slice(vertex, size) {
+                    Some(bytes) => loader.place(bytes, input),
+                    None => {
+                        // twelve fields of sixteen bytes, and their
+                        // alignment, fit
+                        let mut bytes = [0u8; 256];
+                        memory.read(vertex, &mut bytes[..size]);
+                        loader.place(&bytes[..size], input);
+                    }
                 }
             }
         }
-        input
+    }
+
+    /// each array's bytes from vertex low to high, copied, for decoding on
+    /// another thread with decode. none where an array's vertices do not
+    /// sit together in memory, or the vertices between them make it much
+    /// longer than the count drawn needs.
+    fn copy<M: GpuMemory>(&self, memory: &mut M, base: u32, (low, high): (u32, u32), count: u32) -> Option<Vec<Vec<u8>>> {
+        let mut arrays = Vec::with_capacity(self.loaders.len());
+        for loader in &self.loaders {
+            let size = loader.size as usize;
+            let (first, last) = (base + loader.offset + low * loader.stride, base + loader.offset + high * loader.stride);
+            let len = (last - first) as usize + size;
+            if len > (count as usize * loader.stride.max(loader.size) as usize).saturating_mul(4) + 4096 {
+                return None;
+            }
+            let start = memory.translate(first);
+            if memory.translate(last) != start.wrapping_add(last - first) {
+                return None;
+            }
+            arrays.push(memory.slice(start, len)?.to_vec());
+        }
+        Some(arrays)
+    }
+
+    /// the input registers of each of vertices, into inputs, from the bytes
+    /// copy made of each array from vertex low on, as fetch_all reads them
+    /// from memory.
+    fn decode(&self, arrays: &[Vec<u8>], low: u32, vertices: &[u32], inputs: &mut Vec<[Vec4; shader::INPUT_REGISTERS]>) {
+        inputs.clear();
+        inputs.resize(vertices.len(), self.template);
+        for (loader, bytes) in self.loaders.iter().zip(arrays) {
+            loader.place_all(bytes, low, vertices, inputs);
+        }
+    }
+
+    /// one vertex's input registers.
+    #[cfg(test)]
+    fn fetch<M: GpuMemory>(&self, memory: &mut M, base: u32, vertex_index: u32) -> [Vec4; shader::INPUT_REGISTERS] {
+        let mut inputs = Vec::new();
+        self.fetch_all(memory, base, &[vertex_index], &mut inputs);
+        inputs[0]
     }
 }
 
 impl LoaderPlan {
+    /// puts the fields of each of vertices in its input registers, from the
+    /// array's bytes starting at vertex low.
+    fn place_all(&self, bytes: &[u8], low: u32, vertices: &[u32], inputs: &mut [[Vec4; shader::INPUT_REGISTERS]]) {
+        let size = self.size as usize;
+        for (input, &vertex) in inputs.iter_mut().zip(vertices) {
+            let at = ((vertex - low) * self.stride) as usize;
+            self.place(&bytes[at..at + size], input);
+        }
+    }
+
     /// puts the fields of a vertex's bytes in their registers. components
     /// an array does not provide read as (0, 0, 0, 1), a two-component
     /// texture coordinate arrives as (u, v, 0, 1).
@@ -383,6 +457,8 @@ struct Vertex {
     /// fragment lighting works from.
     quaternion: Vec4,
     view: [f32; 3],
+    /// set 0's w, which a projected texture divides u and v by.
+    texcoord0_w: f32,
 }
 
 impl Vertex {
@@ -398,6 +474,7 @@ impl Vertex {
             }),
             quaternion: std::array::from_fn(|i| mix(self.quaternion[i], other.quaternion[i])),
             view: std::array::from_fn(|i| mix(self.view[i], other.view[i])),
+            texcoord0_w: mix(self.texcoord0_w, other.texcoord0_w),
         }
     }
 }
@@ -413,6 +490,7 @@ struct OutputMap {
     texcoords: [[Option<(usize, usize)>; 2]; 3],
     quaternion: [Option<(usize, usize)>; 4],
     view: [Option<(usize, usize)>; 3],
+    texcoord0_w: Option<(usize, usize)>,
 }
 
 impl Default for OutputMap {
@@ -430,6 +508,7 @@ impl Default for OutputMap {
             texcoords: [[Some((3, 0)), Some((3, 1))], [None; 2], [None; 2]],
             quaternion: [None; 4],
             view: [None; 3],
+            texcoord0_w: None,
         }
     }
 }
@@ -446,6 +525,7 @@ fn read_output_map(registers: &[u32]) -> OutputMap {
         texcoords: [[None; 2]; 3],
         quaternion: [None; 4],
         view: [None; 3],
+        texcoord0_w: None,
     };
     let mut saw_position = false;
 
@@ -464,6 +544,7 @@ fn read_output_map(registers: &[u32]) -> OutputMap {
                 8..=11 => map.color[semantic - 8] = Some(slot),
                 12..=13 => map.texcoords[0][semantic - 12] = Some(slot),
                 14..=15 => map.texcoords[1][semantic - 14] = Some(slot),
+                16 => map.texcoord0_w = Some(slot),
                 18..=20 => map.view[semantic - 18] = Some(slot),
                 22..=23 => map.texcoords[2][semantic - 22] = Some(slot),
                 _ => {}
@@ -496,15 +577,16 @@ fn pack_outputs(outputs: &[Vec4; shader::OUTPUT_REGISTERS], mask: u32) -> [Vec4;
     packed
 }
 
-/// where each of a vertex's 21 values comes from in a stage's output
+/// where each of a vertex's 22 values comes from in a stage's output
 /// registers, worked out once a draw from the output map and the stage's
 /// output mask: what packing the outputs and picking the varyings out of
 /// them gives, without packing every vertex.
 #[derive(Clone, Copy)]
 struct VertexPlan {
     /// the output register times four plus the component, or PLAN_ZERO or
-    /// PLAN_ONE, in the order of clip, color, texcoords, quaternion and view.
-    from: [u8; 21],
+    /// PLAN_ONE, in the order of clip, color, texcoords, quaternion, view
+    /// and set 0's w.
+    from: [u8; 22],
 }
 
 /// a value that no output register gives.
@@ -527,7 +609,7 @@ impl VertexPlan {
         // an attribute past the enabled registers is packed as zero
         let read = |(attribute, component): (usize, usize)| registers[attribute].map_or(PLAN_ZERO, |register| (register * 4 + component) as u8);
         let or = |slot: Option<(usize, usize)>, missing: u8| slot.map_or(missing, read);
-        let mut from = [PLAN_ZERO; 21];
+        let mut from = [PLAN_ZERO; 22];
         for i in 0..4 {
             from[i] = read(map.position[i]);
             from[4 + i] = or(map.color[i], PLAN_ONE);
@@ -541,6 +623,8 @@ impl VertexPlan {
         for (i, &slot) in map.view.iter().enumerate() {
             from[18 + i] = or(slot, PLAN_ZERO);
         }
+        // a w no register gives divides nothing
+        from[21] = or(map.texcoord0_w, PLAN_ONE);
         VertexPlan { from }
     }
 
@@ -558,6 +642,7 @@ impl VertexPlan {
             texcoords: [[get(8), get(9)], [get(10), get(11)], [get(12), get(13)]],
             quaternion: [get(14), get(15), get(16), get(17)],
             view: [get(18), get(19), get(20)],
+            texcoord0_w: get(21),
         }
     }
 }
@@ -623,6 +708,9 @@ enum Vertices<'a> {
         vertices: &'a [u32],
     },
     Shaded(&'a [Vertex]),
+    /// through the shaders and placed on the screen by another thread, see
+    /// hand_out.
+    Prepared(&'a Prepared),
 }
 
 impl Vertices<'_> {
@@ -632,14 +720,411 @@ impl Vertices<'_> {
             #[cfg(feature = "vulkan")]
             Vertices::Raw { vertices, .. } => vertices.len(),
             Vertices::Shaded(shaded) => shaded.len(),
+            Vertices::Prepared(prepared) => prepared.order.as_ref().map_or(prepared.shaded.len(), Vec::len),
         }
     }
 }
 
+/// a draw's vertices through the shaders, then clipped, culled and placed
+/// on the screen as the GPU or the software fill takes them.
+struct Prepared {
+    shaded: Vec<Vertex>,
+    /// which of the shaded vertices each vertex of the draw is.
+    order: Option<Vec<usize>>,
+    placement: Placement,
+}
+
+/// the triangles of a draw on the screen. each vertex inside the volume
+/// lands once however many triangles share it, the triangles index those,
+/// and what clipping makes goes after them.
+struct Placement {
+    placed: Vec<Screen>,
+    indices: Vec<u32>,
+    /// the triangles before clipping and culling.
+    triangles: usize,
+    clipped_away: u32,
+    culled: u32,
+}
+
+/// what a draw's vertex work reads besides the vertices, as the walk ahead
+/// of a command list saw it at the draw: what another thread shades with,
+/// and what the real walk checks it reached the draw with.
+struct Seen {
+    registers: Box<[u32]>,
+    vertex_shader: ShaderUnit,
+    /// none while the geometry stage is off.
+    geometry_shader: Option<ShaderUnit>,
+    fixed_attributes: [Vec4; 16],
+}
+
+/// a draw's vertex work, handed to another thread by the walk ahead of a
+/// command list, see Gpu::scout.
+pub struct Handed {
+    seen: Arc<Seen>,
+    /// memory's count of writes when the walk read the vertices.
+    writes: Option<u64>,
+    job: Arc<Job>,
+}
+
+/// a draw's vertex work, which whichever thread gets to it first does: a
+/// thread of the pool, or the real walk when it reaches the draw before
+/// any did, which costs less than waiting for one to start.
+struct Job {
+    state: Mutex<Work>,
+    done: Condvar,
+}
+
+enum Work {
+    Waiting(Fetched),
+    Running,
+    /// none for a draw with no viewport to place it in.
+    Done(Option<Prepared>),
+    /// taken, or not wanted any more.
+    Gone,
+}
+
+impl Job {
+    /// does the work, unless another thread took it.
+    fn run(&self, seen: &Seen) {
+        let mut state = self.state.lock().unwrap();
+        if !matches!(*state, Work::Waiting(_)) {
+            return;
+        }
+        let Work::Waiting(fetched) = std::mem::replace(&mut *state, Work::Running) else {
+            unreachable!("work that was waiting")
+        };
+        drop(state);
+        let prepared = prepare(seen, fetched);
+        *self.state.lock().unwrap() = Work::Done(prepared);
+        self.done.notify_all();
+    }
+}
+
+impl Handed {
+    /// the work done, here if no thread started on it yet. none when the
+    /// draw has no viewport, or the thread doing it died.
+    fn take(self) -> Option<Option<Prepared>> {
+        let mut state = self.job.state.lock().unwrap();
+        loop {
+            match std::mem::replace(&mut *state, Work::Gone) {
+                Work::Waiting(fetched) => {
+                    drop(state);
+                    return Some(prepare(&self.seen, fetched));
+                }
+                Work::Running => {
+                    *state = Work::Running;
+                    state = self.job.done.wait(state).unwrap();
+                }
+                Work::Done(prepared) => return Some(prepared),
+                Work::Gone => return None,
+            }
+        }
+    }
+}
+
+impl Drop for Handed {
+    /// work no draw took is left undone.
+    fn drop(&mut self) {
+        if let Ok(mut state) = self.job.state.lock() {
+            if matches!(*state, Work::Waiting(_)) {
+                *state = Work::Gone;
+            }
+        }
+    }
+}
+
+impl Handed {
+    /// whether the walk ahead saw this draw as it is: the same registers,
+    /// shaders and fixed attributes, and memory unwritten since it read the
+    /// vertices.
+    fn holds(
+        &self,
+        registers: &[u32],
+        vertex_shader: &ShaderUnit,
+        geometry_shader: &ShaderUnit,
+        fixed_attributes: &[Vec4; 16],
+        writes: Option<u64>,
+    ) -> bool {
+        let seen = &*self.seen;
+        writes.is_some()
+            && writes == self.writes
+            && *seen.registers == *registers
+            && same_bits(&seen.fixed_attributes, fixed_attributes)
+            && seen.vertex_shader.runs_like(vertex_shader)
+            && seen.geometry_shader.as_ref().is_none_or(|unit| unit.runs_like(geometry_shader))
+    }
+}
+
+/// whether two runs of vectors hold the same bits, NaNs included.
+pub(crate) fn same_bits(a: &[Vec4], b: &[Vec4]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).all(|(a, b)| a.map(f32::to_bits) == b.map(f32::to_bits))
+}
+
+/// whether draws hand their vertex work to other threads, see Gpu::scout,
+/// unless ZAKURO_SHADE_AHEAD is 0.
+#[cfg(feature = "vulkan")]
+fn shading_ahead() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("ZAKURO_SHADE_AHEAD").map_or(true, |value| value != "0"))
+}
+
+/// the walk ahead of a command list's half of draw: what draw reads of
+/// memory first, the index buffer and the vertices it names, handed with
+/// the state shading takes to another thread, which shades, clips and
+/// places them for the real walk's draw. none for a draw with no vertices.
+pub(crate) fn hand_out<M: GpuMemory>(
+    registers: &[u32],
+    vertex_shader: &ShaderUnit,
+    geometry_shader: &ShaderUnit,
+    fixed_attributes: &[Vec4; 16],
+    memory: &mut M,
+    resources: &mut Resources,
+    indexed: bool,
+) -> Option<Handed> {
+    let vertex_count = registers[REG_VERTEX_COUNT];
+    if vertex_count < HAND_OUT_FROM || vertex_count > 0x1_0000 {
+        return None;
+    }
+    let writes = memory.writes();
+    let scratch = &mut resources.scratch;
+    read_indices(registers, memory, scratch, indexed);
+    let plan = scratch.plans.update(registers, fixed_attributes);
+    // the vertices the draw names, from the first to the last
+    let short = registers[REG_INDEX_ARRAY] & 0x8000_0000 != 0;
+    let range = match (indexed, short) {
+        (false, _) => {
+            let first = registers[REG_VERTEX_OFFSET];
+            (first, first + vertex_count - 1)
+        }
+        (true, true) => {
+            let halves = scratch.bytes.as_chunks::<2>().0.iter().map(|b| u16::from_le_bytes(*b) as u32);
+            halves.fold((u32::MAX, 0), |(low, high), index| (low.min(index), high.max(index)))
+        }
+        (true, false) => scratch.bytes.iter().fold((u32::MAX, 0), |(low, high), &index| (low.min(index as u32), high.max(index as u32))),
+    };
+    // the bytes the thread decodes the vertices from, or the vertices
+    // decoded here where the arrays do not sit together in memory
+    let attribute_base = loc_register(registers, REG_ATTRIBUTE_BASE);
+    let fetched = match plan.copy(memory, attribute_base, range, vertex_count) {
+        Some(arrays) => Fetched::Arrays(Box::new(Arrays {
+            plan: plan.clone(),
+            indices: indexed.then(|| (scratch.bytes.clone(), short)),
+            first: registers[REG_VERTEX_OFFSET],
+            count: vertex_count,
+            low: range.0,
+            arrays,
+        })),
+        None => {
+            fetch(registers, memory, scratch, indexed);
+            Fetched::Inputs(std::mem::take(&mut scratch.inputs), indexed.then(|| scratch.order.clone()))
+        }
+    };
+    let seen = Arc::new(Seen {
+        registers: registers.into(),
+        vertex_shader: vertex_shader.for_draw(),
+        geometry_shader: (registers[REG_GEOSTAGE_CONFIG] & 0x3 == 2).then(|| geometry_shader.for_draw()),
+        fixed_attributes: *fixed_attributes,
+    });
+    let job = Arc::new(Job { state: Mutex::new(Work::Waiting(fetched)), done: Condvar::new() });
+    let (shared, work) = (seen.clone(), job.clone());
+    rayon::spawn(move || work.run(&shared));
+    Some(Handed { seen, writes, job })
+}
+
+/// what the walk ahead read of a draw's vertices: the shader inputs of
+/// each vertex it names, once each, and which one each vertex of the draw
+/// is when it is indexed, or what the thread doing the work decodes them
+/// from.
+enum Fetched {
+    Inputs(Vec<[Vec4; shader::INPUT_REGISTERS]>, Option<Vec<usize>>),
+    Arrays(Box<Arrays>),
+}
+
+/// a draw's index buffer and the bytes of its arrays from the first vertex
+/// it names to the last, copied, with the plan that decodes them.
+struct Arrays {
+    plan: InputPlan,
+    /// the index buffer's bytes and whether they are halfwords, none for a
+    /// draw without one, which takes count vertices from first on.
+    indices: Option<(Vec<u8>, bool)>,
+    first: u32,
+    count: u32,
+    /// the vertex each array's bytes start at.
+    low: u32,
+    arrays: Vec<Vec<u8>>,
+}
+
+impl Arrays {
+    /// the shader inputs as fetch makes them, on the thread doing the work.
+    fn decode(&self) -> (Vec<[Vec4; shader::INPUT_REGISTERS]>, Option<Vec<usize>>) {
+        thread_local! {
+            static SCRATCH: std::cell::RefCell<Scratch> = std::cell::RefCell::default();
+        }
+        SCRATCH.with_borrow_mut(|scratch| {
+            match &self.indices {
+                Some((bytes, short)) => {
+                    scratch.indices.clear();
+                    if *short {
+                        scratch.indices.extend(bytes.as_chunks::<2>().0.iter().map(|b| u16::from_le_bytes(*b) as u32));
+                    } else {
+                        scratch.indices.extend(bytes.iter().map(|&b| b as u32));
+                    }
+                    scratch.unique();
+                }
+                None => {
+                    scratch.unique.clear();
+                    scratch.unique.extend((0..self.count).map(|i| self.first + i));
+                }
+            }
+            let mut inputs = Vec::new();
+            self.plan.decode(&self.arrays, self.low, &scratch.unique, &mut inputs);
+            (inputs, self.indices.is_some().then(|| scratch.order.clone()))
+        })
+    }
+}
+
+/// the fewest vertices a draw needs for its work to go to another thread,
+/// fewer cost less to shade than to hand out. 64 and 256 timed the same
+/// in the games measured.
+const HAND_OUT_FROM: u32 = 64;
+
+/// a draw's vertex work, on whichever thread does it: the vertices through
+/// the shaders, then placed on the screen.
+fn prepare(seen: &Seen, fetched: Fetched) -> Option<Prepared> {
+    static OFF: std::sync::OnceLock<ShaderUnit> = std::sync::OnceLock::new();
+    let registers = &seen.registers[..];
+    let viewport = viewport(registers)?;
+    let (inputs, order) = match fetched {
+        Fetched::Inputs(inputs, order) => (inputs, order),
+        Fetched::Arrays(arrays) => arrays.decode(),
+    };
+    let geometry_shader = seen.geometry_shader.as_ref().unwrap_or_else(|| OFF.get_or_init(ShaderUnit::new));
+    let (shaded, kept) = process_vertices(registers, &seen.vertex_shader, geometry_shader, &inputs, order.as_deref());
+    // the geometry shader's vertices come in order
+    let order = if kept.is_some() { order } else { None };
+    let placement = place(registers, &shaded, order.as_deref(), viewport);
+    Some(Prepared { shaded, order, placement })
+}
+
+/// the viewport's left, bottom, width and height, none where it has no
+/// extent to draw in.
+fn viewport(registers: &[u32]) -> Option<(f32, f32, f32, f32)> {
+    // the offset is two signed 10-bit fields.
+    let signed10 = |value: u32| (((value & 0x3FF) << 22) as i32 >> 22) as f32;
+    let viewport_x = signed10(registers[REG_VIEWPORT_XY]);
+    let viewport_y = signed10(registers[REG_VIEWPORT_XY] >> 16);
+    // the viewport registers hold *half* the extent, because what the hardware
+    // actually wants is the scale factor that maps clip space (-1..1) onto the
+    // target.
+    let viewport_width = read_float24(registers, REG_VIEWPORT_WIDTH) * 2.0;
+    let viewport_height = read_float24(registers, REG_VIEWPORT_HEIGHT) * 2.0;
+    if viewport_width <= 0.0 || viewport_height <= 0.0 {
+        return None;
+    }
+    Some((viewport_x, viewport_y, viewport_width, viewport_height))
+}
+
+/// a draw's shaded vertices assembled into triangles and placed on the
+/// screen, clipped to the volume and culled.
+fn place(registers: &[u32], shaded: &[Vertex], order: Option<&[usize]>, viewport: (f32, f32, f32, f32)) -> Placement {
+    // GPUREG_PRIMITIVE_CONFIG bits [9:8], 0 = triangle list, 1 = strip,
+    // 2 = fan, 3 = whatever the geometry shader emitted, which is a list.
+    let topology = (registers[REG_PRIMITIVE_CONFIG] >> 8) & 0x3;
+    // GPUREG_FACECULLING_CONFIG, 0 keeps everything, 1 keeps triangles
+    // wound clockwise and 2 counter-clockwise, as seen with y pointing up.
+    let cull_mode = registers[REG_FACE_CULLING] & 0x3;
+    // which of the vertices made each vertex of the draw is
+    let at = |i: usize| order.map_or(i, |order| order[i]);
+    let triangle_indices = assemble(topology, order.map_or(shaded.len(), <[usize]>::len));
+    // on a buffer upside down the window's rows run from its top, and the
+    // triangles that turns over cull as they would the right way up
+    let flip = upside_down(registers).then(|| buffer_size(registers, viewport).1 as f32);
+    let to_window = |vertex: &Vertex| {
+        to_screen(vertex, viewport).map(|screen| match flip {
+            Some(height) => Screen { y: height - screen.y, ..screen },
+            None => screen,
+        })
+    };
+
+    let triangles = triangle_indices.len();
+    let mut clipped_away = 0u32;
+    let mut culled = 0u32;
+    const OUTSIDE: u32 = u32::MAX;
+    let mut placed: Vec<Screen> = Vec::with_capacity(shaded.len());
+    let slots: Vec<u32> = shaded
+        .iter()
+        .map(|vertex| match inside(vertex).then(|| to_window(vertex)).flatten() {
+            Some(screen) => {
+                placed.push(screen);
+                placed.len() as u32 - 1
+            }
+            None => OUTSIDE,
+        })
+        .collect();
+    let mut indices: Vec<u32> = Vec::with_capacity(triangles * 3);
+    let culls = |p: &Screen, q: &Screen, r: &Screen| {
+        let counter_clockwise = (q.x - p.x) * (r.y - p.y) - (q.y - p.y) * (r.x - p.x) > 0.0;
+        cull_mode != 0 && (counter_clockwise != flip.is_some()) == (cull_mode == 1)
+    };
+    for (ia, ib, ic) in triangle_indices {
+        let (a, b, c) = (at(ia), at(ib), at(ic));
+        let [sa, sb, sc] = [slots[a], slots[b], slots[c]];
+        if sa != OUTSIDE && sb != OUTSIDE && sc != OUTSIDE {
+            if culls(&placed[sa as usize], &placed[sb as usize], &placed[sc as usize]) {
+                culled += 1;
+            } else {
+                indices.extend([sa, sb, sc]);
+            }
+            continue;
+        }
+        let polygon = clip_triangle([shaded[a], shaded[b], shaded[c]]);
+        let screen: Vec<Screen> = polygon.iter().filter_map(to_window).collect();
+        if screen.len() < 3 || screen.len() != polygon.len() {
+            clipped_away += 1;
+            continue;
+        }
+        if culls(&screen[0], &screen[1], &screen[2]) {
+            culled += 1;
+            continue;
+        }
+        let first = placed.len() as u32;
+        placed.extend_from_slice(&screen);
+        for i in 1..screen.len() as u32 - 1 {
+            indices.extend([first, first + i, first + i + 1]);
+        }
+    }
+    Placement { placed, indices, triangles, clipped_away, culled }
+}
+
+/// whether texture unit 0 is projected, a texture of type 3 in bits 28-30
+/// of its GPUREG_TEXUNIT0_PARAM: its u and v are divided by coordinate set
+/// 0's w, which titles cast reflections and shadows onto a surface with.
+fn projected(registers: &[u32]) -> bool {
+    (registers[TEXTURE_UNIT_BASES[0] + 2] >> 28) & 7 == 3
+}
+
+/// whether the framebuffer is upside down, the window's rows running from
+/// the top of the buffer down: bit 24 of GPUREG_FRAMEBUFFER_DIMENSIONS
+/// clear. titles set it, Star Fox 64 3D clears it for some passes.
+pub(super) fn upside_down(registers: &[u32]) -> bool {
+    registers[REG_FRAMEBUFFER_DIMENSIONS] & (1 << 24) == 0
+}
+
+/// the buffer's real width and height, which the tile addressing uses. it
+/// is often padded past the viewport, and tiling at the viewport's width
+/// instead reads back as the image repeating down the screen. a viewport
+/// reaching past it makes it that much larger.
+fn buffer_size(registers: &[u32], (x, y, width, height): (f32, f32, f32, f32)) -> (u32, u32) {
+    let dimensions = registers[REG_FRAMEBUFFER_DIMENSIONS];
+    let right = (x + width).round() as i32;
+    let top = (y + height).round() as i32;
+    ((dimensions & 0x7FF).max(right.max(1) as u32), (((dimensions >> 12) & 0x3FF) + 1).max(top.max(1) as u32))
+}
+
 /// where the GPU's vertex shader finds each varying, per semantic
 /// component of position, color, texture coordinates 0, 1 and 2, the
-/// quaternion and the view vector, the output register times four plus
-/// the component, the way to_vertex reads them.
+/// quaternion, the view vector and coordinate set 0's w, the output
+/// register times four plus the component, the way to_vertex reads them.
 #[cfg(feature = "vulkan")]
 fn output_semantics(registers: &[u32]) -> [u32; 24] {
     let map = read_output_map(registers);
@@ -668,7 +1153,8 @@ fn output_semantics(registers: &[u32]) -> [u32; 24] {
         .chain(t1)
         .chain(t2)
         .chain(map.quaternion)
-        .chain(map.view);
+        .chain(map.view)
+        .chain([map.texcoord0_w]);
     let mut semantics = [hardware::MISSING; 24];
     for (semantic, found) in semantics.iter_mut().zip(slots) {
         *semantic = slot(found);
@@ -828,6 +1314,7 @@ struct Screen {
     texcoords_over_w: [[f32; 2]; 3],
     quaternion_over_w: Vec4,
     view_over_w: [f32; 3],
+    texcoord0_w_over_w: f32,
 }
 
 fn to_screen(vertex: &Vertex, viewport: (f32, f32, f32, f32)) -> Option<Screen> {
@@ -853,6 +1340,7 @@ fn to_screen(vertex: &Vertex, viewport: (f32, f32, f32, f32)) -> Option<Screen> 
         texcoords_over_w: vertex.texcoords.map(|[u, v]| [u * inv_w, v * inv_w]),
         quaternion_over_w: vertex.quaternion.map(|c| c * inv_w),
         view_over_w: vertex.view.map(|c| c * inv_w),
+        texcoord0_w_over_w: vertex.texcoord0_w * inv_w,
     })
 }
 
@@ -922,7 +1410,7 @@ pub(crate) struct DrawnTexture {
 /// texture unit 0's configuration and backing data for one draw call.
 struct BoundTexture {
     /// the texture decoded, row by row from the top, none when it is drawn
-    /// unless it reaches past the rows drawn.
+    /// unless it reaches past the rows drawn. its smaller sizes follow.
     texels: Arc<[[u8; 4]]>,
     drawn: Option<DrawnTexture>,
     /// bilinear rather than point sampling when magnifying.
@@ -935,6 +1423,82 @@ struct BoundTexture {
     /// the texture pack's picture for it, which the host's GPU draws with
     /// in its place once it has been read.
     replacement: Option<Arc<crate::pack::Material>>,
+    /// how many sizes the texels hold, each half the last.
+    levels: u32,
+    lod: Lod,
+}
+
+/// how a unit goes between a texture's sizes, from GPUREG_TEXUNITi_LOD and
+/// the filters in GPUREG_TEXUNITi_PARAM: the level of detail the rate the
+/// coordinates change across the screen gives, plus the bias, kept between
+/// the smallest and largest level the unit allows, 0 being the largest
+/// size and each step up half the last.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct Lod {
+    /// in 256ths.
+    bias: i16,
+    min: u8,
+    max: u8,
+    /// bilinear rather than point sampling when minifying.
+    linear: bool,
+    /// blends the two sizes about the level rather than taking the nearer.
+    between: bool,
+}
+
+impl Lod {
+    /// the unit's, for a texture of levels sizes.
+    fn read(registers: &[u32], base: usize, levels: u32) -> Lod {
+        let config = registers[base + 2];
+        let lod = registers[base + 3];
+        let max = ((lod >> 16) & 0xF).min(levels - 1);
+        Lod {
+            // 13 bits with the sign, 8 of them a fraction
+            bias: ((lod << 19) as i32 >> 19) as i16,
+            min: ((lod >> 24) & 0xF).min(max) as u8,
+            max: max as u8,
+            linear: config & 0x4 != 0,
+            between: config & (1 << 24) != 0,
+        }
+    }
+}
+
+/// how many sizes a unit's texture has: as many as the largest level of
+/// detail GPUREG_TEXUNITi_LOD allows, each half the last, down to 8 texels
+/// a side, the tiles' size.
+fn level_count(registers: &[u32], base: usize, width: u32, height: u32) -> u32 {
+    let largest = (registers[base + 3] >> 16) & 0xF;
+    1 + largest.min(width.trailing_zeros().min(height.trailing_zeros()).saturating_sub(3))
+}
+
+/// one of a texture's sizes: its width and height, and where it starts in
+/// the texture's bytes and in its texels.
+#[derive(Clone, Copy, Debug)]
+struct Level {
+    width: u32,
+    height: u32,
+    bytes: usize,
+    texels: usize,
+}
+
+/// a texture's sizes, the largest first, one after the other in memory as
+/// in the decoded texels.
+fn texture_levels(format: TextureFormat, width: u32, height: u32, levels: u32) -> impl Iterator<Item = Level> {
+    let bits = format.bits_per_pixel() as u64;
+    (0..levels).scan((0, 0), move |(bytes, texels), level| {
+        let (width, height) = (width >> level, height >> level);
+        let found = Level { width, height, bytes: *bytes, texels: *texels };
+        *bytes += (width as u64 * height as u64 * bits).div_ceil(8) as usize;
+        *texels += (width * height) as usize;
+        Some(found)
+    })
+}
+
+/// how many bytes a texture's sizes take in memory.
+fn texture_bytes(format: TextureFormat, width: u32, height: u32, levels: u32) -> usize {
+    let bits = format.bits_per_pixel() as u64;
+    texture_levels(format, width, height, levels)
+        .last()
+        .map_or(0, |last| last.bytes + (last.width as u64 * last.height as u64 * bits).div_ceil(8) as usize)
 }
 
 /// what a draw does for frame interpolation, see crate::interpolation.
@@ -979,6 +1543,15 @@ pub struct Resources {
 }
 
 impl Resources {
+    /// whether draws hand their vertex work to other threads, see
+    /// Gpu::scout: on the host's GPU while the CPU shades.
+    pub(crate) fn hands_out(&self) -> bool {
+        #[cfg(feature = "vulkan")]
+        return shading_ahead() && self.hardware.as_ref().is_some_and(|hardware| !hardware.shades());
+        #[cfg(not(feature = "vulkan"))]
+        false
+    }
+
     /// lets go of the textures decoded, what the last draws left to the
     /// next and what the host's GPU drew, memory having been put back as a
     /// saved state had it.
@@ -1090,7 +1663,8 @@ pub struct TextureCache {
     rows: Vec<u8>,
 }
 
-type TextureKey = (u32, TextureFormat, u32, u32);
+/// address, format, width, height and how many sizes.
+type TextureKey = (u32, TextureFormat, u32, u32, u32);
 
 /// a texture's texels, and the texture pack's picture replacing it.
 type Found = (Arc<[[u8; 4]]>, Option<Arc<crate::pack::Material>>);
@@ -1105,6 +1679,9 @@ struct Decoded {
     /// made by then.
     checked: (u64, usize),
     replacement: Option<Arc<crate::pack::Material>>,
+    /// what memory gave when the bytes were last read, which tells while
+    /// nothing wrote them since, see GpuMemory::watch.
+    watch: Option<u64>,
 }
 
 /// how many texels the cache holds before it starts over, 256 MiB of them.
@@ -1150,8 +1727,27 @@ impl TextureCache {
         (list == self.list && !overwritten).then(|| (decoded.texels.clone(), decoded.replacement.clone()))
     }
 
+    /// the texture, when memory has had nothing written over it since its
+    /// bytes were last read, which then counts as checked in this list too.
+    fn unchanged<M: GpuMemory>(&mut self, key: TextureKey, size: u32, memory: &mut M) -> Option<Found> {
+        let decoded = self.entries.get_mut(&key)?;
+        let watch = decoded.watch?;
+        if !memory.unchanged(key.0, size, watch) {
+            return None;
+        }
+        decoded.checked = (self.list, self.written.len());
+        Some((decoded.texels.clone(), decoded.replacement.clone()))
+    }
+
+    /// has memory watch the bytes the texture was just read from.
+    fn watch<M: GpuMemory>(&mut self, key: TextureKey, size: u32, memory: &mut M) {
+        if let Some(decoded) = self.entries.get_mut(&key) {
+            decoded.watch = memory.watch(key.0, size);
+        }
+    }
+
     fn decoded(&mut self, key: TextureKey, data: &[u8]) -> Found {
-        let (_, format, width, height) = key;
+        let (_, format, width, height, levels) = key;
         let hash = fingerprint(data);
         let checked = (self.list, self.written.len());
         if let Some(decoded) = self.entries.get_mut(&key) {
@@ -1161,13 +1757,19 @@ impl TextureCache {
                 // into a copy, as the old texels may still be uploading
                 let mut copy: Arc<[[u8; 4]]> = Arc::from(&decoded.texels[..]);
                 let texels = Arc::get_mut(&mut copy).expect("a copy no one else holds");
-                let tile = data.len() / (width * height / 64) as usize;
-                let tiles = decoded.bytes.chunks(tile).zip(data.chunks(tile)).enumerate();
-                for (index, _) in tiles.filter(|(_, (old, new))| old != new) {
-                    let (tile_x, tile_y) = (index as u32 % (width / 8) * 8, index as u32 / (width / 8) * 8);
-                    for y in tile_y..tile_y + 8 {
-                        for x in tile_x..tile_x + 8 {
-                            texels[(y * width + x) as usize] = crate::texture::sample_texel(data, format, width, x, y);
+                let tile = 64 * format.bits_per_pixel() as usize / 8;
+                for level in texture_levels(format, width, height, levels) {
+                    let span = level.bytes..level.bytes + (level.width * level.height) as usize * tile / 64;
+                    let (old, new) = (&decoded.bytes[span.clone()], &data[span]);
+                    let tiles = old.chunks(tile).zip(new.chunks(tile)).enumerate();
+                    for (index, _) in tiles.filter(|(_, (old, new))| old != new) {
+                        let columns = level.width / 8;
+                        let (tile_x, tile_y) = (index as u32 % columns * 8, index as u32 / columns * 8);
+                        for y in tile_y..tile_y + 8 {
+                            for x in tile_x..tile_x + 8 {
+                                texels[level.texels + (y * level.width + x) as usize] =
+                                    crate::texture::sample_texel(new, format, level.width, x, y);
+                            }
                         }
                     }
                 }
@@ -1181,17 +1783,21 @@ impl TextureCache {
                 return (decoded.texels.clone(), decoded.replacement.clone());
             }
         }
-        let count = (width * height) as usize;
+        let texels: Arc<[[u8; 4]]> = texture_levels(format, width, height, levels)
+            .flat_map(|level| {
+                let data = &data[level.bytes..];
+                (0..level.height)
+                    .flat_map(move |y| (0..level.width).map(move |x| (x, y)))
+                    .map(move |(x, y)| crate::texture::sample_texel(data, format, level.width, x, y))
+            })
+            .collect();
+        let count = texels.len();
         if self.texels + count > CACHED_TEXELS {
             self.entries.clear();
             self.texels = 0;
         }
-        let texels: Arc<[[u8; 4]]> = (0..height)
-            .flat_map(|y| (0..width).map(move |x| (x, y)))
-            .map(|(x, y)| crate::texture::sample_texel(data, format, width, x, y))
-            .collect();
         let replacement = picture_for(self.pack.as_deref(), data, &texels, key, &mut self.rows);
-        let decoded = Decoded { hash, bytes: data.to_vec(), texels: texels.clone(), checked, replacement: replacement.clone() };
+        let decoded = Decoded { hash, bytes: data.to_vec(), texels: texels.clone(), checked, replacement: replacement.clone(), watch: None };
         if let Some(old) = self.entries.insert(key, decoded) {
             self.texels -= old.texels.len();
         }
@@ -1208,7 +1814,9 @@ fn picture_for(
     key: TextureKey,
     rows: &mut Vec<u8>,
 ) -> Option<Arc<crate::pack::Material>> {
-    let (_, format, width, height) = key;
+    // packs know textures by their largest size alone
+    let (_, format, width, height, _) = key;
+    let (data, texels) = (&data[..texture_bytes(format, width, height, 1)], &texels[..(width * height) as usize]);
     if crate::pack::recording() {
         crate::pack::record(data, texels, format, width, height);
     }
@@ -1273,26 +1881,56 @@ impl Wrap {
 }
 
 impl BoundTexture {
-    fn texel(&self, x: i32, y: i32) -> [f32; 4] {
+    /// a texel of one of the sizes, 0 the largest.
+    fn texel(&self, level: u32, x: i32, y: i32) -> [f32; 4] {
+        let (width, height) = (self.width >> level, self.height >> level);
         let outside = |wrap: Wrap, coordinate: i32, size: u32| {
             wrap == Wrap::ClampToBorder && !(0..size as i32).contains(&coordinate)
         };
-        if outside(self.wrap_s, x, self.width) || outside(self.wrap_t, y, self.height) {
+        if outside(self.wrap_s, x, width) || outside(self.wrap_t, y, height) {
             return self.border;
         }
-        let x = self.wrap_s.apply(x, self.width);
-        let y = self.wrap_t.apply(y, self.height);
-        self.texels[(y * self.width + x) as usize].map(|c| c as f32 / 255.0)
+        let x = self.wrap_s.apply(x, width);
+        let y = self.wrap_t.apply(y, height);
+        let start: u32 = (0..level).map(|level| (self.width >> level) * (self.height >> level)).sum();
+        self.texels[(start + y * width + x) as usize].map(|c| c as f32 / 255.0)
     }
 
-    /// samples at (u, v), filtering the way the unit is configured.
+    /// samples at (u, v), magnifying the way the unit is configured.
     fn sample(&self, u: f32, v: f32) -> [f32; 4] {
-        // PICA texture coordinates have v=0 at the bottom row.
-        let fx = u * self.width as f32;
-        let fy = (1.0 - v) * self.height as f32;
+        self.sample_level(0, u, v, self.linear)
+    }
 
-        if !self.linear {
-            return self.texel(fx.floor() as i32, fy.floor() as i32);
+    /// samples at (u, v) where the coordinates change by about 2^level
+    /// texels from one pixel to the next, as Vulkan picks and filters the
+    /// sizes, see Lod.
+    fn sample_at(&self, u: f32, v: f32, level: f32) -> [f32; 4] {
+        let lod = self.lod;
+        let level = (level + lod.bias as f32 / 256.0).clamp(lod.min as f32, lod.max as f32);
+        // magnified, or no rate to tell
+        if !(level > 0.0) {
+            return self.sample(u, v);
+        }
+        if !lod.between {
+            // the nearer size, the larger one halfway
+            let nearest = ((level + 0.5).ceil() - 1.0) as u32;
+            return self.sample_level(nearest, u, v, lod.linear);
+        }
+        let larger = level.floor() as u32;
+        let smaller = (larger + 1).min(lod.max as u32);
+        let blend = level - larger as f32;
+        let (a, b) = (self.sample_level(larger, u, v, lod.linear), self.sample_level(smaller, u, v, lod.linear));
+        std::array::from_fn(|i| a[i] + (b[i] - a[i]) * blend)
+    }
+
+    /// samples one of the sizes at (u, v), filtering it or not.
+    fn sample_level(&self, level: u32, u: f32, v: f32, linear: bool) -> [f32; 4] {
+        // PICA texture coordinates have v=0 at the bottom row.
+        let fx = u * (self.width >> level) as f32;
+        let fy = (1.0 - v) * (self.height >> level) as f32;
+
+        if !linear {
+            return self.texel(level, fx.floor() as i32, fy.floor() as i32);
         }
 
         // texel centers sit at half-integer positions.
@@ -1304,10 +1942,10 @@ impl BoundTexture {
         let ty = fy - y0;
         let (x0, y0) = (x0 as i32, y0 as i32);
 
-        let a = self.texel(x0, y0);
-        let b = self.texel(x0 + 1, y0);
-        let c = self.texel(x0, y0 + 1);
-        let d = self.texel(x0 + 1, y0 + 1);
+        let a = self.texel(level, x0, y0);
+        let b = self.texel(level, x0 + 1, y0);
+        let c = self.texel(level, x0, y0 + 1);
+        let d = self.texel(level, x0 + 1, y0 + 1);
         std::array::from_fn(|i| {
             let top = a[i] + (b[i] - a[i]) * tx;
             let bottom = c[i] + (d[i] - c[i]) * tx;
@@ -1336,6 +1974,8 @@ fn empty_texture() -> BoundTexture {
         height: 1,
         border: [0.0; 4],
         replacement: None,
+        levels: 1,
+        lod: Lod::default(),
     }
 }
 
@@ -1372,19 +2012,27 @@ fn bind_texture<M: GpuMemory>(
 
     let addr = memory.translate(address);
     log::trace!("texture unit {unit}: 0x{address:08X} -> 0x{addr:08X}, {width}x{height} {format:?}");
-    let bits = (width as u64) * (height as u64) * format.bits_per_pixel() as u64;
-    let size = bits.div_ceil(8) as usize;
+    // a buffer drawn into has the one size
+    let levels = if drawn.is_some() { 1 } else { level_count(registers, base, width, height) };
+    let size = texture_bytes(format, width, height, levels);
 
-    let key = (addr, format, width, height);
+    let key = (addr, format, width, height, levels);
     let (texels, replacement) = match (drawn, cache.checked(key, size as u32)) {
         (Some(_), _) if !past => (Arc::default(), None),
         (_, Some(found)) => found,
-        (_, None) => match memory.slice(addr, size) {
-            Some(data) => cache.decoded(key, data),
+        (_, None) => match cache.unchanged(key, size as u32, memory) {
+            Some(found) => found,
             None => {
-                let mut data = vec![0u8; size];
-                memory.read(addr, &mut data);
-                cache.decoded(key, &data)
+                let found = match memory.slice(addr, size) {
+                    Some(data) => cache.decoded(key, data),
+                    None => {
+                        let mut data = vec![0u8; size];
+                        memory.read(addr, &mut data);
+                        cache.decoded(key, &data)
+                    }
+                };
+                cache.watch(key, size as u32, memory);
+                found
             }
         },
     };
@@ -1404,6 +2052,8 @@ fn bind_texture<M: GpuMemory>(
         border: registers[base].to_le_bytes().map(|c| c as f32 / 255.0),
         // a buffer drawn into is the GPU's, not a pack's picture
         replacement: replacement.filter(|_| drawn.is_none()),
+        levels,
+        lod: Lod::read(registers, base, levels),
     })
 }
 
@@ -1446,8 +2096,8 @@ fn texture_range<M: GpuMemory>(registers: &[u32], memory: &M, unit: usize) -> Op
     if width == 0 || height == 0 || address == 0 {
         return None;
     }
-    let bits = width as u64 * height as u64 * format.bits_per_pixel() as u64;
-    Some((memory.translate(address), bits.div_ceil(8) as u32))
+    let size = texture_bytes(format, width, height, level_count(registers, base, width, height));
+    Some((memory.translate(address), size as u32))
 }
 
 /// where and how depth testing reads/writes, or None when disabled.
@@ -1570,14 +2220,21 @@ struct Stencil {
 }
 
 impl Stencil {
-    fn read(registers: &[u32]) -> Option<Stencil> {
+    /// the stencil test, none when it does nothing. with bit 0 of
+    /// GPUREG_STENCIL_TEST clear it passes always, as the depth test does,
+    /// but its operations still change the buffer where it may be written:
+    /// Star Fox 64 3D counts its shadow volumes into the stencil that way,
+    /// having zeroed it with the draws before them.
+    fn read(registers: &[u32], writable: bool) -> Option<Stencil> {
         let test = registers[REG_STENCIL_TEST];
-        if test & 1 == 0 {
+        let op = registers[REG_STENCIL_OP];
+        let enabled = test & 1 != 0;
+        let changes = writable && (test >> 8) & 0xFF != 0 && op & 0x777 != 0;
+        if !enabled && !changes {
             return None;
         }
-        let op = registers[REG_STENCIL_OP];
         Some(Stencil {
-            function: Compare::from_raw(test >> 4),
+            function: if enabled { Compare::from_raw(test >> 4) } else { Compare::Always },
             write_mask: (test >> 8) as u8,
             reference: (test >> 16) as u8,
             compare_mask: (test >> 24) as u8,
@@ -1620,7 +2277,7 @@ impl DepthStencil {
         let format = registers[REG_DEPTH_BUFFER_FORMAT] & 0x3;
         let test = (mask & 1 != 0).then(|| Compare::from_raw(mask >> 4));
         let write_depth = writable && mask & (1 << 12) != 0;
-        let stencil = if format == 3 { Stencil::read(registers) } else { None };
+        let stencil = if format == 3 { Stencil::read(registers, writable) } else { None };
         if test.is_none() && !write_depth && stencil.is_none() {
             return None;
         }
@@ -1796,6 +2453,8 @@ struct DrawState<'a> {
     textures: &'a [Option<BoundTexture>; 3],
     /// texture unit 2 can read coordinate set 1 instead of its own.
     texture2_uses_coord1: bool,
+    /// texture unit 0 is projected, see projected.
+    texture0_projected: bool,
     lighting: Option<Lighting>,
     tables: &'a Tables,
     /// texture 3, made up from its coordinates, and its tables.
@@ -1877,6 +2536,10 @@ fn fill_triangle(
     }
     let inverse_area = 1.0 / area as f32;
     let edges = [Edge::new(&b, &c), Edge::new(&c, &a), Edge::new(&a, &b)];
+    // how the weights change a pixel to the right and a pixel up, for how
+    // fast texture coordinates change across the screen
+    let steps = [edges.map(|edge| (-edge.dy * 16) as f32 * inverse_area), edges.map(|edge| (edge.dx * 16) as f32 * inverse_area)];
+    let weigh = |weights: &[f32; 3], values: [f32; 3]| weights[0] * values[0] + weights[1] * values[1] + weights[2] * values[2];
 
     let bpp = target.format.bytes_per_pixel();
     let mut color_surface = color_surface;
@@ -1947,9 +2610,39 @@ fn fill_triangle(
                         2 if state.texture2_uses_coord1 => 1,
                         unit => unit,
                     };
-                    let u = interpolate([a.texcoords_over_w[set][0], b.texcoords_over_w[set][0], c.texcoords_over_w[set][0]]);
-                    let v = interpolate([a.texcoords_over_w[set][1], b.texcoords_over_w[set][1], c.texcoords_over_w[set][1]]);
-                    samples[unit] = texture.sample(u, v);
+                    let us = [a.texcoords_over_w[set][0], b.texcoords_over_w[set][0], c.texcoords_over_w[set][0]];
+                    let vs = [a.texcoords_over_w[set][1], b.texcoords_over_w[set][1], c.texcoords_over_w[set][1]];
+                    let (u, v) = (interpolate(us), interpolate(vs));
+                    // a projected texture divides its coordinates by set 0's w
+                    let projected = unit == 0 && state.texture0_projected;
+                    let qs = [a.texcoord0_w_over_w, b.texcoord0_w_over_w, c.texcoord0_w_over_w];
+                    let (u, v) = match projected {
+                        true => {
+                            let q = interpolate(qs);
+                            (u / q, v / q)
+                        }
+                        false => (u, v),
+                    };
+                    samples[unit] = match texture.levels {
+                        1 => texture.sample(u, v),
+                        _ => {
+                            // a coordinate is a numerator over 1/w, or over
+                            // set 0's w over w when projected, both going
+                            // linearly across the screen, so it changes by
+                            // the numerator's change less the coordinate
+                            // times the denominator's, over the denominator
+                            let over = if projected { qs } else { [a.inv_w, b.inv_w, c.inv_w] };
+                            let denominator = weigh(&[w0, w1, w2], over);
+                            let rate = |step: &[f32; 3]| {
+                                let change = weigh(step, over);
+                                let du = (weigh(step, us) - u * change) / denominator * texture.width as f32;
+                                let dv = (weigh(step, vs) - v * change) / denominator * texture.height as f32;
+                                du * du + dv * dv
+                            };
+                            // the longer step's length in texels, as a power of 2
+                            texture.sample_at(u, v, 0.5 * rate(&steps[0]).max(rate(&steps[1])).log2())
+                        }
+                    };
                 }
                 if let Some(proctex) = &state.proctex {
                     let set = proctex.coordinates;
@@ -2156,37 +2849,33 @@ pub fn draw<M: GpuMemory>(
     memory: &mut M,
     resources: &mut Resources,
     indexed: bool,
+    handed: Option<Handed>,
 ) -> u32 {
     let vertex_count = registers[REG_VERTEX_COUNT];
-    let first_vertex = registers[REG_VERTEX_OFFSET];
     if vertex_count == 0 || vertex_count > 0x1_0000 {
         return 0;
     }
 
+    // the vertex work another thread did, when the walk ahead saw the draw
+    // as it is
+    if let Some(handed) = handed.filter(|handed| handed.holds(registers, vertex_shader, geometry_shader, fixed_attributes, memory.writes())) {
+        match handed.take() {
+            Some(Some(prepared)) => {
+                rasterize(registers, memory, resources, Vertices::Prepared(&prepared));
+                return vertex_count;
+            }
+            // nothing to draw it in
+            Some(None) => return vertex_count,
+            None => {}
+        }
+    }
+
     let attribute_base = loc_register(registers, REG_ATTRIBUTE_BASE);
-
-    // resolve each of the vertex_count draw indices to an actual vertex
-    // array index, sequential for DrawArrays, looked up in the index buffer
-    // for DrawElements.
-    let index_config = registers[REG_INDEX_ARRAY];
-    let index_short = index_config & 0x8000_0000 != 0;
-    let index_base = memory.translate(attribute_base + (index_config & 0x0FFF_FFFF));
-
 
     // an index buffer names most vertices several times, fetch and shade
     // each of them once.
     let mut scratch = std::mem::take(&mut resources.scratch);
-    if indexed {
-        // the whole index buffer at once, a read per index costs far more
-        let size = if index_short { 2 } else { 1 };
-        let len = (vertex_count * size) as usize;
-        let bytes = &mut scratch.bytes;
-        bytes.resize(len, 0);
-        match memory.slice(index_base, len) {
-            Some(slice) => bytes.copy_from_slice(slice),
-            None => memory.read(index_base, bytes),
-        }
-    }
+    read_indices(registers, memory, &mut scratch, indexed);
     let plan = scratch.plans.update(registers, fixed_attributes);
     log::trace!(
         "array draw: {vertex_count} vertices from 0x{attribute_base:08X}, indexed {indexed}, formats \
@@ -2199,6 +2888,8 @@ pub fn draw<M: GpuMemory>(
     // first vertex the draw uses to the last
     #[cfg(feature = "vulkan")]
     if resources.hardware.as_ref().is_some_and(|hardware| hardware.shades()) && registers[REG_GEOSTAGE_CONFIG] & 0x3 != 2 {
+        let index_short = registers[REG_INDEX_ARRAY] & 0x8000_0000 != 0;
+        let first_vertex = registers[REG_VERTEX_OFFSET];
         let (first, span) = if indexed {
             // over the index buffer's own bytes or halfwords, which the
             // vector units compare many at a time, they have no unsigned
@@ -2236,26 +2927,57 @@ pub fn draw<M: GpuMemory>(
             }
         }
     }
+    fetch(registers, memory, &mut scratch, indexed);
+    let order = indexed.then_some(&scratch.order[..]);
+    let vertices = Vertices::Unshaded { vertex_shader, geometry_shader, inputs: &scratch.inputs, order };
+    rasterize(registers, memory, resources, vertices);
+    resources.scratch = scratch;
+    vertex_count
+}
+
+/// a draw's index buffer into scratch.bytes, the whole of it at once, a
+/// read per index costs far more.
+fn read_indices<M: GpuMemory>(registers: &[u32], memory: &mut M, scratch: &mut Scratch, indexed: bool) {
+    if !indexed {
+        return;
+    }
+    // resolve each of the vertex_count draw indices to an actual vertex
+    // array index, sequential for DrawArrays, looked up in the index buffer
+    // for DrawElements.
+    let attribute_base = loc_register(registers, REG_ATTRIBUTE_BASE);
+    let index_config = registers[REG_INDEX_ARRAY];
+    let index_short = index_config & 0x8000_0000 != 0;
+    let index_base = memory.translate(attribute_base + (index_config & 0x0FFF_FFFF));
+    let size = if index_short { 2 } else { 1 };
+    let len = (registers[REG_VERTEX_COUNT] * size) as usize;
+    let bytes = &mut scratch.bytes;
+    bytes.resize(len, 0);
+    match memory.slice(index_base, len) {
+        Some(slice) => bytes.copy_from_slice(slice),
+        None => memory.read(index_base, bytes),
+    }
+}
+
+/// the shader inputs of each vertex a draw names, once each, into
+/// scratch.inputs, with scratch.order saying which one each vertex of the
+/// draw is when it is indexed. the plan is the one plans.update made.
+fn fetch<M: GpuMemory>(registers: &[u32], memory: &mut M, scratch: &mut Scratch, indexed: bool) {
+    let vertex_count = registers[REG_VERTEX_COUNT];
     if indexed {
         scratch.indices.clear();
-        if index_short {
+        if registers[REG_INDEX_ARRAY] & 0x8000_0000 != 0 {
             scratch.indices.extend(scratch.bytes.as_chunks::<2>().0.iter().map(|b| u16::from_le_bytes(*b) as u32));
         } else {
             scratch.indices.extend(scratch.bytes.iter().map(|&b| b as u32));
         }
         scratch.unique();
     } else {
+        let first_vertex = registers[REG_VERTEX_OFFSET];
         scratch.unique.clear();
         scratch.unique.extend((0..vertex_count).map(|i| first_vertex + i));
     }
-    let plan = scratch.plans.current();
-    scratch.inputs.clear();
-    scratch.inputs.extend(scratch.unique.iter().map(|&vertex_index| plan.fetch(memory, attribute_base, vertex_index)));
-    let order = indexed.then_some(&scratch.order[..]);
-    let vertices = Vertices::Unshaded { vertex_shader, geometry_shader, inputs: &scratch.inputs, order };
-    rasterize(registers, memory, resources, vertices);
-    resources.scratch = scratch;
-    vertex_count
+    let attribute_base = loc_register(registers, REG_ATTRIBUTE_BASE);
+    scratch.plans.current().fetch_all(memory, attribute_base, &scratch.unique, &mut scratch.inputs);
 }
 
 /// draws vertices a title sent one attribute at a time through the fixed
@@ -2393,34 +3115,27 @@ fn assemble(topology: u32, count: usize) -> Vec<(usize, usize, usize)> {
 /// CPU decodes then.
 fn rasterize<M: GpuMemory>(registers: &[u32], memory: &mut M, resources: &mut Resources, vertices: Vertices) -> Option<u32> {
     let vertex_count = vertices.len();
-    // the offset is two signed 10-bit fields.
-    let signed10 = |value: u32| (((value & 0x3FF) << 22) as i32 >> 22) as f32;
-    let viewport_x = signed10(registers[REG_VIEWPORT_XY]);
-    let viewport_y = signed10(registers[REG_VIEWPORT_XY] >> 16);
-    // the viewport registers hold *half* the extent, because what the hardware
-    // actually wants is the scale factor that maps clip space (-1..1) onto the
-    // target.
-    let viewport_width = read_float24(registers, REG_VIEWPORT_WIDTH) * 2.0;
-    let viewport_height = read_float24(registers, REG_VIEWPORT_HEIGHT) * 2.0;
-    if viewport_width <= 0.0 || viewport_height <= 0.0 {
+    let Some(viewport) = viewport(registers) else {
         return Some(0);
-    }
-    let viewport = (viewport_x, viewport_y, viewport_width, viewport_height);
+    };
+    let (viewport_x, viewport_y, viewport_width, viewport_height) = viewport;
 
     let color_buffer_raw = loc_register(registers, REG_COLOR_BUFFER_ADDRESS);
     let target_addr = memory.translate(color_buffer_raw);
     // the format sits in bits 16-18 of the register, not the low bits, the low
     // half holds how many bytes a pixel takes.
     let target_format = ColorFormat::from_color_buffer((registers[REG_COLOR_BUFFER_FORMAT] >> 16) & 7);
-    // the buffer's real size, which the tile addressing uses, it is often
-    // padded past the viewport, and tiling at the viewport's width instead
-    // reads back as the image repeating down the screen.
-    let dimensions = registers[REG_FRAMEBUFFER_DIMENSIONS];
     let viewport_right = (viewport_x + viewport_width).round() as i32;
     let viewport_top = (viewport_y + viewport_height).round() as i32;
-    let buffer_width = (dimensions & 0x7FF).max(viewport_right.max(1) as u32);
-    let buffer_height = (((dimensions >> 12) & 0x3FF) + 1).max(viewport_top.max(1) as u32);
+    let (buffer_width, buffer_height) = buffer_size(registers, viewport);
     let (target_width, target_height) = (buffer_width, buffer_height);
+    // drawing stays inside the viewport, its rows turned over on a buffer
+    // upside down
+    let (bottom, top) = ((viewport_y.round() as i32).max(0), viewport_top.min(buffer_height as i32));
+    let (bottom, top) = match upside_down(registers) {
+        true => (buffer_height as i32 - top, buffer_height as i32 - bottom),
+        false => (bottom, top),
+    };
 
     // draws are far more frequent than fills or transfers (thousands per
     // second versus dozens), so this stays at trace level to keep debug
@@ -2452,7 +3167,11 @@ fn rasterize<M: GpuMemory>(registers: &[u32], memory: &mut M, resources: &mut Re
     #[cfg(feature = "vulkan")]
     if let Some(hardware) = resources.hardware.as_mut() {
         for (unit, drawn) in drawn.iter_mut().enumerate() {
-            *drawn = drawn_texture(registers, memory, unit).filter(|texture| hardware.holds(texture));
+            // one memory holds as drawn is still the GPU's to copy, unless
+            // the unit reads smaller sizes after it, which memory has
+            let one_size = |texture: &DrawnTexture| level_count(registers, TEXTURE_UNIT_BASES[unit], texture.width, texture.height) == 1;
+            *drawn = drawn_texture(registers, memory, unit)
+                .filter(|texture| hardware.holds(texture) || (one_size(texture) && hardware.holds_unchanged(memory, texture)));
             if let Some(texture) = drawn {
                 past[unit] = !hardware.covers(texture);
                 continue;
@@ -2472,11 +3191,10 @@ fn rasterize<M: GpuMemory>(registers: &[u32], memory: &mut M, resources: &mut Re
     let state = DrawState {
         target: ColorTarget {
             addr: target_addr,
-            // drawing stays inside the viewport.
             left: (viewport_x.round() as i32).max(0),
-            bottom: (viewport_y.round() as i32).max(0),
+            bottom,
             right: viewport_right.min(buffer_width as i32),
-            top: viewport_top.min(buffer_height as i32),
+            top,
             buffer_width,
             buffer_height,
             format: target_format,
@@ -2490,6 +3208,7 @@ fn rasterize<M: GpuMemory>(registers: &[u32], memory: &mut M, resources: &mut Re
         logic_op: crate::blend::LogicOp::read(registers),
         textures: &textures,
         texture2_uses_coord1: registers[REG_TEXTURE_CONFIG] & (1 << 13) != 0,
+        texture0_projected: projected(registers),
         lighting,
         tables: &resources.light_tables,
         proctex: crate::proctex::ProcTex::read(registers, &resources.proctex_tables),
@@ -2505,14 +3224,6 @@ fn rasterize<M: GpuMemory>(registers: &[u32], memory: &mut M, resources: &mut Re
         resources.textures.wrote(depth.addr, pixels * depth.bytes);
     }
 
-    // GPUREG_PRIMITIVE_CONFIG bits [9:8], 0 = triangle list, 1 = strip,
-    // 2 = fan, 3 = whatever the geometry shader emitted, which is a list.
-    let topology = (registers[REG_PRIMITIVE_CONFIG] >> 8) & 0x3;
-
-    // GPUREG_FACECULLING_CONFIG, 0 keeps everything, 1 keeps triangles
-    // wound clockwise and 2 counter-clockwise, as seen with y pointing up.
-    let cull_mode = registers[REG_FACE_CULLING] & 0x3;
-
     // the GPU runs the vertex shader itself, unless a geometry shader
     // comes after it
     #[cfg(feature = "vulkan")]
@@ -2524,9 +3235,17 @@ fn rasterize<M: GpuMemory>(registers: &[u32], memory: &mut M, resources: &mut Re
                 Some((vertex_shader, hardware::Inputs::Decoded(inputs), order, None))
             }
             Vertices::Raw { vertex_shader, raw, vertices } => Some((vertex_shader, hardware::Inputs::Raw(raw), None, Some(vertices))),
-            Vertices::Shaded(_) => None,
+            Vertices::Shaded(_) | Vertices::Prepared(_) => None,
         };
         if let Some((unit, inputs, order, raw)) = unshaded.filter(|_| hardware.shades() && whole && registers[REG_GEOSTAGE_CONFIG] & 0x3 != 2) {
+            // GPUREG_PRIMITIVE_CONFIG bits [9:8], 0 = triangle list, 1 =
+            // strip, 2 = fan, 3 = whatever the geometry shader emitted,
+            // which is a list.
+            let topology = (registers[REG_PRIMITIVE_CONFIG] >> 8) & 0x3;
+            // GPUREG_FACECULLING_CONFIG, 0 keeps everything, 1 keeps
+            // triangles wound clockwise and 2 counter-clockwise, as seen
+            // with y pointing up.
+            let cull_mode = registers[REG_FACE_CULLING] & 0x3;
             let mut assembled = std::mem::take(&mut resources.triangles);
             let indices = triangle_indices(topology, vertex_count, raw, order, &mut assembled);
             let shading = hardware::Shading {
@@ -2546,80 +3265,34 @@ fn rasterize<M: GpuMemory>(registers: &[u32], memory: &mut M, resources: &mut Re
             }
         }
     }
-    let processed;
-    let (shaded, order) = match vertices {
-        Vertices::Shaded(shaded) => (shaded, None),
+    let (processed, placed_here);
+    // the order goes to the software path the GPU falls back on alone
+    #[cfg_attr(not(feature = "vulkan"), allow(unused_variables))]
+    let (shaded, order, placement) = match vertices {
+        Vertices::Prepared(prepared) => (&prepared.shaded[..], prepared.order.as_deref(), &prepared.placement),
+        Vertices::Shaded(shaded) => {
+            placed_here = place(registers, shaded, None, viewport);
+            (shaded, None, &placed_here)
+        }
         Vertices::Unshaded { vertex_shader, geometry_shader, inputs, order } => {
             processed = process_vertices(registers, vertex_shader, geometry_shader, inputs, order);
-            (&processed.0[..], processed.1)
+            placed_here = place(registers, &processed.0, processed.1, viewport);
+            (&processed.0[..], processed.1, &placed_here)
         }
         // arrays the GPU did not draw, which the CPU decodes first
         #[cfg(feature = "vulkan")]
         Vertices::Raw { .. } => return None,
     };
-    // which of the vertices made each vertex of the draw is
-    let at = |i: usize| order.map_or(i, |order| order[i]);
-    let triangle_indices = assemble(topology, order.map_or(shaded.len(), <[usize]>::len));
-
-    let triangle_count = triangle_indices.len();
-    let mut clipped_away = 0u32;
-    let mut culled = 0u32;
+    let (placed, indices) = (&placement.placed, &placement.indices);
+    let (triangle_count, clipped_away, culled) = (placement.triangles, placement.clipped_away, placement.culled);
     let mut stats = FillStats::default();
-    // where each vertex inside the volume lands, worked out once however
-    // many triangles share it, and the triangles as indices into those, a
-    // triangle of such vertices needs no clipping. what clipping makes goes
-    // after them
-    const OUTSIDE: u32 = u32::MAX;
-    let mut placed: Vec<Screen> = Vec::with_capacity(shaded.len());
-    let slots: Vec<u32> = shaded
-        .iter()
-        .map(|vertex| match inside(vertex).then(|| to_screen(vertex, viewport)).flatten() {
-            Some(screen) => {
-                placed.push(screen);
-                placed.len() as u32 - 1
-            }
-            None => OUTSIDE,
-        })
-        .collect();
-    let mut indices: Vec<u32> = Vec::with_capacity(triangle_count * 3);
-    let culls = |p: &Screen, q: &Screen, r: &Screen| {
-        let counter_clockwise = (q.x - p.x) * (r.y - p.y) - (q.y - p.y) * (r.x - p.x) > 0.0;
-        cull_mode != 0 && counter_clockwise == (cull_mode == 1)
-    };
-    for (ia, ib, ic) in triangle_indices {
-        let (a, b, c) = (at(ia), at(ib), at(ic));
-        let [sa, sb, sc] = [slots[a], slots[b], slots[c]];
-        if sa != OUTSIDE && sb != OUTSIDE && sc != OUTSIDE {
-            if culls(&placed[sa as usize], &placed[sb as usize], &placed[sc as usize]) {
-                culled += 1;
-            } else {
-                indices.extend([sa, sb, sc]);
-            }
-            continue;
-        }
-        let polygon = clip_triangle([shaded[a], shaded[b], shaded[c]]);
-        let screen: Vec<Screen> = polygon.iter().filter_map(|v| to_screen(v, viewport)).collect();
-        if screen.len() < 3 || screen.len() != polygon.len() {
-            clipped_away += 1;
-            continue;
-        }
-        if culls(&screen[0], &screen[1], &screen[2]) {
-            culled += 1;
-            continue;
-        }
-        let first = placed.len() as u32;
-        placed.extend_from_slice(&screen);
-        for i in 1..screen.len() as u32 - 1 {
-            indices.extend([first, first + i, first + i + 1]);
-        }
-    }
 
     #[cfg(feature = "vulkan")]
     if let Some(hardware) = resources.hardware.as_mut() {
         let target = &state.target;
         // tiles are whole in any buffer a title really draws into
         if target.buffer_width.is_multiple_of(8) && target.buffer_height.is_multiple_of(8) {
-            let geometry = hardware::Geometry::Placed { vertices: &placed, indices: &indices };
+            let geometry = hardware::Geometry::Placed { vertices: placed, indices };
             match hardware.draw(memory, &state.hardware(registers, geometry)) {
                 Ok(()) => return Some(triangle_count as u32),
                 Err(error) => log::error!("the GPU could not draw, {error}, drawing in software"),
@@ -2639,6 +3312,8 @@ fn rasterize<M: GpuMemory>(registers: &[u32], memory: &mut M, resources: &mut Re
         // were not
         if drawn.iter().any(Option::is_some) {
             let hardware = resources.hardware.take();
+            // which of the vertices made each vertex of the draw is
+            let at = |i: usize| order.map_or(i, |order| order[i]);
             let in_order: Vec<Vertex> = (0..order.map_or(shaded.len(), <[usize]>::len)).map(|i| shaded[at(i)]).collect();
             let drawn = rasterize(registers, memory, resources, Vertices::Shaded(&in_order));
             resources.hardware = hardware;
@@ -2724,12 +3399,13 @@ mod tests {
             texcoords: map.texcoords.map(|set| [set[0].map_or(0.0, get), set[1].map_or(0.0, get)]),
             quaternion: map.quaternion.map(|slot| slot.map_or(0.0, get)),
             view: map.view.map(|slot| slot.map_or(0.0, get)),
+            texcoord0_w: map.texcoord0_w.map_or(1.0, get),
         }
     }
 
     fn vertex_bits(vertex: &Vertex) -> Vec<u32> {
         let texcoords = vertex.texcoords.as_flattened();
-        [&vertex.clip[..], &vertex.color, texcoords, &vertex.quaternion, &vertex.view].concat().iter().map(|v| v.to_bits()).collect()
+        [&vertex.clip[..], &vertex.color, texcoords, &vertex.quaternion, &vertex.view, &[vertex.texcoord0_w]].concat().iter().map(|v| v.to_bits()).collect()
     }
 
     /// placing a vertex's fields gives the bits reading each component
@@ -2950,7 +3626,7 @@ mod tests {
         registers[REG_COLOR_BUFFER_ADDRESS] = COLOR >> 3;
         registers[REG_DEPTH_BUFFER_ADDRESS] = DEPTH >> 3;
         registers[REG_DEPTH_BUFFER_FORMAT] = 3;
-        registers[REG_FRAMEBUFFER_DIMENSIONS] = 8 | (7 << 12);
+        registers[REG_FRAMEBUFFER_DIMENSIONS] = 8 | (7 << 12) | 1 << 24;
         registers[REG_COLOR_BUFFER_WRITE] = 0xF;
         registers[REG_DEPTH_STENCIL_WRITE] = 0x3;
         registers[REG_DEPTH_COLOR_MASK] = 0xF << 8;
@@ -2962,7 +3638,7 @@ mod tests {
     fn cover(z: f32, color: Vec4) -> Vec<Vertex> {
         [[-1.0, -1.0], [3.0, -1.0], [-1.0, 3.0]]
             .into_iter()
-            .map(|[x, y]| Vertex { clip: [x, y, z, 1.0], color, texcoords: [[0.0; 2]; 3], quaternion: [0.0, 0.0, 0.0, 1.0], view: [0.0; 3] })
+            .map(|[x, y]| Vertex { clip: [x, y, z, 1.0], color, texcoords: [[0.0; 2]; 3], quaternion: [0.0, 0.0, 0.0, 1.0], view: [0.0; 3], texcoord0_w: 1.0 })
             .collect()
     }
 
@@ -3011,13 +3687,87 @@ mod tests {
         assert_eq!(written, 32);
     }
 
+    /// with bit 0 of GPUREG_STENCIL_TEST clear the test passes always, but
+    /// its operations still change the stencil, as Star Fox 64 3D's shadow
+    /// volumes need: a draw marks where a later one testing it fills, on
+    /// the CPU and the GPU alike.
+    #[test]
+    fn the_stencil_changes_with_its_test_off() {
+        let vertex = |x: f32, y: f32| Vertex { clip: [x, y, -0.5, 1.0], color: RED, texcoords: [[0.0; 2]; 3], quaternion: [0.0, 0.0, 0.0, 1.0], view: [0.0; 3], texcoord0_w: 1.0 };
+        // the lower left, its long edge through no pixel's center
+        let triangle = [vertex(-1.0, -1.0), vertex(1.1, -1.0), vertex(-1.0, 1.1)];
+        let mut alone = ConsoleMemory::default();
+        rasterize_shaded(&target_registers(), &mut alone, &mut Resources::default(), &triangle);
+        let expected = pixels(&mut alone);
+        assert!(expected.contains(&[0; 4]) && expected.contains(&[255, 0, 0, 255]));
+
+        #[cfg_attr(not(feature = "vulkan"), allow(unused_mut))]
+        let mut renderers = vec![("the CPU", Resources::default())];
+        #[cfg(feature = "vulkan")]
+        if let Ok(hardware) = hardware::Hardware::new() {
+            renderers.push(("the GPU", Resources { hardware: Some(hardware), ..Default::default() }));
+        }
+        for (renderer, mut resources) in renderers {
+            let mut memory = ConsoleMemory::default();
+            // the triangle with no colors and the test off, replacing the
+            // stencil with 1 where it draws
+            let mut marking = target_registers();
+            marking[REG_DEPTH_COLOR_MASK] = 0;
+            marking[REG_STENCIL_TEST] = (1 << 4) | (0xFF << 8) | (1 << 16);
+            marking[REG_STENCIL_OP] = 2 << 8;
+            rasterize_shaded(&marking, &mut memory, &mut resources, &triangle);
+            // then all of the target where the stencil is 1
+            let mut testing = target_registers();
+            testing[REG_STENCIL_TEST] = 1 | (2 << 4) | (1 << 16) | (0xFF << 24);
+            rasterize_shaded(&testing, &mut memory, &mut resources, &cover(-0.5, RED));
+            #[cfg(feature = "vulkan")]
+            if let Some(hardware) = resources.hardware.as_mut() {
+                hardware.flush(&mut memory).unwrap();
+            }
+            assert_eq!(pixels(&mut memory), expected, "{renderer}");
+        }
+    }
+
+    /// a buffer upside down, bit 24 of its dimensions clear, gets in its
+    /// first rows what the same draw puts in its last ones, and the same
+    /// triangles cull.
+    #[test]
+    fn a_buffer_upside_down_has_the_drawing_turned_over() {
+        let vertex = |x: f32, y: f32| Vertex { clip: [x, y, -0.5, 1.0], color: RED, texcoords: [[0.0; 2]; 3], quaternion: [0.0, 0.0, 0.0, 1.0], view: [0.0; 3], texcoord0_w: 1.0 };
+        // the lower left of the window, wound counter-clockwise
+        let triangle = [vertex(-1.0, -1.0), vertex(0.5, -1.0), vertex(-1.0, 0.25)];
+        // which pixels it covers, row after row of memory
+        let drawn = |flag: u32, cull: u32| {
+            let mut registers = target_registers();
+            registers[REG_FRAMEBUFFER_DIMENSIONS] = 8 | (7 << 12) | flag;
+            registers[REG_FACE_CULLING] = cull;
+            let mut memory = ConsoleMemory::default();
+            rasterize_shaded(&registers, &mut memory, &mut Resources::default(), &triangle);
+            let pixels = pixels(&mut memory);
+            let rows: Vec<Vec<bool>> =
+                (0..8).map(|row| (0..8).map(|x| pixels[(crate::format::morton_offset(x, row, 8, 4) / 4) as usize] != [0; 4]).collect()).collect();
+            rows
+        };
+        let upright = drawn(1 << 24, 0);
+        assert!(upright.iter().flatten().filter(|&&on| on).count() > 8, "too little drawn to tell");
+        assert!(upright[7].iter().any(|&on| on) && !upright[0].iter().any(|&on| on), "drawn at the bottom of the window");
+        let turned: Vec<Vec<bool>> = upright.iter().rev().cloned().collect();
+        assert_eq!(drawn(0, 0), turned);
+        // keeping the counter-clockwise ones keeps it either way up, keeping
+        // the clockwise ones drops it
+        assert_eq!(drawn(1 << 24, 2), upright);
+        assert_eq!(drawn(0, 2), turned);
+        assert!(drawn(1 << 24, 1).iter().flatten().all(|&on| !on));
+        assert!(drawn(0, 1).iter().flatten().all(|&on| !on));
+    }
+
     /// a floor-like triangle with its far corner behind the camera, the part in
     /// front of the camera covers everything above its near edge.
     #[test]
     fn a_triangle_crossing_the_camera_is_clipped_not_dropped() {
         let registers = target_registers();
         let mut memory = ConsoleMemory::default();
-        let vertex = |clip: Vec4| Vertex { clip, color: RED, texcoords: [[0.0; 2]; 3], quaternion: [0.0, 0.0, 0.0, 1.0], view: [0.0; 3] };
+        let vertex = |clip: Vec4| Vertex { clip, color: RED, texcoords: [[0.0; 2]; 3], quaternion: [0.0, 0.0, 0.0, 1.0], view: [0.0; 3], texcoord0_w: 1.0 };
         let triangle = [
             vertex([-1.0, -1.0, -0.5, 1.0]),
             vertex([1.0, -1.0, -0.5, 1.0]),
@@ -3047,7 +3797,7 @@ mod tests {
     fn a_quad_covers_every_pixel_once() {
         let registers = target_registers();
         let mut memory = ConsoleMemory::default();
-        let vertex = |x: f32, y: f32| Vertex { clip: [x, y, -0.5, 1.0], color: RED, texcoords: [[0.0; 2]; 3], quaternion: [0.0, 0.0, 0.0, 1.0], view: [0.0; 3] };
+        let vertex = |x: f32, y: f32| Vertex { clip: [x, y, -0.5, 1.0], color: RED, texcoords: [[0.0; 2]; 3], quaternion: [0.0, 0.0, 0.0, 1.0], view: [0.0; 3], texcoord0_w: 1.0 };
         let quad = [
             vertex(-1.0, -1.0),
             vertex(1.0, -1.0),
@@ -3070,9 +3820,9 @@ mod tests {
         registers[REG_VIEWPORT_HEIGHT] = float24(128.0);
         registers[REG_COLOR_BUFFER_ADDRESS] = BIG_COLOR >> 3;
         registers[REG_DEPTH_BUFFER_ADDRESS] = BIG_DEPTH >> 3;
-        registers[REG_FRAMEBUFFER_DIMENSIONS] = 256 | (255 << 12);
+        registers[REG_FRAMEBUFFER_DIMENSIONS] = 256 | (255 << 12) | 1 << 24;
         let mut memory = ConsoleMemory::default();
-        let vertex = |x: f32, y: f32| Vertex { clip: [x, y, -0.5, 1.0], color: RED, texcoords: [[0.0; 2]; 3], quaternion: [0.0, 0.0, 0.0, 1.0], view: [0.0; 3] };
+        let vertex = |x: f32, y: f32| Vertex { clip: [x, y, -0.5, 1.0], color: RED, texcoords: [[0.0; 2]; 3], quaternion: [0.0, 0.0, 0.0, 1.0], view: [0.0; 3], texcoord0_w: 1.0 };
         let quad = [
             vertex(-1.0, -1.0),
             vertex(1.0, -1.0),
@@ -3092,7 +3842,7 @@ mod tests {
     /// culling keeps the winding the register asks for and drops the other.
     #[test]
     fn face_culling_keeps_one_winding() {
-        let vertex = |x: f32, y: f32| Vertex { clip: [x, y, -0.5, 1.0], color: RED, texcoords: [[0.0; 2]; 3], quaternion: [0.0, 0.0, 0.0, 1.0], view: [0.0; 3] };
+        let vertex = |x: f32, y: f32| Vertex { clip: [x, y, -0.5, 1.0], color: RED, texcoords: [[0.0; 2]; 3], quaternion: [0.0, 0.0, 0.0, 1.0], view: [0.0; 3], texcoord0_w: 1.0 };
         // counter-clockwise with y up.
         let triangle = [vertex(-1.0, -1.0), vertex(3.0, -1.0), vertex(-1.0, 3.0)];
         for (mode, expected) in [(0, 64), (1, 0), (2, 64)] {
@@ -3136,12 +3886,77 @@ mod tests {
             height: 8,
             border: RED,
             replacement: None,
+            levels: 1,
+            lod: Lod::default(),
         };
         let white = [1.0; 4];
-        assert_eq!(texture(Wrap::ClampToBorder).texel(-1, 3), RED);
-        assert_eq!(texture(Wrap::ClampToBorder).texel(3, 8), RED);
-        assert_eq!(texture(Wrap::ClampToBorder).texel(3, 3), white);
-        assert_eq!(texture(Wrap::ClampToEdge).texel(-1, 3), white);
+        assert_eq!(texture(Wrap::ClampToBorder).texel(0, -1, 3), RED);
+        assert_eq!(texture(Wrap::ClampToBorder).texel(0, 3, 8), RED);
+        assert_eq!(texture(Wrap::ClampToBorder).texel(0, 3, 3), white);
+        assert_eq!(texture(Wrap::ClampToEdge).texel(0, -1, 3), white);
+    }
+
+    /// a texture drawn at half its size samples the half size after it in
+    /// memory, when GPUREG_TEXUNIT0_LOD lets it, the nearer size or a blend
+    /// of the two, the bias moving the level, on the CPU and the GPU alike.
+    #[test]
+    fn a_minified_texture_samples_its_smaller_sizes() {
+        const TEXTURE: u32 = 0x10000;
+        // the 8x8 target, the texture across it once
+        let quad: Vec<Vertex> = [[-1.0, -1.0, 0.0, 0.0], [3.0, -1.0, 2.0, 0.0], [-1.0, 3.0, 0.0, 2.0]]
+            .into_iter()
+            .map(|[x, y, u, v]| Vertex {
+                clip: [x, y, -0.5, 1.0],
+                color: [1.0; 4],
+                texcoords: [[u, v], [0.0; 2], [0.0; 2]],
+                quaternion: [0.0, 0.0, 0.0, 1.0],
+                view: [0.0; 3],
+                texcoord0_w: 1.0,
+            })
+            .collect();
+        // the largest level, the bias in 256ths, whether it blends, and the
+        // color it comes out
+        let cases = [
+            (0, 0, false, [255, 0, 0, 255]),
+            (1, 0, false, [0, 255, 0, 255]),
+            // levels of about 0.6 and 0.4
+            (1, -102, false, [0, 255, 0, 255]),
+            (1, -154, false, [255, 0, 0, 255]),
+            (1, -128, true, [127, 127, 0, 255]),
+        ];
+        #[cfg_attr(not(feature = "vulkan"), allow(unused_mut))]
+        let mut renderers = vec![("the CPU", Resources::default())];
+        #[cfg(feature = "vulkan")]
+        if let Ok(hardware) = hardware::Hardware::new() {
+            renderers.push(("the GPU", Resources { hardware: Some(hardware), ..Default::default() }));
+        }
+        for (renderer, mut resources) in renderers {
+            // 16x16 red, then 8x8 green, A, B, G and R a texel
+            let mut memory = ConsoleMemory::default();
+            memory.write(TEXTURE, &[0xFF, 0, 0, 0xFF].repeat(16 * 16));
+            memory.write(TEXTURE + 16 * 16 * 4, &[0xFF, 0, 0xFF, 0].repeat(8 * 8));
+            for (largest, bias, between, expected) in cases {
+                let mut registers = target_registers();
+                registers[REG_TEXTURE_CONFIG] = 1;
+                registers[REG_TEXTURE0_DIMENSIONS] = 16 | (16 << 16);
+                registers[REG_TEXTURE0_ADDRESS] = TEXTURE >> 3;
+                registers[REG_TEXTURE0_PARAMETERS] = (between as u32) << 24;
+                registers[REG_TEXTURE0_LOD] = largest << 16 | (bias as u32 & 0x1FFF);
+                registers[0x0C0] = 0x3 | (0x3 << 16);
+                for stage in [0x0C8, 0x0D0, 0x0D8, 0x0F0, 0x0F8] {
+                    registers[stage] = 0xF | (0xF << 16);
+                }
+                rasterize_shaded(&registers, &mut memory, &mut resources, &quad);
+                #[cfg(feature = "vulkan")]
+                if let Some(hardware) = resources.hardware.as_mut() {
+                    hardware.flush(&mut memory).unwrap();
+                }
+                for pixel in pixels(&mut memory) {
+                    let near = pixel.iter().zip(expected).all(|(&got, want)| got.abs_diff(want) <= 1);
+                    assert!(near, "{renderer}, largest level {largest}, bias {bias}: {pixel:?}");
+                }
+            }
+        }
     }
 
     /// within a command list memory changes only where draws write, so a
@@ -3150,7 +3965,7 @@ mod tests {
     #[test]
     fn textures_are_checked_once_a_list_unless_drawn_over() {
         let mut cache = TextureCache::default();
-        let key = (0x1000, TextureFormat::Rgba8, 8, 8);
+        let key = (0x1000, TextureFormat::Rgba8, 8, 8, 1);
         cache.begin_list();
         assert!(cache.checked(key, 256).is_none(), "never seen");
         cache.decoded(key, &[0x11; 256]);
@@ -3166,36 +3981,46 @@ mod tests {
     }
 
     /// a few tiles of a texture rewritten, as a title animating sprites in
-    /// an atlas, come out the same as the whole texture decoded again.
+    /// an atlas, come out the same as the whole texture decoded again, in
+    /// its smaller size too.
     #[test]
     fn a_partly_changed_texture_decodes_as_a_whole_one_would() {
         for format in [TextureFormat::Etc1, TextureFormat::Etc1A4, TextureFormat::Rgba8] {
             let (width, height) = (32, 16);
             let size = (width * height * format.bits_per_pixel() / 8) as usize;
-            let before: Vec<u8> = (0..size).map(|i| (i * 7 % 251) as u8).collect();
+            // the half size after the whole
+            let before: Vec<u8> = (0..size + size / 4).map(|i| (i * 7 % 251) as u8).collect();
             let mut after = before.clone();
-            // the third tile of the second row
+            // the third tile of the second row, and the second of the half
             let tile = size / 8;
-            after[6 * tile..7 * tile].iter_mut().for_each(|byte| *byte = byte.wrapping_mul(3).wrapping_add(1));
-            let key = (0x1000, format, width, height);
+            let change = |bytes: &mut [u8]| bytes.iter_mut().for_each(|byte| *byte = byte.wrapping_mul(3).wrapping_add(1));
+            change(&mut after[6 * tile..7 * tile]);
+            change(&mut after[size + tile..size + 2 * tile]);
+            let key = (0x1000, format, width, height, 2);
             let mut cache = TextureCache::default();
             let old = cache.decoded(key, &before).0;
             let updated = cache.decoded(key, &after).0;
             let whole = TextureCache::default().decoded(key, &after).0;
             assert_eq!(updated, whole, "{format:?}");
             let changed = old.iter().zip(updated.iter()).enumerate().filter(|(_, (a, b))| a != b);
-            assert!(changed.clone().count() > 0, "{format:?} changed nothing");
+            let mut levels = [false; 2];
             for (index, _) in changed {
-                let (x, y) = (index as u32 % width, index as u32 / width);
-                assert_eq!((x / 8, y / 8), (2, 1), "{format:?} changed outside the tile, at {x}, {y}");
+                let (level, index, width) = match index as u32 {
+                    index if index < width * height => (0, index, width),
+                    index => (1, index - width * height, width / 2),
+                };
+                let (x, y) = (index % width, index / width);
+                assert_eq!((x / 8, y / 8), [(2, 1), (1, 0)][level], "{format:?} changed outside the tile, at {x}, {y} of size {level}");
+                levels[level] = true;
             }
+            assert_eq!(levels, [true; 2], "{format:?} changed nothing in a size");
         }
     }
 
     #[test]
     fn the_texture_cache_notices_changed_bytes() {
         let mut cache = TextureCache::default();
-        let key = (0x1000, TextureFormat::Rgba8, 8, 8);
+        let key = (0x1000, TextureFormat::Rgba8, 8, 8, 1);
         let first = cache.decoded(key, &[0x11; 256]).0;
         let again = cache.decoded(key, &[0x11; 256]).0;
         assert!(Arc::ptr_eq(&first, &again));
@@ -3214,6 +4039,7 @@ mod tests {
             texcoords: [[0.0; 2]; 3],
             quaternion: [0.0, 0.0, 0.0, 1.0],
             view: [0.0; 3],
+            texcoord0_w: 1.0,
         };
         for (left, right) in [(1.5, 3.5), (1.4999967, 3.499992)] {
             let quad = [(left, 1.5), (right, 1.5), (right, 3.5), (left, 1.5), (right, 3.5), (left, 3.5)];
@@ -3242,7 +4068,7 @@ mod tests {
         let mut registers = target_registers();
         registers[REG_VIEWPORT_WIDTH] = float24(SIZE as f32 / 2.0);
         registers[REG_VIEWPORT_HEIGHT] = float24(SIZE as f32 / 2.0);
-        registers[REG_FRAMEBUFFER_DIMENSIONS] = SIZE | ((SIZE - 1) << 12);
+        registers[REG_FRAMEBUFFER_DIMENSIONS] = SIZE | ((SIZE - 1) << 12) | 1 << 24;
 
         let mut seed = 1u32;
         let mut random = move |range: u32| {
@@ -3269,6 +4095,7 @@ mod tests {
                     texcoords: [[0.0; 2]; 3],
                     quaternion: [0.0, 0.0, 0.0, 1.0],
                     view: [0.0; 3],
+                    texcoord0_w: 1.0,
                 })
                 .collect();
             let cleared = vec![0u8; (SIZE * SIZE * 4) as usize];
@@ -3313,6 +4140,7 @@ mod tests {
                 texcoords: [[0.0; 2]; 3],
                 quaternion: [0.0, 0.0, 0.0, 1.0],
                 view: [0.0; 3],
+                texcoord0_w: 1.0,
             };
             vec![corner(-1.0, bottom), corner(1.0, bottom), corner(1.0, top), corner(-1.0, bottom), corner(1.0, top), corner(-1.0, top)]
         };
@@ -3428,6 +4256,7 @@ mod tests {
                             texcoords: [[0.0; 2]; 3],
                             quaternion: [0.0, 0.0, 0.0, 1.0],
                             view: [0.0; 3],
+                            texcoord0_w: 1.0,
                         })
                         .collect();
                     rasterize_shaded(&registers, &mut software, &mut Resources::default(), &vertices);
@@ -3590,7 +4419,7 @@ mod tests {
     fn sized(registers: &mut [u32], width: u32, height: u32) {
         registers[REG_VIEWPORT_WIDTH] = float24(width as f32 / 2.0);
         registers[REG_VIEWPORT_HEIGHT] = float24(height as f32 / 2.0);
-        registers[REG_FRAMEBUFFER_DIMENSIONS] = width | ((height - 1) << 12);
+        registers[REG_FRAMEBUFFER_DIMENSIONS] = width | ((height - 1) << 12) | 1 << 24;
     }
 
     /// a fill over every row the GPU drew leaves the buffer as memory holds
@@ -3725,6 +4554,79 @@ mod tests {
         }
     }
 
+    /// a buffer written back for a read that could not copy it on the GPU,
+    /// such as a texture of it narrower than it was drawn, is still copied
+    /// on the GPU for a texture of it, at the scale it was drawn, while
+    /// memory holds what it wrote, and comes from memory once the CPU writes
+    /// there.
+    #[cfg(feature = "vulkan")]
+    #[test]
+    fn a_buffer_written_back_unchanged_is_still_copied_on_the_gpu() {
+        let Ok(hardware) = hardware::Hardware::new() else { return };
+        let mut registers = target_registers();
+        sized(&mut registers, 8, 16);
+        let mut memory = ConsoleMemory::default();
+        let mut resources = Resources { hardware: Some(hardware), ..Default::default() };
+        rasterize_shaded(&registers, &mut memory, &mut resources, &cover(-0.5, RED));
+        let hardware = resources.hardware.as_mut().unwrap();
+        let texture = DrawnTexture { addr: COLOR, width: 8, height: 16, format: ColorFormat::Rgba8 };
+        assert!(hardware.holds(&texture));
+        hardware.sync(&mut memory, COLOR, 512).unwrap();
+        assert!(!hardware.holds(&texture), "memory has it");
+        assert!(hardware.holds_unchanged(&mut memory, &texture), "the image is still memory's");
+        let mut green = [0u8; 4];
+        ColorFormat::Rgba8.encode([0, 255, 0, 255], &mut green);
+        memory.write(COLOR, &green);
+        assert!(!hardware.holds_unchanged(&mut memory, &texture), "the CPU wrote over it");
+    }
+
+    /// a buffer written back and unchanged since that a unit reads with
+    /// smaller sizes after it comes from memory, which has them, not from
+    /// the GPU's copy of the one size: drawn at half its size, it shows the
+    /// half size memory holds.
+    #[cfg(feature = "vulkan")]
+    #[test]
+    fn a_buffer_written_back_read_with_smaller_sizes_comes_from_memory() {
+        let Ok(hardware) = hardware::Hardware::new() else { return };
+        const BUFFER: u32 = 0x10000;
+        let mut drawing = target_registers();
+        sized(&mut drawing, 16, 16);
+        drawing[REG_COLOR_BUFFER_ADDRESS] = BUFFER >> 3;
+        let mut memory = ConsoleMemory::default();
+        let mut resources = Resources { hardware: Some(hardware), ..Default::default() };
+        rasterize_shaded(&drawing, &mut memory, &mut resources, &cover(-0.5, RED));
+        resources.hardware.as_mut().unwrap().sync(&mut memory, BUFFER, 16 * 16 * 4).unwrap();
+        // the half size after it, green
+        let mut green = [0u8; 4];
+        ColorFormat::Rgba8.encode([0, 255, 0, 255], &mut green);
+        memory.write(BUFFER + 16 * 16 * 4, &green.repeat(8 * 8));
+
+        // the 8x8 target, the buffer across it once with both sizes
+        let mut sampling = target_registers();
+        sampling[REG_TEXTURE_CONFIG] = 1;
+        sampling[REG_TEXTURE0_DIMENSIONS] = 16 | (16 << 16);
+        sampling[REG_TEXTURE0_ADDRESS] = BUFFER >> 3;
+        sampling[REG_TEXTURE0_LOD] = 1 << 16;
+        sampling[0x0C0] = 0x3 | (0x3 << 16);
+        for stage in [0x0C8, 0x0D0, 0x0D8, 0x0F0, 0x0F8] {
+            sampling[stage] = 0xF | (0xF << 16);
+        }
+        let quad: Vec<Vertex> = [[-1.0, -1.0, 0.0, 0.0], [3.0, -1.0, 2.0, 0.0], [-1.0, 3.0, 0.0, 2.0]]
+            .into_iter()
+            .map(|[x, y, u, v]| Vertex {
+                clip: [x, y, -0.5, 1.0],
+                color: [1.0; 4],
+                texcoords: [[u, v], [0.0; 2], [0.0; 2]],
+                quaternion: [0.0, 0.0, 0.0, 1.0],
+                view: [0.0; 3],
+                texcoord0_w: 1.0,
+            })
+            .collect();
+        rasterize_shaded(&sampling, &mut memory, &mut resources, &quad);
+        resources.hardware.as_mut().unwrap().flush(&mut memory).unwrap();
+        assert!(pixels(&mut memory).iter().all(|&p| p == [0, 255, 0, 255]), "{:?}", pixels(&mut memory)[0]);
+    }
+
     /// a narrower buffer drawn over rows a fill left of a wider one does not
     /// cost the wider one the rows it drew elsewhere, which memory lacks,
     /// when it is used again.
@@ -3776,7 +4678,7 @@ mod tests {
         let mut registers = target_registers();
         // eight by sixteen, two rows of tiles
         registers[REG_VIEWPORT_HEIGHT] = float24(8.0);
-        registers[REG_FRAMEBUFFER_DIMENSIONS] = 8 | (15 << 12);
+        registers[REG_FRAMEBUFFER_DIMENSIONS] = 8 | (15 << 12) | 1 << 24;
         let mut memory = ConsoleMemory::default();
         let mut resources = Resources { hardware: Some(hardware), ..Default::default() };
         rasterize_shaded(&registers, &mut memory, &mut resources, &cover(-0.5, RED));
@@ -3835,12 +4737,12 @@ mod tests {
         let mut drawing = target_registers();
         drawing[REG_VIEWPORT_WIDTH] = float24(SIZE as f32 / 2.0);
         drawing[REG_VIEWPORT_HEIGHT] = float24(SIZE as f32 / 4.0);
-        drawing[REG_FRAMEBUFFER_DIMENSIONS] = SIZE | ((SIZE / 2 - 1) << 12);
+        drawing[REG_FRAMEBUFFER_DIMENSIONS] = SIZE | ((SIZE / 2 - 1) << 12) | 1 << 24;
         let mut sampling = target_registers();
         sampling[REG_COLOR_BUFFER_ADDRESS] = TARGET >> 3;
         sampling[REG_VIEWPORT_WIDTH] = float24(SIZE as f32 / 2.0);
         sampling[REG_VIEWPORT_HEIGHT] = float24(SIZE as f32 / 2.0);
-        sampling[REG_FRAMEBUFFER_DIMENSIONS] = SIZE | ((SIZE - 1) << 12);
+        sampling[REG_FRAMEBUFFER_DIMENSIONS] = SIZE | ((SIZE - 1) << 12) | 1 << 24;
         sampling[REG_TEXTURE_CONFIG] = 1;
         sampling[REG_TEXTURE0_DIMENSIONS] = SIZE | (SIZE << 16);
         sampling[REG_TEXTURE0_ADDRESS] = COLOR >> 3;
@@ -3864,6 +4766,7 @@ mod tests {
                         texcoords: [[0.0; 2]; 3],
                         quaternion: [0.0, 0.0, 0.0, 1.0],
                         view: [0.0; 3],
+                        texcoord0_w: 1.0,
                     })
                     .collect()
             })
@@ -3878,6 +4781,7 @@ mod tests {
                 texcoords: [[u, v], [0.0; 2], [0.0; 2]],
                 quaternion: [0.0, 0.0, 0.0, 1.0],
                 view: [0.0; 3],
+                texcoord0_w: 1.0,
             })
             .collect();
 
@@ -3919,7 +4823,7 @@ mod tests {
         let mut registers = target_registers();
         // eight by sixteen, two rows of tiles
         registers[REG_VIEWPORT_HEIGHT] = float24(8.0);
-        registers[REG_FRAMEBUFFER_DIMENSIONS] = 8 | (15 << 12);
+        registers[REG_FRAMEBUFFER_DIMENSIONS] = 8 | (15 << 12) | 1 << 24;
         let mut memory = ConsoleMemory::default();
         let mut resources = Resources { hardware: Some(hardware), ..Default::default() };
         rasterize_shaded(&registers, &mut memory, &mut resources, &cover(-0.5, RED));
@@ -4175,7 +5079,7 @@ mod tests {
         registers[REG_VIEWPORT_XY] = 4 | 6 << 16;
         registers[REG_VIEWPORT_WIDTH] = float24(12.0);
         registers[REG_VIEWPORT_HEIGHT] = float24(12.0);
-        registers[REG_FRAMEBUFFER_DIMENSIONS] = SIZE | ((SIZE - 1) << 12);
+        registers[REG_FRAMEBUFFER_DIMENSIONS] = SIZE | ((SIZE - 1) << 12) | 1 << 24;
         registers[REG_DEPTH_COLOR_MASK] = 0xF << 8 | 1 | 4 << 4 | 1 << 12;
         registers[REG_VIEWPORT_DEPTH_RANGE] = float24(-1.0);
         registers[REG_DEPTHMAP_ENABLE] = 1;
@@ -4339,7 +5243,7 @@ mod tests {
         let mut registers = target_registers();
         registers[REG_VIEWPORT_WIDTH] = float24(SIZE as f32 / 2.0);
         registers[REG_VIEWPORT_HEIGHT] = float24(SIZE as f32 / 2.0);
-        registers[REG_FRAMEBUFFER_DIMENSIONS] = SIZE | ((SIZE - 1) << 12);
+        registers[REG_FRAMEBUFFER_DIMENSIONS] = SIZE | ((SIZE - 1) << 12) | 1 << 24;
         registers[REG_SHADER_OUTPUT_TOTAL] = 2;
         registers[REG_SHADER_OUTPUT_MAP] = 0x0302_0100;
         registers[REG_SHADER_OUTPUT_MAP + 1] = 0x0B0A_0908;
@@ -4447,32 +5351,173 @@ mod tests {
                 _ => indices.iter().map(|&index| index as u8).collect(),
             };
 
-            let mut decoded = ConsoleMemory::default();
-            let mut raw = ArrayMemory::new();
-            decoded.write(0x1400_0000, &bytes);
-            decoded.write(0x1400_0000 + INDICES, &index_bytes);
-            raw.write(0x1400_0000, &bytes);
-            raw.write(0x1400_0000 + INDICES, &index_bytes);
-            decoded.write(COLOR, &vec![0u8; (SIZE * SIZE * 4) as usize]);
-            raw.write(COLOR, &vec![0u8; (SIZE * SIZE * 4) as usize]);
-            let indexed = case.indices.is_some();
-            draw(&registers, &unit, &unit, &fixed, &mut decoded, &mut resources, indexed);
-            resources.hardware.as_mut().unwrap().flush(&mut decoded).unwrap();
-            draw(&registers, &unit, &unit, &fixed, &mut raw, &mut resources, indexed);
-            resources.hardware.as_mut().unwrap().flush(&mut raw).unwrap();
-            // the first array whole, from the first vertex used to the last
-            let span = match indexed {
-                true => indices.iter().max().unwrap() - indices.iter().min().unwrap() + 1,
-                false => VERTICES,
+            // the buffer the right way up and upside down, and culling
+            // either way round, which the GPU turns over with the window
+            for (flip, cull) in [(1 << 24, 0), (0, 0), (0, 1), (0, 2), (1 << 24, 1)] {
+                registers[REG_FRAMEBUFFER_DIMENSIONS] = SIZE | ((SIZE - 1) << 12) | flip;
+                registers[REG_FACE_CULLING] = cull;
+                let mut decoded = ConsoleMemory::default();
+                let mut raw = ArrayMemory::new();
+                decoded.write(0x1400_0000, &bytes);
+                decoded.write(0x1400_0000 + INDICES, &index_bytes);
+                raw.write(0x1400_0000, &bytes);
+                raw.write(0x1400_0000 + INDICES, &index_bytes);
+                decoded.write(COLOR, &vec![0u8; (SIZE * SIZE * 4) as usize]);
+                raw.write(COLOR, &vec![0u8; (SIZE * SIZE * 4) as usize]);
+                let indexed = case.indices.is_some();
+                draw(&registers, &unit, &unit, &fixed, &mut decoded, &mut resources, indexed, None);
+                resources.hardware.as_mut().unwrap().flush(&mut decoded).unwrap();
+                draw(&registers, &unit, &unit, &fixed, &mut raw, &mut resources, indexed, None);
+                resources.hardware.as_mut().unwrap().flush(&mut raw).unwrap();
+                // the first array whole, from the first vertex used to the last
+                let span = match indexed {
+                    true => indices.iter().max().unwrap() - indices.iter().min().unwrap() + 1,
+                    false => VERTICES,
+                };
+                let whole = ((span - 1) * case.loaders[0].1 + sizes[0]) as usize;
+                assert!(raw.sliced.contains(&whole), "case {number}, the arrays went to the GPU as they are");
+                let (mut a, mut b) = (vec![0u8; (SIZE * SIZE * 4) as usize], vec![0u8; (SIZE * SIZE * 4) as usize]);
+                decoded.read(COLOR, &mut a);
+                raw.read(COLOR, &mut b);
+                let drawn = a.chunks(4).filter(|pixel| *pixel != [0; 4]).count();
+                if cull == 0 {
+                    assert!(drawn > 50, "case {number}, only {drawn} pixels drawn");
+                }
+                assert!(a == b, "case {number}, flip {flip:X}, cull {cull}: the arrays decode differently");
+            }
+        }
+    }
+
+    /// memory that counts its writes, which handing a draw out takes.
+    struct Counted(ConsoleMemory, u64);
+
+    impl GpuMemory for Counted {
+        fn read(&mut self, addr: u32, out: &mut [u8]) {
+            self.0.read(addr, out);
+        }
+
+        fn write(&mut self, addr: u32, data: &[u8]) {
+            self.1 += 1;
+            self.0.write(addr, data);
+        }
+
+        fn slice(&mut self, addr: u32, len: usize) -> Option<&[u8]> {
+            self.0.slice(addr, len)
+        }
+
+        fn slice_mut(&mut self, addr: u32, len: usize) -> Option<&mut [u8]> {
+            self.1 += 1;
+            self.0.slice_mut(addr, len)
+        }
+
+        fn translate(&self, paddr: u32) -> u32 {
+            self.0.translate(paddr)
+        }
+
+        fn writes(&self) -> Option<u64> {
+            Some(self.1)
+        }
+    }
+
+    /// a draw whose vertex work another thread did draws what it draws on
+    /// its own, and work done for a draw that changed since, or with
+    /// memory written since, is done again by the draw.
+    #[test]
+    fn draws_handed_out_draw_as_they_would() {
+        const SIZE: u32 = 32;
+        const BASE: u32 = 0x2000_0000;
+        const INDICES: u32 = 0x6000;
+        const VERTICES: u32 = 96;
+        const IDENTITY: u32 = 0x1B << 5 | 0x1B << 14 | 0x1B << 23;
+        let mut unit = ShaderUnit::new();
+        unit.descriptors[0] = 0xF | IDENTITY;
+        let op = |opcode: u32, destination: u32, src1: u32, src2: u32| opcode << 26 | destination << 21 | src1 << 12 | src2 << 7;
+        // o0 = c0 * v0, o1 = c1 * v1
+        let program = [op(0x08, 0x00, 0x20, 0x00), op(0x08, 0x01, 0x21, 0x01), 0x22 << 26];
+        unit.program[..program.len()].copy_from_slice(&program);
+        unit.float_uniforms[0] = [0.9, 0.9, 1.0, 1.0];
+        unit.float_uniforms[1] = [1.0 / 255.0; 4];
+        unit.prepare();
+        let fixed = [shader::ZERO; 16];
+
+        let mut registers = target_registers();
+        registers[REG_VIEWPORT_WIDTH] = float24(SIZE as f32 / 2.0);
+        registers[REG_VIEWPORT_HEIGHT] = float24(SIZE as f32 / 2.0);
+        registers[REG_FRAMEBUFFER_DIMENSIONS] = SIZE | ((SIZE - 1) << 12) | 1 << 24;
+        registers[REG_SHADER_OUTPUT_TOTAL] = 2;
+        registers[REG_SHADER_OUTPUT_MAP] = 0x0302_0100;
+        registers[REG_SHADER_OUTPUT_MAP + 1] = 0x0B0A_0908;
+        registers[REG_VS_OUTPUT_MASK] = 0b11;
+        registers[REG_ATTRIBUTE_BASE] = BASE >> 3;
+        registers[REG_VS_NUM_INPUT_ATTRIBUTES] = 1;
+        registers[REG_VS_BLOCK + SHADER_INPUT_MAP_LOW] = 0x10;
+        // float positions, two of them, and four byte colors, each in an
+        // array of its own
+        registers[REG_ATTRIBUTE_FORMAT_LOW] = (1 << 2 | 3) | (3 << 2 | 1) << 4;
+        registers[REG_ATTRIBUTE_FORMAT_HIGH] = 1 << 28;
+        registers[REG_ATTRIBUTE_LOADER] = 0x100;
+        registers[REG_ATTRIBUTE_LOADER + 2] = 8 << 16 | 1 << 28;
+        registers[REG_ATTRIBUTE_LOADER + 3] = 0x800;
+        registers[REG_ATTRIBUTE_LOADER + 4] = 1;
+        registers[REG_ATTRIBUTE_LOADER + 5] = 4 << 16 | 1 << 28;
+        registers[REG_VERTEX_COUNT] = VERTICES;
+        registers[REG_INDEX_ARRAY] = INDICES | 1 << 31;
+
+        let mut seed = 5u32;
+        let mut random = move || {
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            seed >> 8
+        };
+        let mut arrays = vec![0u8; 0x6000 + VERTICES as usize * 2];
+        for vertex in 0..40usize {
+            for component in 0..2 {
+                let position = (random() & 0xFFFF) as f32 / 65536.0 * 1.8 - 0.9;
+                arrays[0x100 + vertex * 8 + component * 4..][..4].copy_from_slice(&position.to_le_bytes());
+            }
+            for component in 0..4 {
+                arrays[0x800 + vertex * 4 + component] = random() as u8;
+            }
+        }
+        for index in 0..VERTICES as usize {
+            arrays[INDICES as usize + index * 2..][..2].copy_from_slice(&((random() % 40) as u16).to_le_bytes());
+        }
+        let pixels = |memory: &mut Counted| {
+            let mut pixels = vec![0u8; (SIZE * SIZE * 4) as usize];
+            memory.read(COLOR, &mut pixels);
+            pixels
+        };
+
+        // arrays in the part of memory that is in one piece, which go to
+        // the thread as bytes, and past it, which are decoded first
+        for base in [0x0010_0000, BASE] {
+            registers[REG_ATTRIBUTE_BASE] = base >> 3;
+            let memory = || {
+                let mut memory = Counted(ConsoleMemory::default(), 0);
+                let at = memory.translate(base);
+                memory.0.write(at, &arrays);
+                memory
             };
-            let whole = ((span - 1) * case.loaders[0].1 + sizes[0]) as usize;
-            assert!(raw.sliced.contains(&whole), "case {number}, the arrays went to the GPU as they are");
-            let (mut a, mut b) = (vec![0u8; (SIZE * SIZE * 4) as usize], vec![0u8; (SIZE * SIZE * 4) as usize]);
-            decoded.read(COLOR, &mut a);
-            raw.read(COLOR, &mut b);
-            let drawn = a.chunks(4).filter(|pixel| *pixel != [0; 4]).count();
-            assert!(drawn > 50, "case {number}, only {drawn} pixels drawn");
-            assert!(a == b, "case {number}, the arrays decode differently");
+            let alone = |registers: &[u32]| {
+                let mut memory = memory();
+                draw(registers, &unit, &unit, &fixed, &mut memory, &mut Resources::default(), true, None);
+                pixels(&mut memory)
+            };
+            // the draw as handed out, culled since, and with memory
+            // written in between
+            let mut culled = registers.clone();
+            culled[REG_FACE_CULLING] = 1;
+            for (drawn, write, holds) in [(&registers, false, true), (&culled, false, false), (&registers, true, false)] {
+                let mut memory = memory();
+                let handed = hand_out(&registers, &unit, &unit, &fixed, &mut memory, &mut Resources::default(), true).expect("handed out");
+                if write {
+                    memory.write(0x8000, &[1]);
+                }
+                assert_eq!(handed.holds(drawn, &unit, &unit, &fixed, memory.writes()), holds);
+                draw(drawn, &unit, &unit, &fixed, &mut memory, &mut Resources::default(), true, Some(handed));
+                let (got, expected) = (pixels(&mut memory), alone(drawn));
+                assert!(expected.chunks(4).filter(|pixel| *pixel != [0; 4]).count() > 50, "too little drawn to tell");
+                assert!(got == expected, "base 0x{base:08X}, a draw that holds {holds} drew differently");
+            }
         }
     }
 
@@ -4521,7 +5566,7 @@ mod tests {
         registers[REG_VIEWPORT_XY] = 4 | 6 << 16;
         registers[REG_VIEWPORT_WIDTH] = float24(12.0);
         registers[REG_VIEWPORT_HEIGHT] = float24(12.0);
-        registers[REG_FRAMEBUFFER_DIMENSIONS] = TRANSLATION_SIZE | ((TRANSLATION_SIZE - 1) << 12);
+        registers[REG_FRAMEBUFFER_DIMENSIONS] = TRANSLATION_SIZE | ((TRANSLATION_SIZE - 1) << 12) | 1 << 24;
         registers[REG_DEPTH_COLOR_MASK] = 0xF << 8 | 1 | 4 << 4 | 1 << 12;
         registers[REG_VIEWPORT_DEPTH_RANGE] = float24(-1.0);
         registers[REG_DEPTHMAP_ENABLE] = 1;
@@ -4808,6 +5853,7 @@ mod tests {
                                     texcoords: [[float() * 2.0, float() * 2.0], [float() * 2.0, float() * 2.0], [float() * 2.0, float() * 2.0]],
                                     quaternion: [float(), float(), float(), float()],
                                     view: [float(), float(), float()],
+                                    texcoord0_w: 1.0,
                                 }
                             })
                             .collect()
@@ -5007,7 +6053,7 @@ mod tests {
         let mut drawing = target_registers();
         drawing[REG_VIEWPORT_WIDTH] = float24(SIZE as f32 / 2.0);
         drawing[REG_VIEWPORT_HEIGHT] = float24(SIZE as f32 / 2.0);
-        drawing[REG_FRAMEBUFFER_DIMENSIONS] = SIZE | ((SIZE - 1) << 12);
+        drawing[REG_FRAMEBUFFER_DIMENSIONS] = SIZE | ((SIZE - 1) << 12) | 1 << 24;
         if depth {
             // depth written always, the stencil as it comes, the depth
             // being -z as titles map it
@@ -5022,7 +6068,7 @@ mod tests {
         sampling[REG_COLOR_BUFFER_ADDRESS] = TARGET >> 3;
         sampling[REG_VIEWPORT_WIDTH] = float24(SIZE as f32 / 2.0);
         sampling[REG_VIEWPORT_HEIGHT] = float24(SIZE as f32 / 4.0);
-        sampling[REG_FRAMEBUFFER_DIMENSIONS] = SIZE | ((SIZE / 2 - 1) << 12);
+        sampling[REG_FRAMEBUFFER_DIMENSIONS] = SIZE | ((SIZE / 2 - 1) << 12) | 1 << 24;
         sampling[REG_TEXTURE_CONFIG] = 1;
         sampling[REG_TEXTURE0_DIMENSIONS] = (SIZE / 2) | (SIZE << 16);
         let source = if depth { DEPTH } else { COLOR };
@@ -5047,6 +6093,7 @@ mod tests {
                         texcoords: [[0.0; 2]; 3],
                         quaternion: [0.0, 0.0, 0.0, 1.0],
                         view: [0.0; 3],
+                        texcoord0_w: 1.0,
                     })
                     .collect()
             })
@@ -5060,6 +6107,7 @@ mod tests {
                 texcoords: [[u, v], [0.0; 2], [0.0; 2]],
                 quaternion: [0.0, 0.0, 0.0, 1.0],
                 view: [0.0; 3],
+                texcoord0_w: 1.0,
             })
             .collect();
 
@@ -5106,7 +6154,7 @@ mod tests {
             let mut registers = target_registers();
             registers[REG_VIEWPORT_WIDTH] = float24(SIZE as f32 / 2.0);
             registers[REG_VIEWPORT_HEIGHT] = float24(SIZE as f32 / 2.0);
-            registers[REG_FRAMEBUFFER_DIMENSIONS] = SIZE | ((SIZE - 1) << 12);
+            registers[REG_FRAMEBUFFER_DIMENSIONS] = SIZE | ((SIZE - 1) << 12) | 1 << 24;
             registers[REG_COLOR_BUFFER_FORMAT] = input_format.color_buffer_raw() << 16;
             // triangles in all sorts of colors over each other
             let mut drawn = ConsoleMemory::default();
@@ -5119,6 +6167,7 @@ mod tests {
                         texcoords: [[0.0; 2]; 3],
                         quaternion: [0.0, 0.0, 0.0, 1.0],
                         view: [0.0; 3],
+                        texcoord0_w: 1.0,
                     })
                     .collect();
                 rasterize_shaded(&registers, &mut drawn, &mut resources, &triangle);
@@ -5263,7 +6312,7 @@ mod tests {
         let mut registers = target_registers();
         registers[REG_VIEWPORT_WIDTH] = float24(SIZE as f32 / 2.0);
         registers[REG_VIEWPORT_HEIGHT] = float24(SIZE as f32 / 2.0);
-        registers[REG_FRAMEBUFFER_DIMENSIONS] = SIZE | ((SIZE - 1) << 12);
+        registers[REG_FRAMEBUFFER_DIMENSIONS] = SIZE | ((SIZE - 1) << 12) | 1 << 24;
         let mut drawn = ConsoleMemory::default();
         for _ in 0..40 {
             let color = [random(), random(), random(), random()];
@@ -5274,6 +6323,7 @@ mod tests {
                     texcoords: [[0.0; 2]; 3],
                     quaternion: [0.0, 0.0, 0.0, 1.0],
                     view: [0.0; 3],
+                    texcoord0_w: 1.0,
                 })
                 .collect();
             rasterize_shaded(&registers, &mut drawn, &mut resources, &triangle);
@@ -5378,7 +6428,7 @@ mod tests {
         let mut registers = target_registers();
         registers[REG_VIEWPORT_WIDTH] = float24(SIZE as f32 / 2.0);
         registers[REG_VIEWPORT_HEIGHT] = float24(SIZE as f32 / 2.0);
-        registers[REG_FRAMEBUFFER_DIMENSIONS] = SIZE | ((SIZE - 1) << 12);
+        registers[REG_FRAMEBUFFER_DIMENSIONS] = SIZE | ((SIZE - 1) << 12) | 1 << 24;
         let mut gpu = ConsoleMemory::default();
         let triangle: Vec<Vertex> = [[-1.0, -1.0], [3.0, -1.0], [-1.0, 3.0]]
             .into_iter()
@@ -5388,6 +6438,7 @@ mod tests {
                 texcoords: [[0.0; 2]; 3],
                 quaternion: [0.0, 0.0, 0.0, 1.0],
                 view: [0.0; 3],
+                texcoord0_w: 1.0,
             })
             .collect();
         rasterize_shaded(&registers, &mut gpu, &mut resources, &triangle);
@@ -5453,7 +6504,7 @@ mod tests {
                 let mut registers = target_registers();
                 registers[REG_VIEWPORT_WIDTH] = float24(SIZE as f32 / 2.0);
                 registers[REG_VIEWPORT_HEIGHT] = float24(SIZE as f32 / 2.0);
-                registers[REG_FRAMEBUFFER_DIMENSIONS] = SIZE | ((SIZE - 1) << 12);
+                registers[REG_FRAMEBUFFER_DIMENSIONS] = SIZE | ((SIZE - 1) << 12) | 1 << 24;
                 let mut seed = 11u32;
                 let mut random = move || {
                     seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
@@ -5469,6 +6520,7 @@ mod tests {
                             texcoords: [[0.0; 2]; 3],
                             quaternion: [0.0, 0.0, 0.0, 1.0],
                             view: [0.0; 3],
+                            texcoord0_w: 1.0,
                         })
                         .collect();
                     rasterize_shaded(&registers, &mut memory, &mut resources, &triangle);
@@ -5531,13 +6583,13 @@ mod tests {
         let band = |left: f32, color: Vec4| -> Vec<Vertex> {
             [[left, -1.0], [left + 1.0, -1.0], [left, 1.0], [left + 1.0, -1.0], [left + 1.0, 1.0], [left, 1.0]]
                 .into_iter()
-                .map(|[x, y]| Vertex { clip: [x, y, 0.0, 1.0], color, texcoords: [[0.0; 2]; 3], quaternion: [0.0, 0.0, 0.0, 1.0], view: [0.0; 3] })
+                .map(|[x, y]| Vertex { clip: [x, y, 0.0, 1.0], color, texcoords: [[0.0; 2]; 3], quaternion: [0.0, 0.0, 0.0, 1.0], view: [0.0; 3], texcoord0_w: 1.0 })
                 .collect()
         };
         let mut registers = target_registers();
         registers[REG_VIEWPORT_WIDTH] = float24(SIZE as f32 / 2.0);
         registers[REG_VIEWPORT_HEIGHT] = float24(SIZE as f32 / 2.0);
-        registers[REG_FRAMEBUFFER_DIMENSIONS] = SIZE | ((SIZE - 1) << 12);
+        registers[REG_FRAMEBUFFER_DIMENSIONS] = SIZE | ((SIZE - 1) << 12) | 1 << 24;
         let transfer = hardware::Transfer {
             input: COLOR,
             output: OUTPUT,

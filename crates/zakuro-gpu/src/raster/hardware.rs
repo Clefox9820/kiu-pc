@@ -828,6 +828,58 @@ impl Replaced {
     }
 }
 
+/// how a sampler filters and wraps, and goes between an image's sizes.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+struct Filtering {
+    /// bilinear rather than point sampling, magnifying and minifying.
+    magnify: bool,
+    minify: bool,
+    /// blends the two sizes about the level of detail rather than taking
+    /// the nearer.
+    between: bool,
+    s: Wrap,
+    t: Wrap,
+    /// the levels of detail it is kept between, see Lod, and its bias in
+    /// 256ths.
+    levels: (u8, u8),
+    bias: i16,
+}
+
+impl Filtering {
+    /// a unit's, for its texture's sizes.
+    fn of(bound: &BoundTexture) -> Filtering {
+        let lod = bound.lod;
+        match bound.levels {
+            // one size is only ever magnified
+            1 => Filtering { minify: bound.linear, between: false, levels: (0, 0), bias: 0, ..Filtering::wrapping(bound) },
+            _ => Filtering { minify: lod.linear, between: lod.between, levels: (lod.min, lod.max), bias: lod.bias, ..Filtering::wrapping(bound) },
+        }
+    }
+
+    /// for a texture pack's picture, going between its sizes down to
+    /// smallest, a little sharper than the rate the coordinates change
+    /// gives, so that one drawn a little smaller than its own size, as at 3
+    /// times the console's resolution, stays as sharp as it is.
+    fn picture(bound: &BoundTexture, smallest: u32) -> Filtering {
+        Filtering {
+            minify: bound.linear,
+            between: smallest > 0 && bound.linear,
+            levels: (0, smallest as u8),
+            bias: if smallest > 0 { -128 } else { 0 },
+            ..Filtering::wrapping(bound)
+        }
+    }
+
+    /// the unit's magnifying filter and wrapping, one size of its texture.
+    fn wrapping(bound: &BoundTexture) -> Filtering {
+        Filtering { s: bound.wrap_s, t: bound.wrap_t, magnify: bound.linear, ..Filtering::OFF }
+    }
+
+    /// what a unit that is off samples with.
+    const OFF: Filtering =
+        Filtering { magnify: false, minify: false, between: false, s: Wrap::ClampToEdge, t: Wrap::ClampToEdge, levels: (0, 0), bias: 0 };
+}
+
 /// how long a batch spends uploading texture pack pictures, and how many
 /// bytes of them it uploads, past the first picture, so that a scene's
 /// pictures coming in at once are spread over a few frames rather than hold
@@ -1429,7 +1481,9 @@ pub struct Hardware {
     /// the same writing an image, made the first time it is needed.
     upright_image: Option<Compute>,
     samples: Option<Local>,
-    samplers: QuickMap<(bool, Wrap, Wrap, u32), vk::Sampler>,
+    samplers: QuickMap<Filtering, vk::Sampler>,
+    /// the furthest a sampler's bias reaches, past which a unit's is cut.
+    max_bias: f32,
     ring: Buffer,
     used: u64,
     readback: Option<Buffer>,
@@ -1685,6 +1739,7 @@ impl Hardware {
                 upright_image: None,
                 samples: None,
                 samplers: QuickMap::default(),
+                max_bias: properties.limits.max_sampler_lod_bias,
                 used: 0,
                 readback: None,
                 surfaces: Vec::new(),
@@ -2658,24 +2713,25 @@ impl Hardware {
         };
     }
 
-    /// the texture's image, uploaded the first time it is drawn with, and
-    /// the smallest of its sizes to draw with. a texture pack's picture
-    /// takes its place once it has been read.
-    fn texture(&mut self, bound: &BoundTexture) -> Result<(vk::ImageView, u32), String> {
+    /// the texture's image, uploaded the first time it is drawn with, all
+    /// its sizes, or a texture pack's picture in its place once it has been
+    /// read, with the smallest of the picture's sizes to draw with.
+    fn texture(&mut self, bound: &BoundTexture) -> Result<(vk::ImageView, Option<u32>), String> {
         let size = (bound.width, bound.height);
-        if let Some(found) = bound.replacement.as_ref().and_then(|material| self.replacement(material, size)) {
-            return Ok(found);
+        if let Some((view, smallest)) = bound.replacement.as_ref().and_then(|material| self.replacement(material, size)) {
+            return Ok((view, Some(smallest)));
         }
         let key = Arc::as_ptr(&bound.texels) as *const u8 as usize;
         if let Some(texture) = self.textures.get_mut(&key) {
             texture.used = self.batch;
-            return Ok((texture.image.view, 0));
+            return Ok((texture.image.view, None));
         }
         self.mark(Work::Upload, false);
         self.end_rendering();
-        let image = self.image(
+        let image = self.image_levels(
             bound.width,
             bound.height,
+            bound.levels,
             COLOR_FORMAT,
             vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::TRANSFER_SRC,
             vk::ImageAspectFlags::COLOR,
@@ -2686,11 +2742,21 @@ impl Hardware {
         for (out, texel) in staging.as_chunks_mut::<4>().0.iter_mut().zip(bound.texels.iter()) {
             *out = *texel;
         }
-        let regions = [vk::BufferImageCopy::default()
-            .buffer_offset(offset)
-            .image_subresource(vk::ImageSubresourceLayers::default().aspect_mask(vk::ImageAspectFlags::COLOR).layer_count(1))
-            .image_extent(vk::Extent3D { width: bound.width, height: bound.height, depth: 1 })];
-        // SAFETY: recording, the region lies inside the ring and the image
+        // the sizes one after the other, each half the last
+        let regions: Vec<vk::BufferImageCopy> = (0..bound.levels)
+            .scan(offset, |start, level| {
+                let (width, height) = (bound.width >> level, bound.height >> level);
+                let region = vk::BufferImageCopy::default()
+                    .buffer_offset(*start)
+                    .image_subresource(
+                        vk::ImageSubresourceLayers::default().aspect_mask(vk::ImageAspectFlags::COLOR).mip_level(level).layer_count(1),
+                    )
+                    .image_extent(vk::Extent3D { width, height, depth: 1 });
+                *start += (width * height) as u64 * 4;
+                Some(region)
+            })
+            .collect();
+        // SAFETY: recording, the regions lie inside the ring and the image
         unsafe {
             self.unfenced = true;
             self.device.cmd_copy_buffer_to_image(self.commands, self.ring.buffer, image.image, vk::ImageLayout::GENERAL, &regions)
@@ -2698,7 +2764,7 @@ impl Hardware {
         self.uploads = true;
         let view = image.view;
         self.textures.insert(key, Texture { image, _texels: bound.texels.clone(), used: self.batch });
-        Ok((view, 0))
+        Ok((view, None))
     }
 
     /// the image of a texture pack's picture for a texture of size, and
@@ -2816,10 +2882,9 @@ impl Hardware {
         }
     }
 
-    /// a sampler for a unit, which goes between an image's sizes down to
-    /// smallest, as texture pack pictures have them.
-    fn sampler(&mut self, linear: bool, s: Wrap, t: Wrap, smallest: u32) -> Result<vk::Sampler, String> {
-        if let Some(&sampler) = self.samplers.get(&(linear, s, t, smallest)) {
+    /// a sampler for a unit.
+    fn sampler(&mut self, filtering: Filtering) -> Result<vk::Sampler, String> {
+        if let Some(&sampler) = self.samplers.get(&filtering) {
             return Ok(sampler);
         }
         // the border is the shader's to draw, past the edge it clamps
@@ -2828,23 +2893,21 @@ impl Hardware {
             Wrap::MirroredRepeat => vk::SamplerAddressMode::MIRRORED_REPEAT,
             _ => vk::SamplerAddressMode::CLAMP_TO_EDGE,
         };
-        let filter = if linear { vk::Filter::LINEAR } else { vk::Filter::NEAREST };
-        let between = if smallest > 0 && linear { vk::SamplerMipmapMode::LINEAR } else { vk::SamplerMipmapMode::NEAREST };
-        // a picture drawn a little smaller than its own size, as at 3 times
-        // the console's resolution, stays as sharp as it is
-        let bias = if smallest > 0 { -0.5 } else { 0.0 };
+        let filter = |linear: bool| if linear { vk::Filter::LINEAR } else { vk::Filter::NEAREST };
+        let between = if filtering.between { vk::SamplerMipmapMode::LINEAR } else { vk::SamplerMipmapMode::NEAREST };
         let info = vk::SamplerCreateInfo::default()
-            .mag_filter(filter)
-            .min_filter(filter)
+            .mag_filter(filter(filtering.magnify))
+            .min_filter(filter(filtering.minify))
             .mipmap_mode(between)
-            .mip_lod_bias(bias)
-            .address_mode_u(mode(s))
-            .address_mode_v(mode(t))
+            .mip_lod_bias((filtering.bias as f32 / 256.0).clamp(-self.max_bias, self.max_bias))
+            .address_mode_u(mode(filtering.s))
+            .address_mode_v(mode(filtering.t))
             .address_mode_w(vk::SamplerAddressMode::CLAMP_TO_EDGE)
-            .max_lod(smallest as f32);
+            .min_lod(filtering.levels.0 as f32)
+            .max_lod(filtering.levels.1 as f32);
         // SAFETY: plain object creation on our device
         let sampler = unsafe { self.device.create_sampler(&info, None) }.map_err(vk_error("create a sampler"))?;
-        self.samplers.insert((linear, s, t, smallest), sampler);
+        self.samplers.insert(filtering, sampler);
         Ok(sampler)
     }
 
@@ -3187,7 +3250,7 @@ impl Hardware {
                 view[0] * w,
                 view[1] * w,
                 view[2] * w,
-                0.0,
+                v.texcoord0_w_over_w * w,
             ];
             for (bytes, value) in out.as_chunks_mut::<4>().0.iter_mut().zip(values) {
                 *bytes = value.to_le_bytes();
@@ -3571,7 +3634,7 @@ impl Hardware {
         for (unit, bound) in draw.textures.iter().enumerate() {
             match bound {
                 Some(bound) => {
-                    let smallest = match bound.drawn {
+                    let filtering = match bound.drawn {
                         Some(drawn) => {
                             if real {
                                 views[unit] = self.copy_texture(&drawn, bound, false)?;
@@ -3579,18 +3642,21 @@ impl Hardware {
                             if twin {
                                 twin_views[unit] = self.copy_texture(&drawn, bound, true)?;
                             }
-                            0
+                            Filtering::of(bound)
                         }
                         None => {
-                            let (view, smallest) = self.texture(bound)?;
+                            let (view, picture) = self.texture(bound)?;
                             (views[unit], twin_views[unit]) = (view, view);
-                            smallest
+                            match picture {
+                                Some(smallest) => Filtering::picture(bound, smallest),
+                                None => Filtering::of(bound),
+                            }
                         }
                     };
-                    samplers[unit] = self.sampler(bound.linear, bound.wrap_s, bound.wrap_t, smallest)?;
+                    samplers[unit] = self.sampler(filtering)?;
                     enabled |= 1 << unit;
                 }
-                None => samplers[unit] = self.sampler(false, Wrap::ClampToEdge, Wrap::ClampToEdge, 0)?,
+                None => samplers[unit] = self.sampler(Filtering::OFF)?,
             }
         }
         let tables = match draw.lighting.is_some() || draw.proctex || draw.fog {
@@ -3664,7 +3730,13 @@ impl Hardware {
         let writable = r[REG_DEPTH_STENCIL_WRITE] != 0;
         let depth_test = mask & 1 != 0;
         let depth_write = writable && mask & (1 << 12) != 0;
-        let stencil_test = draw.depth.is_some_and(|(_, bytes)| bytes == 4) && r[REG_STENCIL_TEST] & 1 != 0;
+        // the stencil's operations apply with its test's bit clear too, the
+        // test then passing always, see Stencil::read
+        let stencil_test = draw.depth.is_some_and(|(_, bytes)| bytes == 4) && super::Stencil::read(r, writable).is_some();
+        let stencil_compare = match r[REG_STENCIL_TEST] & 1 {
+            0 => r[REG_STENCIL_TEST] & !0x70 | 0x10,
+            _ => r[REG_STENCIL_TEST],
+        };
         // only the bits compile_pipeline reads, so draws that differ
         // elsewhere share a pipeline
         let blend = (r[REG_COLOR_OPERATION] & 0x100 != 0).then_some(r[REG_BLEND_FUNC] & 0xFFFF_0707);
@@ -3745,16 +3817,27 @@ impl Hardware {
             }
         }
 
+        // a buffer upside down has the window's rows run from its top, a
+        // viewport of negative height turning clip space over, and the
+        // triangles that turns over cull as they would the right way up.
+        // the CPU placed its vertices that way already
+        let flip = super::upside_down(draw.registers) && matches!(draw.geometry, Geometry::Shaded(_));
         // where the PICA's viewport puts clip space, for what the GPU
         // shades, the whole target for what the CPU placed on it
         let (x, y, viewport_width, viewport_height) = match draw.geometry {
+            Geometry::Shaded(shading) if flip => {
+                let (x, y, width, viewport_height) = shading.viewport;
+                (x, height - y, width, -viewport_height)
+            }
             Geometry::Shaded(shading) => shading.viewport,
             Geometry::Placed { .. } => (0.0, 0.0, width, height),
         };
         let y = y + raise as f32;
         let cull = match draw.geometry {
-            Geometry::Shaded(shading) if shading.cull == 1 => vk::CullModeFlags::FRONT,
-            Geometry::Shaded(shading) if shading.cull != 0 => vk::CullModeFlags::BACK,
+            Geometry::Shaded(shading) if shading.cull == 1 && !flip => vk::CullModeFlags::FRONT,
+            Geometry::Shaded(shading) if shading.cull != 0 && !flip => vk::CullModeFlags::BACK,
+            Geometry::Shaded(shading) if shading.cull == 1 => vk::CullModeFlags::BACK,
+            Geometry::Shaded(shading) if shading.cull != 0 => vk::CullModeFlags::FRONT,
             _ => vk::CullModeFlags::NONE,
         };
         let scale = self.scale;
@@ -3781,7 +3864,7 @@ impl Hardware {
             depth_compare: if depth_test { COMPARES[((mask >> 4) & 7) as usize] } else { vk::CompareOp::ALWAYS },
             depth_write: depth.is_some() && depth_write,
             stencil_test,
-            stencil: (r[REG_STENCIL_TEST], r[REG_STENCIL_OP]),
+            stencil: (stencil_compare, r[REG_STENCIL_OP]),
             writable,
             blend_constants: r[REG_BLEND_COLOR].to_le_bytes().map(|c| c as f32 / 255.0),
             blend,
@@ -4196,6 +4279,35 @@ impl Hardware {
         let row_bytes = surface.row_bytes();
         let stale = surface.stale.is_some_and(|(from, to)| from < (row + texture.height) * row_bytes && row * row_bytes < to);
         surface.dirty.is_some() && !changed && !stale
+    }
+
+    /// whether a texture is rows of a color surface guest memory got back
+    /// and has not changed since, which draw then copies on the GPU as it
+    /// does one memory lacks, at the scale it was drawn. a game that reads
+    /// its frame as a texture narrower than it was drawn, which writes the
+    /// frame back, then draws the frame over itself as a texture its own
+    /// width, would otherwise have the console's resolution in memory take
+    /// the place of the scaled frame.
+    pub(crate) fn holds_unchanged<M: GpuMemory>(&self, memory: &mut M, texture: &DrawnTexture) -> bool {
+        let Some((index, row)) = self.texture_source(texture) else { return false };
+        let surface = &self.surfaces[index];
+        if !matches!(surface.kind, Kind::Color(_)) || surface.dirty.is_some() || surface.stale.is_some() {
+            return false;
+        }
+        let row_bytes = surface.row_bytes();
+        let rows = (surface.height - row).min(texture.height);
+        let (at, len) = (surface.addr + row * row_bytes, rows * row_bytes);
+        // memory behind another surface drawn over it says nothing of this one
+        if (0..self.surfaces.len()).any(|i| i != index && self.surfaces[i].dirty_overlaps(at, len)) {
+            return false;
+        }
+        let range = (row * row_bytes) as usize..((row + rows) * row_bytes) as usize;
+        if let Some(now) = memory.slice(at, len as usize) {
+            return surface.shadows(range, now);
+        }
+        let mut now = vec![0u8; len as usize];
+        memory.read(at, &mut now);
+        surface.shadows(range, &now)
     }
 
     /// the image of a texture copied from the surface it is part of, copied

@@ -98,6 +98,15 @@ pub struct Memory {
     /// while a loop is watched for changing nothing, what each byte the CPU
     /// wrote held before its first write, see crate::idle.
     write_log: Option<Box<WriteLog>>,
+
+    /// physical pages something keeps a copy of, the textures the GPU
+    /// decoded, by page number, each with the watch it has been watched
+    /// since, unwritten. the CPU writes them the slow way, through any
+    /// address that maps them, and the first write of anything ends the
+    /// watch, see watch_physical.
+    watched: HashMap<u32, u64>,
+    /// the watches so far.
+    watches: u64,
 }
 
 /// what the CPU's writes wrote over, byte by byte.
@@ -175,6 +184,7 @@ impl Memory {
         }
         self.guards.clear();
         self.write_guards.clear();
+        self.watched.clear();
         self.gpu_sync = None;
         self.faults.clear();
         for (page, read, write) in state.pages {
@@ -212,7 +222,71 @@ impl Memory {
             mappings: BTreeMap::new(),
             faults: BTreeMap::new(),
             write_log: None,
+            watched: HashMap::new(),
+            watches: 0,
         }
+    }
+
+    /// watches the physical pages under a range for writes from now on,
+    /// the CPU's through every address mapping them, and gives what
+    /// unchanged_physical takes to tell whether one came since. the GPU
+    /// keeps textures it decoded this way, rather than reading them again
+    /// at each command list to see whether they changed.
+    pub fn watch_physical(&mut self, paddr: u32, len: u32) -> u64 {
+        self.watches += 1;
+        let watch = self.watches;
+        for page in physical_pages(paddr, len) {
+            if let std::collections::hash_map::Entry::Vacant(entry) = self.watched.entry(page) {
+                entry.insert(watch);
+                for vaddr in aliases(&self.mappings, page) {
+                    self.cpu_write_table[(vaddr >> PAGE_BITS) as usize] = std::ptr::null_mut();
+                }
+            }
+        }
+        watch
+    }
+
+    /// whether nothing wrote the physical pages under a range since
+    /// watch_physical gave watch.
+    pub fn unchanged_physical(&self, paddr: u32, len: u32, watch: u64) -> bool {
+        physical_pages(paddr, len).all(|page| self.watched.get(&page).is_some_and(|&since| since <= watch))
+    }
+
+    /// something wrote the physical pages under a range, which ends their
+    /// watches.
+    pub(crate) fn wrote_physical(&mut self, paddr: u32, len: u32) {
+        if self.watched.is_empty() {
+            return;
+        }
+        for page in physical_pages(paddr, len) {
+            if self.watched.remove(&page).is_some() {
+                for vaddr in aliases(&self.mappings, page) {
+                    let index = (vaddr >> PAGE_BITS) as usize;
+                    if !guarded_page(&self.write_guards, index) {
+                        self.cpu_write_table[index] = self.write_table[index];
+                    }
+                }
+            }
+        }
+    }
+
+    /// something wrote the page a virtual address falls in.
+    fn wrote_page(&mut self, vaddr: VAddr) {
+        if self.watched.is_empty() {
+            return;
+        }
+        let pointer = self.write_table[(vaddr >> PAGE_BITS) as usize];
+        if let Some(paddr) = (!pointer.is_null()).then(|| self.phys.paddr_of(pointer)).flatten() {
+            self.wrote_physical(paddr, 1);
+        }
+    }
+
+    /// whether the physical page behind a virtual one is watched.
+    fn watched_page(&self, index: usize) -> bool {
+        let pointer = self.write_table[index];
+        !self.watched.is_empty()
+            && !pointer.is_null()
+            && self.phys.paddr_of(pointer).is_some_and(|paddr| self.watched.contains_key(&(paddr >> PAGE_BITS)))
     }
 
     /// starts noting what the CPU's writes write over, forgetting what was
@@ -287,7 +361,7 @@ impl Memory {
             }
             if permission.contains(Permission::WRITE) {
                 self.write_table[index] = ptr;
-                if !guarded_page(&self.write_guards, index) {
+                if !guarded_page(&self.write_guards, index) && !self.watched.contains_key(&(page_paddr >> PAGE_BITS)) {
                     self.cpu_write_table[index] = ptr;
                 }
             }
@@ -412,6 +486,12 @@ impl Memory {
 
     /// writes a word to any mapped page, whatever its permissions say.
     pub fn write32_privileged(&mut self, vaddr: VAddr, value: u32) -> bool {
+        for address in [vaddr, vaddr.wrapping_add(3)] {
+            let pointer = self.read_table[(address >> PAGE_BITS) as usize];
+            if let Some(paddr) = (!pointer.is_null()).then(|| self.phys.paddr_of(pointer)).flatten() {
+                self.wrote_physical(paddr, 1);
+            }
+        }
         let offset = (vaddr & PAGE_MASK) as usize;
         if offset > PAGE_SIZE as usize - 4 {
             // straddles a page, fall back to the byte path, which resolves
@@ -490,8 +570,10 @@ impl Memory {
             let offset = (addr & PAGE_MASK) as usize;
             let chunk = (PAGE_SIZE as usize - offset).min(data.len() - done);
             match self.page_write(addr) {
-                Some(page) => page[offset..offset + chunk]
-                    .copy_from_slice(&data[done..done + chunk]),
+                Some(page) => {
+                    page[offset..offset + chunk].copy_from_slice(&data[done..done + chunk]);
+                    self.wrote_page(addr);
+                }
                 None => self.note_fault(addr),
             }
             done += chunk;
@@ -501,6 +583,7 @@ impl Memory {
     /// writes straight to physical memory, bypassing the page table and its
     /// permissions.
     pub fn write_physical(&mut self, paddr: u32, data: &[u8]) -> bool {
+        self.wrote_physical(paddr, data.len() as u32);
         match self.phys.host_slice_mut(paddr, data.len() as u32) {
             Some(slice) => {
                 slice.copy_from_slice(data);
@@ -532,6 +615,7 @@ impl Memory {
 
     /// zeroes a physical range, for BSS and freshly allocated pages.
     pub fn zero_physical(&mut self, paddr: u32, size: u32) -> bool {
+        self.wrote_physical(paddr, size);
         match self.phys.host_slice_mut(paddr, size) {
             Some(slice) => {
                 slice.fill(0);
@@ -671,6 +755,7 @@ impl Memory {
 
     #[cold]
     fn cpu_page_write_guarded(&mut self, addr: VAddr, len: u32) -> Option<&mut [u8]> {
+        self.wrote_page(addr);
         self.unguard_writes(addr, len);
         self.page_write(addr)
     }
@@ -683,7 +768,7 @@ impl Memory {
             // SAFETY: as in unguard
             unsafe { (sync.sync_write)(sync.gpu, sync.linear_base, self, from, to - from) };
             for index in (from >> PAGE_BITS) as usize..=((to - 1) >> PAGE_BITS) as usize {
-                if !guarded_page(&self.write_guards, index) {
+                if !guarded_page(&self.write_guards, index) && !self.watched_page(index) {
                     self.cpu_write_table[index] = self.write_table[index];
                 }
             }
@@ -735,6 +820,20 @@ fn add_guard(guards: &mut BTreeMap<VAddr, VAddr>, table: &mut [*mut u8], vaddr: 
     guards.insert(start, end);
     let pages = (vaddr >> PAGE_BITS) as usize..=((vaddr.saturating_add(len - 1)) >> PAGE_BITS) as usize;
     table[pages].fill(std::ptr::null_mut());
+}
+
+/// the numbers of the physical pages a range covers.
+fn physical_pages(paddr: u32, len: u32) -> std::ops::RangeInclusive<u32> {
+    (paddr >> PAGE_BITS)..=(paddr.saturating_add(len.max(1) - 1) >> PAGE_BITS)
+}
+
+/// the virtual addresses of a physical page, one for each mapping of it.
+fn aliases(mappings: &BTreeMap<VAddr, Mapping>, page: u32) -> impl Iterator<Item = VAddr> + '_ {
+    let paddr = page << PAGE_BITS;
+    mappings
+        .values()
+        .filter(move |mapping| paddr.wrapping_sub(mapping.paddr) < mapping.size)
+        .map(move |mapping| mapping.base + (paddr - mapping.paddr))
 }
 
 /// whether any of a page is still guarded.
@@ -964,5 +1063,39 @@ mod tests {
         assert_eq!(drawn.asked, 3);
         assert_eq!(memory.read32(0x1F00_2000), 0xABAB_AB00);
         memory.clear_gpu_sync();
+    }
+
+    /// a watched range stays unchanged until something writes it: the CPU
+    /// through any address mapping it, a mapping made after the watch
+    /// among them, a service, or a write to physical memory. writes beside
+    /// it leave it alone, and the CPU writes the pages fast again after.
+    #[test]
+    fn a_watch_ends_at_any_write_over_it() {
+        let mut memory = Memory::new(false, 0x0400_0000);
+        let block = memory.phys.allocate(MemoryRegion::Application, 0x3000).unwrap();
+        memory.map(0x1400_0000, block.addr, 0x3000, Permission::RW, MemoryState::Private);
+        memory.map(0x0800_0000, block.addr, 0x3000, Permission::RW, MemoryState::Alias);
+        let texture = (block.addr + 0x1000, 0x1000);
+        let writes: [(&str, fn(&mut Memory, u32)); 6] = [
+            ("the CPU", |memory, _| memory.write32(0x1400_1010, 1)),
+            ("the CPU through an alias", |memory, _| memory.write8(0x0800_1FFF, 1)),
+            ("a service", |memory, _| memory.write_bytes(0x1400_0FFE, &[1, 2, 3])),
+            ("physical memory", |memory, paddr| _ = memory.write_physical(paddr + 0x1800, &[1])),
+            ("zeroing", |memory, paddr| _ = memory.zero_physical(paddr + 0x1000, 4)),
+            ("the CPU through a later mapping", |memory, _| {
+                memory.mirror(0x0900_0000, 0x1400_0000, 0x3000);
+                memory.write16(0x0900_1002, 1);
+            }),
+        ];
+        for (what, write) in writes {
+            let watch = memory.watch_physical(texture.0, texture.1);
+            // beside it
+            memory.write32(0x1400_0000, 1);
+            memory.write32(0x1400_2000, 1);
+            assert!(memory.unchanged_physical(texture.0, texture.1, watch), "{what}: a write beside it");
+            write(&mut memory, block.addr);
+            assert!(!memory.unchanged_physical(texture.0, texture.1, watch), "{what}");
+            assert!(!memory.cpu_write_table[0x14001].is_null(), "{what}: the CPU writes the page fast again");
+        }
     }
 }

@@ -15,7 +15,8 @@ layout(location = 2) out vec2 out_texcoord2;
 // the mapped depth before any w-buffer scaling, linear on the screen
 layout(location = 3) noperspective out float out_depth;
 layout(location = 4) out vec4 out_quaternion;
-layout(location = 5) out vec3 out_view;
+// the view vector, and in w texture coordinate set 0's w
+layout(location = 5) out vec4 out_view;
 
 void main() {
     // the mapped depth on the rasterizer's side too, for draws whose
@@ -26,5 +27,5 @@ void main() {
     out_texcoord2 = texcoord2_depth.xy;
     out_depth = texcoord2_depth.z;
     out_quaternion = quaternion;
-    out_view = view.xyz;
+    out_view = view;
 }

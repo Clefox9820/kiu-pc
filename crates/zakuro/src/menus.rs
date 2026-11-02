@@ -940,6 +940,18 @@ impl Menus {
     }
 }
 
+/// a line a GameOverlay keeps over the game, in the bottom right corner.
+pub fn corner(ctx: &egui::Context, text: &str) {
+    egui::Area::new(egui::Id::new("overlay corner"))
+        .anchor(egui::Align2::RIGHT_BOTTOM, Vec2::new(-8.0, -8.0))
+        .interactable(false)
+        .show(ctx, |ui| {
+            egui::Frame::popup(ui.style()).show(ui, |ui| {
+                ui.label(text);
+            });
+        });
+}
+
 /// a recompile's progress bar with where it is.
 fn progress(ui: &mut egui::Ui, job: &Job) {
     let stage = job.stage();

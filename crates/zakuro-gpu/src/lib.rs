@@ -61,6 +61,26 @@ pub trait GpuMemory {
 
     /// the same for the CPU's writes there.
     fn guard_writes(&mut self, _addr: u32, _len: u32) {}
+
+    /// how many times something wrote memory through write or slice_mut so
+    /// far, for the walk ahead of a command list to tell whether the
+    /// vertices it read are still there. none where nothing counts, which
+    /// keeps that walk off.
+    fn writes(&self) -> Option<u64> {
+        None
+    }
+
+    /// watches a range for writes of anything from now on, the CPU's, a
+    /// service's or the GPU's own, and gives what unchanged takes to tell
+    /// whether one came since. none where nothing watches.
+    fn watch(&mut self, _addr: u32, _len: u32) -> Option<u64> {
+        None
+    }
+
+    /// whether nothing wrote over a range since watch gave watch.
+    fn unchanged(&mut self, _addr: u32, _len: u32, _watch: u64) -> bool {
+        false
+    }
 }
 
 /// what one LCD controller holds.
@@ -174,6 +194,14 @@ pub struct Gpu {
     resources: raster::Resources,
     /// frame interpolation's record of the draws, none while it is off.
     interpolation: Option<interpolation::Interpolation>,
+    /// the copy of the registers and shader units that walks each command
+    /// list ahead of the real walk, see scout.
+    scout: Option<Box<Gpu>>,
+    /// whether this is that copy.
+    scouting: bool,
+    /// the vertex work of each draw the walk ahead got to, in order, none
+    /// for one it handed out nothing for.
+    ahead: std::collections::VecDeque<Option<raster::Handed>>,
 }
 
 /// number of external register words we track (0x1EF00000..0x1EF04000).
@@ -208,6 +236,9 @@ impl Gpu {
             busy: std::time::Duration::ZERO,
             resources: raster::Resources::default(),
             interpolation: None,
+            scout: None,
+            scouting: false,
+            ahead: std::collections::VecDeque::new(),
         }
     }
 
@@ -589,8 +620,38 @@ impl Gpu {
     ) {
         let start = std::time::Instant::now();
         self.resources.textures.begin_list();
+        if self.resources.hands_out() && memory.writes().is_some() {
+            self.scout(memory, paddr, size);
+        }
         self.run_command_list(memory, renderer, paddr, size);
+        // work the real walk did not take is left undone, or finishes on
+        // its own where a thread started on it
+        self.ahead.clear();
         self.busy += start.elapsed();
+    }
+
+    /// walks a command list ahead of the real walk, on a copy of the
+    /// registers, shader units and fixed attributes, reading each draw's
+    /// vertices and handing them to other threads to shade, clip and place
+    /// on the screen. the real walk takes that work at the same draw when
+    /// it finds the draw as the walk ahead saw it, so the threads shade
+    /// while it goes on through the list, see raster::hand_out. the copy
+    /// draws nothing and writes no memory, the tables it keeps only move
+    /// their index registers on as the real ones do.
+    fn scout<M: GpuMemory>(&mut self, memory: &mut M, paddr: u32, size: u32) {
+        let mut scout = self.scout.take().unwrap_or_else(|| Box::new(Gpu { scouting: true, ..Gpu::new() }));
+        scout.internal.copy_from_slice(&self.internal);
+        scout.vertex_shader.clone_from(&self.vertex_shader);
+        scout.geometry_shader.clone_from(&self.geometry_shader);
+        scout.fixed_attributes = self.fixed_attributes;
+        scout.fixed_attribute_staging = self.fixed_attribute_staging;
+        scout.fixed_attribute_words = self.fixed_attribute_words;
+        scout.immediate.attributes = self.immediate.attributes;
+        scout.immediate.next_attribute = self.immediate.next_attribute;
+        scout.immediate.vertices.clear();
+        scout.run_command_list(memory, &mut SoftwareRenderer::default(), paddr, size);
+        std::mem::swap(&mut self.ahead, &mut scout.ahead);
+        self.scout = Some(scout);
     }
 
     /// draws on the host's GPU from now on, rather than in software, and
@@ -631,6 +692,16 @@ impl Gpu {
         let drawn = pack.is_some();
         self.resources.textures.set_pack(pack);
         drawn
+    }
+
+    /// whether the 3D is drawn on the host's GPU, enable_hardware_renderer
+    /// having worked, rather than in software.
+    pub fn draws_on_gpu(&self) -> bool {
+        #[cfg(feature = "vulkan")]
+        if self.resources.hardware.is_some() {
+            return true;
+        }
+        false
     }
 
     /// whether the screens the host's GPU draws are shown straight from it,
@@ -1044,12 +1115,27 @@ impl Gpu {
     /// where every write paid for the stack a draw needs.
     #[inline(never)]
     fn draw<M: GpuMemory>(&mut self, memory: &mut M, renderer: &mut dyn Renderer, indexed: bool) {
+        if self.scouting {
+            self.prepare_shaders();
+            let handed = raster::hand_out(
+                &self.internal,
+                &self.vertex_shader,
+                &self.geometry_shader,
+                &self.fixed_attributes,
+                memory,
+                &mut self.resources,
+                indexed,
+            );
+            self.ahead.push_back(handed);
+            return;
+        }
         self.draw_calls += 1;
         renderer.draw(DrawCall {
             indexed,
             registers: &self.internal,
         });
         self.prepare_shaders();
+        let handed = self.ahead.pop_front().flatten();
         // frame interpolation draws it again in between, where it moved
         let geometry = self.internal[REG_GEOSTAGE_CONFIG] & 0x3 == 2;
         let twins = self.resources.twins();
@@ -1066,6 +1152,7 @@ impl Gpu {
             memory,
             &mut self.resources,
             indexed,
+            handed,
         );
         if let Some(mut between) = between {
             self.swap_uniforms(&mut between);
@@ -1078,6 +1165,7 @@ impl Gpu {
                 memory,
                 &mut self.resources,
                 indexed,
+                None,
             );
             self.swap_uniforms(&mut between);
             if let Some(interpolation) = &mut self.interpolation {
@@ -1098,6 +1186,10 @@ impl Gpu {
     #[inline(never)]
     fn draw_immediate<M: GpuMemory>(&mut self, memory: &mut M) {
         let vertices = std::mem::take(&mut self.immediate.vertices);
+        if self.scouting {
+            // the real walk draws them, nothing is handed out for them
+            return;
+        }
         self.draw_calls += 1;
         self.vertices_drawn += vertices.len() as u64;
         self.prepare_shaders();
@@ -1442,7 +1534,7 @@ mod tests {
         write(REG_VIEWPORT_WIDTH, float24(4.0));
         write(REG_VIEWPORT_HEIGHT, float24(4.0));
         write(REG_COLOR_BUFFER_ADDRESS, COLOR_BUFFER >> 3);
-        write(REG_FRAMEBUFFER_DIMENSIONS, 8 | (7 << 12));
+        write(REG_FRAMEBUFFER_DIMENSIONS, 8 | (7 << 12) | 1 << 24);
         // color writes allowed, all four channels.
         write(REG_COLOR_BUFFER_WRITE, 0xF);
         write(REG_DEPTH_COLOR_MASK, 0xF << 8);

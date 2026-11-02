@@ -39,6 +39,7 @@ pub const REG_TEXTURE_CONFIG: usize = 0x0080;
 pub const REG_TEXTURE0_BORDER_COLOR: usize = 0x0081;
 pub const REG_TEXTURE0_DIMENSIONS: usize = 0x0082;
 pub const REG_TEXTURE0_PARAMETERS: usize = 0x0083;
+pub const REG_TEXTURE0_LOD: usize = 0x0084;
 pub const REG_TEXTURE0_ADDRESS: usize = 0x0085;
 pub const REG_TEXTURE0_FORMAT: usize = 0x008E;
 
