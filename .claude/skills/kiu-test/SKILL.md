@@ -26,6 +26,8 @@ Load before claiming a change works, after any edit under `zakuro/`, and for any
 - Compare sound between builds with `ZAKURO_WAV=<file.wav>` (`ZAKURO_WAV_FROM`, `ZAKURO_WAV_SECONDS`) from the same save state with no input; `build\port-usa` builds straight from this repo's `zakuro/`, so it is the port to switch between code versions, then rebuild it on the branch.
 - To see whether a texture replacement is used at all, make it fully transparent in a throwaway build: if the picture still shows, the draw never takes it.
 - Behaviour changes need a test that fails before the fix (RED) and passes after (GREEN) when a deterministic test is possible.
+- A raster test that rewrites a texture's memory between draws must put it at a new address: the texture cache keeps what it decoded, so the second draw silently samples the old bytes.
+- The GPU raster tests draw with `raster_depth.frag.spv`; a shader mutation check has to rebuild both `.spv` variants or it proves nothing.
 
 ## Decision Gates
 

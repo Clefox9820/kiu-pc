@@ -301,7 +301,7 @@ fn combine(u: f32, v: f32, function: u32) -> f32 {
 }
 
 /// a 16-bit float, a sign, 5 bits of exponent and 10 of mantissa.
-fn half_to_f32(half: u16) -> f32 {
+pub(crate) fn half_to_f32(half: u16) -> f32 {
     let sign = if half & 0x8000 != 0 { -1.0 } else { 1.0 };
     let exponent = ((half >> 10) & 0x1F) as i32;
     let mantissa = (half & 0x3FF) as f32 / 1024.0;

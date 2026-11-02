@@ -62,6 +62,8 @@ layout(set = 0, binding = 2) uniform sampler2D texture2;
 // unit 0 as a cube map, its faces upside down so that a cube view's t
 // matches the PICA's v
 layout(set = 0, binding = 8) uniform samplerCube texture0_cube;
+// and its faces as layers, read texel by texel for a shadow cube map
+layout(set = 0, binding = 9) uniform sampler2DArray texture0_faces;
 
 struct Light {
     vec4 specular0;
@@ -166,6 +168,70 @@ vec4 sample_unit(uint unit, vec2 uv) {
     bool border_s = (wrap_s & 3u) == 1u && (st.x < 0.0 || st.x >= 1.0);
     bool border_t = (wrap_t & 3u) == 1u && (st.y < 0.0 || st.y >= 1.0);
     return border_s || border_t ? unpack_color(units[unit].y) : sampled;
+}
+
+// the face a direction points at most, +X, -X, +Y, -Y, +Z or -Z, and the
+// s and t there, as the PICA picks them
+vec3 cube_face(vec3 d) {
+    vec3 a = abs(d);
+    float face, sc, tc, major;
+    if (a.x > a.y && a.x > a.z) {
+        major = a.x;
+        face = d.x > 0.0 ? 0.0 : 1.0;
+        sc = d.x > 0.0 ? -d.z : d.z;
+        tc = -d.y;
+    } else if (a.y > a.z) {
+        major = a.y;
+        face = d.y > 0.0 ? 2.0 : 3.0;
+        sc = d.x;
+        tc = d.y > 0.0 ? d.z : -d.z;
+    } else {
+        major = a.z;
+        face = d.z > 0.0 ? 4.0 : 5.0;
+        sc = d.z > 0.0 ? d.x : -d.x;
+        tc = -d.y;
+    }
+    major = major == 0.0 ? 1.0 : major;
+    return vec3(sc / major * 0.5 + 0.5, tc / major * 0.5 + 0.5, face);
+}
+
+// the 24-bit depth a shadow texture's texels are lit past, at a distance
+// from 0 to 1, less the bias of GPUREG_TEXUNIT0_SHADOW
+uint shadow_reference(float distance) {
+    uint bias = ((units[0].z >> 1) & 0x7FFFFFu) << 1;
+    uint d = uint(min(abs(distance), 1.0) * 16777215.0);
+    return d - min(d, bias);
+}
+
+// a shadow texel's light, byte 3, R, where its depth, bytes 0 to 2
+// big-endian, A, B and G, lies past reference
+float shadow_texel(vec4 texel, uint reference) {
+    uvec4 c = uvec4(round(texel * 255.0));
+    uint depth = (c.a << 16) | (c.b << 8) | c.g;
+    return depth > reference ? float(c.r) / 255.0 : 0.0;
+}
+
+// unit 0 as a shadow texture at (s, t), or a face of a shadow cube map,
+// four texels blended as linear filtering would. past the edge a shadow
+// texture is lit and a face takes its edge
+float shadow(vec2 st, int face, uint reference) {
+    ivec2 size = face < 0 ? textureSize(texture0, 0) : textureSize(texture0_faces, 0).xy;
+    vec2 at = vec2(st.x, 1.0 - st.y) * vec2(size) - 0.5;
+    vec2 corner = floor(at);
+    vec2 f = at - corner;
+    float lit[4];
+    for (int i = 0; i < 4; i++) {
+        ivec2 texel = ivec2(corner) + ivec2(i & 1, i >> 1);
+        if (face < 0) {
+            bool outside = any(lessThan(texel, ivec2(0))) || any(greaterThanEqual(texel, size));
+            lit[i] = outside ? 1.0 : shadow_texel(texelFetch(texture0, texel, 0), reference);
+        } else {
+            texel = clamp(texel, ivec2(0), size - 1);
+            // the faces are upside down
+            lit[i] = shadow_texel(texelFetch(texture0_faces, ivec3(texel.x, size.y - 1 - texel.y, face), 0), reference);
+        }
+    }
+    return mix(mix(lit[0], lit[1], f.x), mix(lit[2], lit[3], f.x), f.y);
 }
 
 precise float lookup(uint table, uint entry, float delta) {
@@ -656,11 +722,23 @@ void main() {
     vec4 textures[4] = vec4[4](vec4(0.0, 0.0, 0.0, 1.0), vec4(0.0, 0.0, 0.0, 1.0), vec4(0.0, 0.0, 0.0, 1.0), vec4(0.0, 0.0, 0.0, 1.0));
     if ((texture_config & 1u) != 0u) {
         // the unit's type, bits 28-30 of its configuration: a cube map, 1,
-        // samples in the direction of set 0's u, v and w, a projected
-        // texture, 3, divides u and v by w, and a disabled unit, 5, reads 0
+        // samples in the direction of set 0's u, v and w, a shadow
+        // texture, 2, is lit past set 0's w, divided by it unless
+        // orthographic, a projected texture, 3, divides u and v by w, a
+        // shadow cube map, 4, is lit past the direction's major axis, and a
+        // disabled unit, 5, reads 0
         uint kind = (units[0].x >> 28) & 7u;
         if (kind == 1u) {
             textures[0] = texture(texture0_cube, vec3(in_texcoords01.xy, in_view.w));
+        } else if (kind == 2u) {
+            bool orthographic = (units[0].z & 1u) != 0u;
+            vec2 st = orthographic ? in_texcoords01.xy : in_texcoords01.xy / in_view.w;
+            textures[0] = vec4(shadow(st, -1, shadow_reference(in_view.w)));
+        } else if (kind == 4u) {
+            vec3 direction = vec3(in_texcoords01.xy, in_view.w);
+            vec3 face = cube_face(direction);
+            vec3 a = abs(direction);
+            textures[0] = vec4(shadow(face.xy, int(face.z), shadow_reference(max(a.x, max(a.y, a.z)))));
         } else if (kind == 5u) {
             textures[0] = vec4(0.0);
         } else {

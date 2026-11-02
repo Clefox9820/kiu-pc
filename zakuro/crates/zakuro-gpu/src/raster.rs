@@ -1097,6 +1097,50 @@ fn place(registers: &[u32], shaded: &[Vertex], order: Option<&[usize]>, viewport
     Placement { placed, indices, triangles, clipped_away, culled }
 }
 
+/// GPUREG_TEXUNIT0_SHADOW, bit 0 orthographic, bits 1 to 23 the bias
+/// halved.
+const REG_TEXTURE0_SHADOW: usize = 0x08B;
+/// GPUREG_FRAMEBUFFER... 0x130, the shadow write's constant and linear
+/// factors as float16, low half and high half.
+const REG_SHADOW_FACTORS: usize = 0x130;
+
+/// the 24-bit depth a shadow texture's texels are lit past, at a
+/// distance from 0 to 1, less the bias of GPUREG_TEXUNIT0_SHADOW.
+fn shadow_reference(shadow: u32, distance: f32) -> u32 {
+    let bias = ((shadow >> 1) & 0x7F_FFFF) << 1;
+    ((distance.abs().min(1.0) * 16_777_215.0) as u32).saturating_sub(bias)
+}
+
+/// whether the draw writes shadows, color operation mode 3 in
+/// GPUREG_COLOR_OPERATION bits 0-1, and the constant and linear factors
+/// the light softens by.
+fn shadows(registers: &[u32]) -> Option<(f32, f32)> {
+    let factors = registers[REG_SHADOW_FACTORS];
+    (registers[REG_COLOR_OPERATION] & 3 == 3)
+        .then(|| (crate::proctex::half_to_f32(factors as u16), crate::proctex::half_to_f32((factors >> 16) as u16)))
+}
+
+/// a shadow buffer's pixel, rgba with the depth in A, B and G and the
+/// light in R, after a fragment at depth from 0 to 1 whose green is s:
+/// nearer than the depth there, an s of 0 moves the depth to the
+/// fragment's, any other darkens the light to s over the constant factor
+/// and the linear one times how far in front the fragment is. none when it
+/// stays as it was.
+fn shadow_write(rgba: [u8; 4], depth: f32, s: u8, (constant, linear): (f32, f32)) -> Option<[u8; 4]> {
+    let [light, g, b, a] = rgba;
+    let stored = u32::from(a) << 16 | u32::from(b) << 8 | u32::from(g);
+    let depth = (depth.clamp(0.0, 1.0) * 16_777_215.0) as u32;
+    if depth >= stored {
+        return None;
+    }
+    if s == 0 {
+        return Some([light, depth as u8, (depth >> 8) as u8, (depth >> 16) as u8]);
+    }
+    // a float past 255 or below 0 saturates
+    let softened = (s as f32 / (constant + linear * depth as f32 / stored as f32)) as u8;
+    Some([light.min(softened), g, b, a])
+}
+
 /// whether texture unit 0 is projected, a texture of type 3 in bits 28-30
 /// of its GPUREG_TEXUNIT0_PARAM: its u and v are divided by coordinate set
 /// 0's w, which titles cast reflections and shadows onto a surface with.
@@ -1475,7 +1519,8 @@ struct BoundTexture {
     levels: u32,
     lod: Lod,
     /// unit 0's type, GPUREG_TEXUNIT0_PARAM bits 28-30: 0 a plain 2D
-    /// texture, 1 a cube map, 3 projected, 5 disabled; 0 for the others.
+    /// texture, 1 a cube map, 2 a shadow texture, 3 projected, 4 a shadow
+    /// cube map, 5 disabled; 0 for the others.
     kind: u32,
     /// a cube map's six faces, +X, -X, +Y, -Y, +Z and -Z, each decoded as
     /// texels are, the first being texels.
@@ -2732,6 +2777,31 @@ impl BoundTexture {
         self.texels[(start + y * width + x) as usize].map(|c| c as f32 / 255.0)
     }
 
+    /// a shadow texture's light at (s, t), of four texels each lit by its
+    /// intensity, byte 3, where its depth, bytes 0 to 2 big-endian, lies
+    /// past reference, blended as linear filtering would. a texel past the
+    /// edge is lit when outside_lit, otherwise the edge's.
+    fn shadow(&self, s: f32, t: f32, reference: u32, outside_lit: bool) -> f32 {
+        let (width, height) = (self.width as i32, self.height as i32);
+        let (x, y) = (s * width as f32 - 0.5, (1.0 - t) * height as f32 - 0.5);
+        let (x0, y0) = (x.floor(), y.floor());
+        let (fx, fy) = (x - x0, y - y0);
+        let lit = |x: i32, y: i32| {
+            if outside_lit && !((0..width).contains(&x) && (0..height).contains(&y)) {
+                return 1.0;
+            }
+            let at = (y.clamp(0, height - 1) * width + x.clamp(0, width - 1)) as usize;
+            // RGBA8's bytes are A, B, G and R
+            let [r, g, b, a] = self.texels.get(at).copied().unwrap_or_default();
+            let depth = u32::from(a) << 16 | u32::from(b) << 8 | u32::from(g);
+            if depth > reference { r as f32 / 255.0 } else { 0.0 }
+        };
+        let (x0, y0) = (x0 as i32, y0 as i32);
+        let top = lit(x0, y0) + (lit(x0 + 1, y0) - lit(x0, y0)) * fx;
+        let bottom = lit(x0, y0 + 1) + (lit(x0 + 1, y0 + 1) - lit(x0, y0 + 1)) * fx;
+        top + (bottom - top) * fy
+    }
+
     /// samples at (u, v), magnifying the way the unit is configured.
     fn sample(&self, u: f32, v: f32) -> [f32; 4] {
         self.sample_level(0, u, v, self.linear)
@@ -2865,7 +2935,7 @@ fn bind_texture<M: GpuMemory>(
     // unit 0's type, and a cube map's five other faces, each where its
     // address register says, of the same size, format and sizes
     let kind = if unit == 0 { (registers[base + 2] >> 28) & 7 } else { 0 };
-    let cube = (kind == 1 && drawn.is_none()).then(|| {
+    let cube = (matches!(kind, 1 | 4) && drawn.is_none()).then(|| {
         Arc::new(std::array::from_fn(|face| match face {
             0 => texels.clone(),
             face => {
@@ -3360,6 +3430,10 @@ struct DrawState<'a> {
     texture2_uses_coord1: bool,
     /// texture unit 0 is projected, see projected.
     texture0_projected: bool,
+    /// GPUREG_TEXUNIT0_SHADOW, see shadow_reference.
+    texture0_shadow: u32,
+    /// the draw writes shadows, see shadow_write.
+    shadow_write: Option<(f32, f32)>,
     lighting: Option<Lighting>,
     tables: &'a Tables,
     /// texture 3, made up from its coordinates, and its tables.
@@ -3708,6 +3782,23 @@ fn fill_triangle(
                         samples[unit] = [0.0; 4];
                         continue;
                     }
+                    // a shadow texture is lit where its depth lies past
+                    // the fragment's, set 0's w, or a shadow cube map's
+                    // the direction's major axis
+                    if unit == 0 && texture.kind == 2 {
+                        let w = interpolate(qs);
+                        let (s, t) = if state.texture0_shadow & 1 == 0 { (u / w, v / w) } else { (u, v) };
+                        samples[unit] = [texture.shadow(s, t, shadow_reference(state.texture0_shadow, w), true); 4];
+                        continue;
+                    }
+                    if let (0, 4, Some(faces)) = (unit, texture.kind, &texture.cube) {
+                        let w = interpolate(qs);
+                        let (face, s, t) = cube_face(u, v, w);
+                        let major = u.abs().max(v.abs()).max(w.abs());
+                        let face = BoundTexture { texels: faces[face].clone(), cube: None, ..texture.clone() };
+                        samples[unit] = [face.shadow(s, t, shadow_reference(state.texture0_shadow, major), false); 4];
+                        continue;
+                    }
                     if let (0, Some(faces)) = (unit, &texture.cube) {
                         let (face, s, t) = cube_face(u, v, interpolate(qs));
                         let face = BoundTexture { texels: faces[face].clone(), cube: None, ..texture.clone() };
@@ -3752,6 +3843,17 @@ fn fill_triangle(
             });
             let combined = state.tex_env.apply(color, samples, fragment);
             let mut rgba = combined.map(|c| (c * 255.0) as u8);
+
+            if let Some(factors) = state.shadow_write {
+                let Some(surface) = color_surface.as_deref_mut() else { continue };
+                pixel[..bpp].copy_from_slice(surface.at(index));
+                if let Some(shadow) = shadow_write(target.format.decode(&pixel[..bpp]), depth, rgba[1], factors) {
+                    target.format.encode(shadow, &mut pixel[..bpp]);
+                    surface.at(index).copy_from_slice(&pixel[..bpp]);
+                    stats.written += 1;
+                }
+                continue;
+            }
 
             if let Some(test) = state.alpha_test {
                 if !test.passes(rgba[3]) {
@@ -4406,6 +4508,7 @@ fn rasterize<M: GpuMemory>(registers: &[u32], memory: &mut M, resources: &mut Re
     let tex_env = resources.tex_env.read(registers);
     // the lighting only matters to a draw whose combiners read it.
     let lighting = if tex_env.reads_lighting() { resources.lighting.read(registers) } else { None };
+    let shadowing = shadows(registers);
     let state = DrawState {
         target: ColorTarget {
             addr: target_addr,
@@ -4419,14 +4522,17 @@ fn rasterize<M: GpuMemory>(registers: &[u32], memory: &mut M, resources: &mut Re
             write: std::array::from_fn(|channel| color_writable && color_mask & (1 << channel) != 0),
         },
         depth_map: DepthMap::read(registers),
-        depth_stencil: DepthStencil::read(registers, memory),
+        // writing shadows tests and blends nothing
+        depth_stencil: shadowing.is_none().then(|| DepthStencil::read(registers, memory)).flatten(),
         tex_env,
-        alpha_test: AlphaTest::read(registers),
-        blend: crate::blend::Blend::read(registers),
-        logic_op: crate::blend::LogicOp::read(registers),
+        alpha_test: shadowing.is_none().then(|| AlphaTest::read(registers)).flatten(),
+        blend: shadowing.is_none().then(|| crate::blend::Blend::read(registers)).flatten(),
+        logic_op: shadowing.is_none().then(|| crate::blend::LogicOp::read(registers)).flatten(),
         textures: &textures,
         texture2_uses_coord1: registers[REG_TEXTURE_CONFIG] & (1 << 13) != 0,
         texture0_projected: projected(registers),
+        texture0_shadow: registers[REG_TEXTURE0_SHADOW],
+        shadow_write: shadowing,
         lighting,
         tables: &resources.light_tables,
         proctex: crate::proctex::ProcTex::read(registers, &resources.proctex_tables),
@@ -4473,7 +4579,11 @@ fn rasterize<M: GpuMemory>(registers: &[u32], memory: &mut M, resources: &mut Re
             Vertices::Raw { vertex_shader, raw, vertices } => Some((vertex_shader, hardware::Inputs::Raw(raw), None, Some(vertices))),
             Vertices::Shaded(_) | Vertices::Prepared(_) => None,
         };
-        if let Some((unit, inputs, order, raw)) = unshaded.filter(|_| hardware.shades() && whole && registers[REG_GEOSTAGE_CONFIG] & 0x3 != 2) {
+        // shadows are written on the CPU, which reads the buffer back
+        let shadowing = state.shadow_write.is_some();
+        if let Some((unit, inputs, order, raw)) =
+            unshaded.filter(|_| hardware.shades() && whole && !shadowing && registers[REG_GEOSTAGE_CONFIG] & 0x3 != 2)
+        {
             // GPUREG_PRIMITIVE_CONFIG bits [9:8], 0 = triangle list, 1 =
             // strip, 2 = fan, 3 = whatever the geometry shader emitted,
             // which is a list.
@@ -4526,8 +4636,9 @@ fn rasterize<M: GpuMemory>(registers: &[u32], memory: &mut M, resources: &mut Re
     #[cfg(feature = "vulkan")]
     if let Some(hardware) = resources.hardware.as_mut() {
         let target = &state.target;
-        // tiles are whole in any buffer a title really draws into
-        if target.buffer_width.is_multiple_of(8) && target.buffer_height.is_multiple_of(8) {
+        // tiles are whole in any buffer a title really draws into, and
+        // shadows are written on the CPU
+        if target.buffer_width.is_multiple_of(8) && target.buffer_height.is_multiple_of(8) && state.shadow_write.is_none() {
             let geometry = hardware::Geometry::Placed { vertices: placed, indices };
             match hardware.draw(memory, &hardware::Draw { replaces, ..state.hardware(registers, geometry) }) {
                 Ok(()) => return Some(triangle_count as u32),
@@ -5267,6 +5378,165 @@ mod tests {
             memory.write(PATTERNED + 4 * FACE, &pattern);
             let plain = draw(&mut resources, &mut memory, 0, PATTERNED + 4 * FACE, &triangle(&|x, y| [x * 0.5 + 0.5, 0.5 - y * 0.5, 1.0]));
             let cube = draw(&mut resources, &mut memory, 1, PATTERNED, &triangle(&|x, y| [x, y, 1.0]));
+            assert_eq!(cube, plain, "{renderer}");
+        }
+    }
+
+    /// a shadow texel is lit past the fragment's depth less the bias, which
+    /// counts in units of 2.
+    #[test]
+    fn the_shadow_reference_is_the_distance_less_the_bias() {
+        assert_eq!(shadow_reference(0, 0.5), 0x7F_FFFF);
+        assert_eq!(shadow_reference(0, -2.0), 0xFF_FFFF);
+        assert_eq!(shadow_reference(0x10 << 1 | 1, 0.5), 0x7F_FFFF - 0x20);
+        assert_eq!(shadow_reference(0x7F_FFFF << 1, 0.25), 0);
+    }
+
+    /// a nearer fragment of green 0 moves a shadow pixel's depth, one of
+    /// another green darkens its light by the factors, a farther one leaves
+    /// it alone.
+    #[test]
+    fn a_shadow_write_moves_depth_or_darkens_light() {
+        // light 200, depth 0x800000 in A, B and G
+        let pixel = [200, 0x00, 0x00, 0x80];
+        assert_eq!(shadow_write(pixel, 0.75, 0, (1.0, 0.0)), None);
+        assert_eq!(shadow_write(pixel, 0.25, 0, (1.0, 0.0)), Some([200, 0xFF, 0xFF, 0x3F]));
+        assert_eq!(shadow_write(pixel, 0.25, 100, (1.0, 0.0)), Some([100, 0x00, 0x00, 0x80]));
+        // 100 over 0.5 is past the light there
+        assert_eq!(shadow_write(pixel, 0.25, 150, (0.5, 0.0)), Some([200, 0x00, 0x00, 0x80]));
+        // the linear factor by the fragment's depth over the pixel's, about a half
+        assert_eq!(shadow_write(pixel, 0.25, 150, (0.5, 1.0)), Some([150, 0x00, 0x00, 0x80]));
+    }
+
+    /// draws that write shadows come out the same on the CPU and with the
+    /// GPU on, which leaves them to the CPU.
+    #[test]
+    fn shadows_are_written_with_the_gpu_on_too() {
+        #[cfg_attr(not(feature = "vulkan"), allow(unused_mut))]
+        let mut renderers = vec![("the CPU", Resources::default())];
+        #[cfg(feature = "vulkan")]
+        if let Ok(hardware) = hardware::Hardware::new() {
+            renderers.push(("the GPU", Resources { hardware: Some(hardware), ..Default::default() }));
+        }
+        for (renderer, mut resources) in renderers {
+            let mut memory = ConsoleMemory::default();
+            // light 200 and depth 0x800000 everywhere
+            memory.write(COLOR, &[0x80, 0x00, 0x00, 200].repeat(64));
+            let mut registers = target_registers();
+            registers[REG_COLOR_OPERATION] = 3;
+            // the constant factor 1.0 and the linear one 0
+            registers[REG_SHADOW_FACTORS] = 0x3C00;
+            // the vertex color through every stage
+            for stage in [0x0C8, 0x0D0, 0x0D8, 0x0F0, 0x0F8] {
+                registers[stage] = 0xF | (0xF << 16);
+            }
+            // a depth of 0 from the zeroed depth map, green 127
+            rasterize_shaded(&registers, &mut memory, &mut resources, &cover(-0.5, [0.0, 0.5, 0.0, 1.0]));
+            #[cfg(feature = "vulkan")]
+            if let Some(hardware) = resources.hardware.as_mut() {
+                hardware.flush(&mut memory).unwrap();
+            }
+            for pixel in pixels(&mut memory) {
+                assert_eq!(pixel, [127, 0x00, 0x00, 0x80], "{renderer}");
+            }
+        }
+    }
+
+    /// a shadow texture, type 2, is lit by its texels' light where their
+    /// depth lies past set 0's w less the bias, after u and v are divided
+    /// by w unless orthographic, and a shadow cube map, type 4, where it
+    /// lies past the direction's major axis, the face sampled as a shadow
+    /// texture would be, on the CPU and the GPU alike.
+    #[test]
+    fn shadow_textures_are_lit_past_the_fragments_depth() {
+        const TEXTURE: u32 = 0x10000;
+        const FACE: u32 = 8 * 8 * 4;
+        // the target across the texture once, each pixel on a texel's center
+        let triangle = |at: &dyn Fn(f32, f32) -> [f32; 3]| -> Vec<Vertex> {
+            [[-1.0, -1.0], [3.0, -1.0], [-1.0, 3.0]]
+                .into_iter()
+                .map(|[x, y]| {
+                    let [u, v, w] = at(x, y);
+                    Vertex {
+                        clip: [x, y, -0.5, 1.0],
+                        color: [1.0; 4],
+                        texcoords: [[u, v], [0.0; 2], [0.0; 2]],
+                        quaternion: [0.0, 0.0, 0.0, 1.0],
+                        view: [0.0; 3],
+                        texcoord0_w: w,
+                    }
+                })
+                .collect()
+        };
+        let draw = |resources: &mut Resources, memory: &mut ConsoleMemory, kind: u32, shadow: u32, base: u32, quad: &[Vertex]| {
+            let mut registers = target_registers();
+            registers[REG_TEXTURE_CONFIG] = 1;
+            registers[REG_TEXTURE0_DIMENSIONS] = 8 | (8 << 16);
+            registers[REG_TEXTURE0_PARAMETERS] = kind << 28;
+            registers[REG_TEXTURE0_SHADOW] = shadow;
+            for face in 0..6 {
+                registers[REG_TEXTURE0_ADDRESS + face] = (base + face as u32 * FACE) >> 3;
+            }
+            registers[0x0C0] = 0x3 | (0x3 << 16);
+            for stage in [0x0C8, 0x0D0, 0x0D8, 0x0F0, 0x0F8] {
+                registers[stage] = 0xF | (0xF << 16);
+            }
+            rasterize_shaded(&registers, memory, resources, quad);
+            #[cfg(feature = "vulkan")]
+            if let Some(hardware) = resources.hardware.as_mut() {
+                hardware.flush(memory).unwrap();
+            }
+            pixels(memory)
+        };
+        // A, B and G the depth, R the light
+        let texel = |depth: u32, light: u8| [(depth >> 16) as u8, (depth >> 8) as u8, depth as u8, light];
+        #[cfg_attr(not(feature = "vulkan"), allow(unused_mut))]
+        let mut renderers = vec![("the CPU", Resources::default())];
+        #[cfg(feature = "vulkan")]
+        if let Ok(hardware) = hardware::Hardware::new() {
+            renderers.push(("the GPU", Resources { hardware: Some(hardware), ..Default::default() }));
+        }
+        for (renderer, mut resources) in renderers {
+            let mut memory = ConsoleMemory::default();
+            // the left half far, lit by 200, the right half near
+            for y in 0..8 {
+                for x in 0..8 {
+                    let depth = if x < 4 { 0xC0_0000 } else { 0x40_0000 };
+                    memory.write(TEXTURE + crate::format::morton_offset(x, y, 8, 4), &texel(depth, 200));
+                }
+            }
+            // w = 0.5, u and v over it, s = x / 2 + 1 / 2
+            let half = triangle(&|x, y| [(x * 0.5 + 0.5) * 0.5, (y * 0.5 + 0.5) * 0.5, 0.5]);
+            let expect = |pixels: Vec<[u8; 4]>, lit: [bool; 2], case: &str| {
+                let mut sides = [0usize; 2];
+                for (i, pixel) in pixels.iter().enumerate() {
+                    // which half the pixel is in, from its place in the tile
+                    let x = (0..8).find(|&x| (0..8).any(|y| crate::format::morton_offset(x, y, 8, 4) == i as u32 * 4)).unwrap();
+                    let left = x < 4;
+                    let want = if lit[!left as usize] { [200; 4] } else { [0; 4] };
+                    assert_eq!(*pixel, want, "{renderer}, {case}, x {x}");
+                    sides[!left as usize] += 1;
+                }
+                assert_eq!(sides, [32, 32]);
+            };
+            expect(draw(&mut resources, &mut memory, 2, 0, TEXTURE, &half), [true, false], "perspective");
+            // a bias past 0x400000 lights both halves
+            expect(draw(&mut resources, &mut memory, 2, 0x20_0002 << 1, TEXTURE, &half), [true, true], "bias");
+            // orthographic, u and v as they are
+            let orthographic = triangle(&|x, y| [x * 0.5 + 0.5, y * 0.5 + 0.5, 0.5]);
+            expect(draw(&mut resources, &mut memory, 2, 1, TEXTURE, &orthographic), [true, false], "orthographic");
+
+            // the faces of a cube of their own, +Z a texel of its own at
+            // every pixel and lit or not, the major axis 1 less a bias of
+            // 0x800000 against depths around it
+            const CUBE: u32 = TEXTURE + 6 * FACE;
+            let pattern: Vec<u8> =
+                (0..64u32).flat_map(|k| texel(if k * 7 % 3 == 0 { 0x40_0000 } else { 0xC0_0000 }, (k * 4) as u8)).collect();
+            memory.write(CUBE + 4 * FACE, &pattern);
+            let bias = 0x40_0000 << 1;
+            let plain = draw(&mut resources, &mut memory, 2, bias | 1, CUBE + 4 * FACE, &triangle(&|x, y| [x * 0.5 + 0.5, 0.5 - y * 0.5, 1.0]));
+            let cube = draw(&mut resources, &mut memory, 4, bias, CUBE, &triangle(&|x, y| [x, y, 1.0]));
+            assert!(plain.iter().any(|p| p[0] != 0) && plain.iter().any(|p| p[0] == 0), "{renderer}: {plain:?}");
             assert_eq!(cube, plain, "{renderer}");
         }
     }
