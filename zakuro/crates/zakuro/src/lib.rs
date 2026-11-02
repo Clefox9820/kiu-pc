@@ -1935,7 +1935,11 @@ impl App {
                     audio.clear();
                 }
             }
-            Err(error) => self.menus.message = Some(error),
+            Err(error) => {
+                // in the log too, for runs nobody watches
+                log::warn!("{error}");
+                self.menus.message = Some(error);
+            }
         }
         self.next_frame = Instant::now();
     }
