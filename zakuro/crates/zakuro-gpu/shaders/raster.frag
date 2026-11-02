@@ -59,6 +59,9 @@ layout(constant_id = 29) const uint DYNAMIC = 0u;
 layout(set = 0, binding = 0) uniform sampler2D texture0;
 layout(set = 0, binding = 1) uniform sampler2D texture1;
 layout(set = 0, binding = 2) uniform sampler2D texture2;
+// unit 0 as a cube map, its faces upside down so that a cube view's t
+// matches the PICA's v
+layout(set = 0, binding = 8) uniform samplerCube texture0_cube;
 
 struct Light {
     vec4 specular0;
@@ -652,10 +655,17 @@ void main() {
     uint texture_config = DYNAMIC != 0u ? (misc.w & 0x2307u) | (TEXTURE_CONFIG & 0x400u) : TEXTURE_CONFIG;
     vec4 textures[4] = vec4[4](vec4(0.0, 0.0, 0.0, 1.0), vec4(0.0, 0.0, 0.0, 1.0), vec4(0.0, 0.0, 0.0, 1.0), vec4(0.0, 0.0, 0.0, 1.0));
     if ((texture_config & 1u) != 0u) {
-        // a projected texture, type 3 in bits 28-30 of the unit's
-        // configuration, divides its coordinates by set 0's w
-        bool projected = ((units[0].x >> 28) & 7u) == 3u;
-        textures[0] = sample_unit(0u, projected ? in_texcoords01.xy / in_view.w : in_texcoords01.xy);
+        // the unit's type, bits 28-30 of its configuration: a cube map, 1,
+        // samples in the direction of set 0's u, v and w, a projected
+        // texture, 3, divides u and v by w, and a disabled unit, 5, reads 0
+        uint kind = (units[0].x >> 28) & 7u;
+        if (kind == 1u) {
+            textures[0] = texture(texture0_cube, vec3(in_texcoords01.xy, in_view.w));
+        } else if (kind == 5u) {
+            textures[0] = vec4(0.0);
+        } else {
+            textures[0] = sample_unit(0u, kind == 3u ? in_texcoords01.xy / in_view.w : in_texcoords01.xy);
+        }
     }
     if ((texture_config & 2u) != 0u) {
         textures[1] = sample_unit(1u, in_texcoords01.zw);

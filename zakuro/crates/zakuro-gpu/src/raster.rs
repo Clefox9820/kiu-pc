@@ -1455,6 +1455,7 @@ pub(crate) struct DrawnTexture {
 }
 
 /// texture unit 0's configuration and backing data for one draw call.
+#[derive(Clone)]
 struct BoundTexture {
     /// the texture decoded, row by row from the top, none when it is drawn
     /// unless it reaches past the rows drawn. its smaller sizes follow.
@@ -1473,6 +1474,45 @@ struct BoundTexture {
     /// how many sizes the texels hold, each half the last.
     levels: u32,
     lod: Lod,
+    /// unit 0's type, GPUREG_TEXUNIT0_PARAM bits 28-30: 0 a plain 2D
+    /// texture, 1 a cube map, 3 projected, 5 disabled; 0 for the others.
+    kind: u32,
+    /// a cube map's six faces, +X, -X, +Y, -Y, +Z and -Z, each decoded as
+    /// texels are, the first being texels.
+    cube: Option<Arc<[Arc<[[u8; 4]]>; 6]>>,
+}
+
+/// a cube map's face and the coordinates within it, (s, t) as a 2D
+/// texture's (u, v), for the direction (x, y, z), texture coordinate set
+/// 0's u, v and w. the axis whose size is strictly the largest picks the
+/// face, x before y before z on ties going to the later one, and its sign
+/// which of the two; the other two over it give the coordinates, the way
+/// the PICA and Vulkan's cube maps both lay the faces out.
+fn cube_face(x: f32, y: f32, z: f32) -> (usize, f32, f32) {
+    let (ax, ay, az) = (x.abs(), y.abs(), z.abs());
+    let (face, sc, tc, major) = if ax > ay && ax > az {
+        if x > 0.0 { (0, -z, -y, ax) } else { (1, z, -y, ax) }
+    } else if ay > az {
+        if y > 0.0 { (2, x, z, ay) } else { (3, x, -z, ay) }
+    } else if z > 0.0 {
+        (4, x, -y, az)
+    } else {
+        (5, -x, -y, az)
+    };
+    let major = if major == 0.0 { 1.0 } else { major };
+    (face, sc / major * 0.5 + 0.5, tc / major * 0.5 + 0.5)
+}
+
+/// the physical address of a cube map's face: +X's is unit 0's address,
+/// GPUREG_TEXUNIT0_ADDR1; the five others, ADDR2 to ADDR6, keep the low 22
+/// bits of theirs, eighths of a byte, and take the rest from ADDR1.
+fn cube_face_address(registers: &[u32], face: usize) -> u32 {
+    let first = registers[TEXTURE_UNIT_BASES[0] + 4];
+    let address = match face {
+        0 => first,
+        face => (first & 0x0FC0_0000) | (registers[TEXTURE_UNIT_BASES[0] + 4 + face] & 0x003F_FFFF),
+    };
+    (address & 0x0FFF_FFFF) << 3
 }
 
 /// how a unit goes between a texture's sizes, from GPUREG_TEXUNITi_LOD and
@@ -2772,6 +2812,8 @@ fn empty_texture() -> BoundTexture {
         replacement: None,
         levels: 1,
         lod: Lod::default(),
+        kind: 0,
+        cube: None,
     }
 }
 
@@ -2816,30 +2858,29 @@ fn bind_texture<M: GpuMemory>(
     if format == TextureFormat::Etc1 {
         cache.bound(address, key);
     }
-    let (texels, replacement) = match (drawn, cache.checked(key, size as u32)) {
-        (Some(_), _) if !past => (Arc::default(), None),
-        (_, Some(found)) => found,
-        (_, None) => match cache.unchanged(key, size as u32, memory) {
-            Some(found) => found,
-            None => {
-                let found = match memory.slice(addr, size) {
-                    Some(data) => cache.decoded(key, data),
-                    None => {
-                        let mut data = vec![0u8; size];
-                        memory.read(addr, &mut data);
-                        cache.decoded(key, &data)
-                    }
-                };
-                cache.watch(key, size as u32, memory);
-                found
-            }
-        },
+    let (texels, replacement) = match drawn {
+        Some(_) if !past => (Arc::default(), None),
+        _ => texture_at(memory, cache, key, size),
     };
+    // unit 0's type, and a cube map's five other faces, each where its
+    // address register says, of the same size, format and sizes
+    let kind = if unit == 0 { (registers[base + 2] >> 28) & 7 } else { 0 };
+    let cube = (kind == 1 && drawn.is_none()).then(|| {
+        Arc::new(std::array::from_fn(|face| match face {
+            0 => texels.clone(),
+            face => {
+                let addr = memory.translate(cube_face_address(registers, face));
+                texture_at(memory, cache, (addr, format, width, height, levels), size).0
+            }
+        }))
+    });
 
     // filter mode in bit 1 (magnification) and 2 (minification), the wrap
     // modes for T and S in bits 8-10 and 12-14.
     let config = registers[base + 2];
     Some(BoundTexture {
+        kind,
+        cube,
         texels,
         drawn,
         linear: config & 0x2 != 0,
@@ -2854,6 +2895,30 @@ fn bind_texture<M: GpuMemory>(
         levels,
         lod: Lod::read(registers, base, levels),
     })
+}
+
+/// the texels of the texture key names, size bytes of memory, from the
+/// cache when nothing wrote them since, else decoded and watched for writes.
+fn texture_at<M: GpuMemory>(memory: &mut M, cache: &mut TextureCache, key: TextureKey, size: usize) -> Found {
+    let addr = key.0;
+    match cache.checked(key, size as u32) {
+        Some(found) => found,
+        None => match cache.unchanged(key, size as u32, memory) {
+            Some(found) => found,
+            None => {
+                let found = match memory.slice(addr, size) {
+                    Some(data) => cache.decoded(key, data),
+                    None => {
+                        let mut data = vec![0u8; size];
+                        memory.read(addr, &mut data);
+                        cache.decoded(key, &data)
+                    }
+                };
+                cache.watch(key, size as u32, memory);
+                found
+            }
+        },
+    }
 }
 
 /// a texture unit's texture as rows of a color buffer, when it is on and in
@@ -3637,6 +3702,18 @@ fn fill_triangle(
                         }
                         false => (u, v),
                     };
+                    // unit 0 as a cube map samples the face its direction
+                    // points at, and disabled gives nothing
+                    if unit == 0 && texture.kind == 5 {
+                        samples[unit] = [0.0; 4];
+                        continue;
+                    }
+                    if let (0, Some(faces)) = (unit, &texture.cube) {
+                        let (face, s, t) = cube_face(u, v, interpolate(qs));
+                        let face = BoundTexture { texels: faces[face].clone(), cube: None, ..texture.clone() };
+                        samples[unit] = face.sample(s, t);
+                        continue;
+                    }
                     samples[unit] = match texture.levels {
                         1 => texture.sample(u, v),
                         _ => {
@@ -5047,6 +5124,8 @@ mod tests {
             replacement: None,
             levels: 1,
             lod: Lod::default(),
+            kind: 0,
+            cube: None,
         };
         let white = [1.0; 4];
         assert_eq!(texture(Wrap::ClampToBorder).texel(0, -1, 3), RED);
@@ -5114,6 +5193,115 @@ mod tests {
                     let near = pixel.iter().zip(expected).all(|(&got, want)| got.abs_diff(want) <= 1);
                     assert!(near, "{renderer}, largest level {largest}, bias {bias}: {pixel:?}");
                 }
+            }
+        }
+    }
+
+    /// a cube map, type 1, samples the face its direction, set 0's u, v
+    /// and w, points at most, there as a plain texture would at that face's
+    /// s and t, on the CPU and the GPU alike.
+    #[test]
+    fn a_cube_map_samples_the_face_its_direction_points_at() {
+        const TEXTURE: u32 = 0x10000;
+        const FACE: u32 = 8 * 8 * 4;
+        let triangle = |at: &dyn Fn(f32, f32) -> [f32; 3]| -> Vec<Vertex> {
+            [[-1.0, -1.0], [3.0, -1.0], [-1.0, 3.0]]
+                .into_iter()
+                .map(|[x, y]| {
+                    let [u, v, w] = at(x, y);
+                    Vertex {
+                        clip: [x, y, -0.5, 1.0],
+                        color: [1.0; 4],
+                        texcoords: [[u, v], [0.0; 2], [0.0; 2]],
+                        quaternion: [0.0, 0.0, 0.0, 1.0],
+                        view: [0.0; 3],
+                        texcoord0_w: w,
+                    }
+                })
+                .collect()
+        };
+        // faces at base on, one after the other
+        let draw = |resources: &mut Resources, memory: &mut ConsoleMemory, kind: u32, base: u32, quad: &[Vertex]| {
+            let mut registers = target_registers();
+            registers[REG_TEXTURE_CONFIG] = 1;
+            registers[REG_TEXTURE0_DIMENSIONS] = 8 | (8 << 16);
+            registers[REG_TEXTURE0_PARAMETERS] = kind << 28;
+            for face in 0..6 {
+                registers[REG_TEXTURE0_ADDRESS + face] = (base + face as u32 * FACE) >> 3;
+            }
+            registers[0x0C0] = 0x3 | (0x3 << 16);
+            for stage in [0x0C8, 0x0D0, 0x0D8, 0x0F0, 0x0F8] {
+                registers[stage] = 0xF | (0xF << 16);
+            }
+            rasterize_shaded(&registers, memory, resources, quad);
+            #[cfg(feature = "vulkan")]
+            if let Some(hardware) = resources.hardware.as_mut() {
+                hardware.flush(memory).unwrap();
+            }
+            pixels(memory)
+        };
+        #[cfg_attr(not(feature = "vulkan"), allow(unused_mut))]
+        let mut renderers = vec![("the CPU", Resources::default())];
+        #[cfg(feature = "vulkan")]
+        if let Ok(hardware) = hardware::Hardware::new() {
+            renderers.push(("the GPU", Resources { hardware: Some(hardware), ..Default::default() }));
+        }
+        for (renderer, mut resources) in renderers {
+            // each face a color of its own, A, B, G and R a texel
+            let mut memory = ConsoleMemory::default();
+            for face in 0..6u8 {
+                memory.write(TEXTURE + face as u32 * FACE, &[0xFF, face * 40, 0x80, 0xFF - face * 40].repeat(64));
+            }
+            let directions = [[1.0, 0.2, 0.3], [-1.0, 0.2, 0.3], [0.2, 1.0, 0.3], [0.2, -1.0, 0.3], [0.2, 0.3, 1.0], [0.2, 0.3, -1.0]];
+            for (face, direction) in directions.into_iter().enumerate() {
+                let expected = [0xFF - face as u8 * 40, 0x80, face as u8 * 40, 0xFF];
+                for pixel in draw(&mut resources, &mut memory, 1, TEXTURE, &triangle(&|_, _| direction)) {
+                    assert_eq!(pixel, expected, "{renderer}, face {face}");
+                }
+            }
+            // +Z with a texel of its own at every pixel, each pixel center on
+            // a texel's: as the plain texture at s = x / 2 + 1 / 2 and
+            // t = 1 / 2 - y / 2, in a cube of its own the cache has not seen
+            const PATTERNED: u32 = TEXTURE + 6 * FACE;
+            let pattern: Vec<u8> = (0..64u8).flat_map(|k| [0xFF, k * 4, 0xFF - k * 4, k.wrapping_mul(37)]).collect();
+            memory.write(PATTERNED + 4 * FACE, &pattern);
+            let plain = draw(&mut resources, &mut memory, 0, PATTERNED + 4 * FACE, &triangle(&|x, y| [x * 0.5 + 0.5, 0.5 - y * 0.5, 1.0]));
+            let cube = draw(&mut resources, &mut memory, 1, PATTERNED, &triangle(&|x, y| [x, y, 1.0]));
+            assert_eq!(cube, plain, "{renderer}");
+        }
+    }
+
+    /// a disabled unit 0, type 5, reads 0 on the CPU and the GPU alike.
+    #[test]
+    fn a_disabled_texture_reads_zero() {
+        const TEXTURE: u32 = 0x10000;
+        let quad: Vec<Vertex> = cover(-0.5, [1.0; 4]);
+        #[cfg_attr(not(feature = "vulkan"), allow(unused_mut))]
+        let mut renderers = vec![("the CPU", Resources::default())];
+        #[cfg(feature = "vulkan")]
+        if let Ok(hardware) = hardware::Hardware::new() {
+            renderers.push(("the GPU", Resources { hardware: Some(hardware), ..Default::default() }));
+        }
+        for (renderer, mut resources) in renderers {
+            let mut memory = ConsoleMemory::default();
+            memory.write(TEXTURE, &[0xFF; 8 * 8 * 4]);
+            memory.write(COLOR, &[0x55; 64 * 4]);
+            let mut registers = target_registers();
+            registers[REG_TEXTURE_CONFIG] = 1;
+            registers[REG_TEXTURE0_DIMENSIONS] = 8 | (8 << 16);
+            registers[REG_TEXTURE0_PARAMETERS] = 5 << 28;
+            registers[REG_TEXTURE0_ADDRESS] = TEXTURE >> 3;
+            registers[0x0C0] = 0x3 | (0x3 << 16);
+            for stage in [0x0C8, 0x0D0, 0x0D8, 0x0F0, 0x0F8] {
+                registers[stage] = 0xF | (0xF << 16);
+            }
+            rasterize_shaded(&registers, &mut memory, &mut resources, &quad);
+            #[cfg(feature = "vulkan")]
+            if let Some(hardware) = resources.hardware.as_mut() {
+                hardware.flush(&mut memory).unwrap();
+            }
+            for pixel in pixels(&mut memory) {
+                assert_eq!(pixel, [0; 4], "{renderer}");
             }
         }
     }
