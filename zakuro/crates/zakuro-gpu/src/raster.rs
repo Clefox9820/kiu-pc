@@ -1794,6 +1794,8 @@ pub(crate) struct Portraits {
     /// how far the title shook its top screen's HUD the last time it drew
     /// the health bar, across in pixels and down in clip x, see hud_shake.
     shake: (f32, f32),
+    /// whether the bottom screen shows a retro scene this frame, see RETRO.
+    retro: bool,
 }
 
 /// a line of text in the title's 512x128 text buffer, in its pixels, rows
@@ -2246,6 +2248,21 @@ const ISLANDS: [Island; 2] = [
     Island { from: [0.0, 150.0, 170.0, 240.0], to: [0.0, 16.0], scale: 0.5 },
 ];
 
+/// Kid Icarus Uprising's retro scenes, Medusa and Hewdraw as the NES game
+/// drew them, a band across the bottom screen whose 256x128 RGB565 picture
+/// is drawn first: on the top screen at 0.6 against the left edge, its foot
+/// on the left portrait's head, 144 down, so it shows who speaks.
+const RETRO: Island = Island { from: [0.0, 56.0, 320.0, 184.0], to: [0.0, 144.0 - 128.0 * 0.6], scale: 0.6 };
+
+/// a draw of the retro scene's picture, see RETRO.
+// ponytail: matched by its shape alone, as is_portrait is
+fn is_retro(registers: &[u32]) -> bool {
+    let base = TEXTURE_UNIT_BASES[0];
+    registers[REG_TEXTURE_CONFIG] & 1 != 0
+        && registers[base + 1] == (256 << 16 | 128)
+        && TextureFormat::from_raw(registers[base + 13]) == TextureFormat::Rgb565
+}
+
 /// takes a bottom-screen draw that lies in one of the islands for the top
 /// screen's buffer, where that island goes, for flush_portraits to draw.
 fn mirror_hud(registers: &[u32], resources: &mut Resources, vertices: Vertices) {
@@ -2256,10 +2273,14 @@ fn mirror_hud(registers: &[u32], resources: &mut Resources, vertices: Vertices) 
     // rows run up from the screen's bottom edge and leftward from its right
     let [left, upper, right, lower] = [320.0 - high[1], 240.0 - high[0], 320.0 - low[1], 240.0 - low[0]];
     const SLACK: f32 = 2.0;
-    let Some(island) = ISLANDS.iter().find(|island| {
+    let inside = |island: &&Island| {
         let [x0, y0, x1, y1] = island.from;
         left >= x0 - SLACK && upper >= y0 - SLACK && right <= x1 + SLACK && lower <= y1 + SLACK
-    }) else {
+    };
+    // the retro scene's picture and what is drawn over it, once it is there
+    resources.portraits.retro |= is_retro(registers) && inside(&&RETRO);
+    let retro = Some(&RETRO).filter(|_| resources.portraits.retro).filter(inside);
+    let Some(island) = retro.or_else(|| ISLANDS.iter().find(inside)) else {
         return;
     };
     // the island's top left on the bottom screen lands on its place on the
@@ -2345,6 +2366,7 @@ fn draw_portraits<M: GpuMemory>(memory: &mut M, resources: &mut Resources) -> bo
     // the battle display as the bottom screen had it, no fading, it is
     // there whenever the game draws it
     let hud = std::mem::take(&mut resources.portraits.hud);
+    resources.portraits.retro = false;
     for mut draw in hud {
         // shaking with the top screen's HUD, as when Pit is hit
         shake(&mut draw.vertices, resources.portraits.shake);
@@ -9517,6 +9539,42 @@ mod tests {
         // bottom edge and 12 left of its right one
         let screen = to_screen(&draw.vertices[0], (0.0, 0.0, 240.0, 400.0)).unwrap();
         assert!((screen.x - 172.0).abs() < 0.1 && (screen.y - 12.0).abs() < 0.1, "at {}, {}", screen.x, screen.y);
+    }
+
+    /// a retro scene on the bottom screen, its 256x128 RGB565 picture across
+    /// the screen from 56 to 184 down, goes to the top screen with all that
+    /// is drawn over it there, scaled by 0.6 against the left edge, its foot
+    /// on the left portrait's head at 144 down; with no retro picture that
+    /// band of the bottom screen stays there.
+    #[test]
+    fn a_retro_scene_goes_to_the_top_screen_above_the_left_portrait() {
+        let mut registers = target_registers();
+        sized(&mut registers, 240, 320);
+        let base = TEXTURE_UNIT_BASES[0];
+        registers[REG_TEXTURE_CONFIG] |= 1;
+        let textured = |width: u32, height: u32, format: u32| {
+            let mut registers = registers.clone();
+            registers[base + 1] = width << 16 | height;
+            registers[base + 13] = format;
+            registers
+        };
+        let mut resources = Resources::default();
+        resources.portraits.top = Some([0x1F08_0000 >> 3, 0, 256 | (511 << 12)]);
+        // the band's rows 56 to 184 from the top are 56 to 184 up the buffer
+        let band = quad((-0.5333, 0.5333), (-1.0, 1.0), RED);
+        let label = quad((0.25, 0.4167), (-0.4375, 0.3125), RED);
+        // a draw there with no retro picture under it stays below
+        mirror_hud(&textured(128, 64, 3), &mut resources, Vertices::Shaded(&label));
+        assert!(resources.portraits.hud.is_empty(), "nothing taken without the retro picture");
+        mirror_hud(&textured(256, 128, 3), &mut resources, Vertices::Shaded(&band));
+        mirror_hud(&textured(128, 64, 2), &mut resources, Vertices::Shaded(&label));
+        let [picture, _label] = &resources.portraits.hud[..] else { panic!("the picture and the label taken") };
+        // its corner at the band's foot on the right, 320 across and 184
+        // down below, lands 192 across and 144 down above, which in the top
+        // screen's buffer is 96 up from its bottom edge and 208 left of its
+        // right one
+        let screen = to_screen(&picture.vertices[0], (0.0, 0.0, 240.0, 400.0)).unwrap();
+        assert!((screen.x - 96.0).abs() < 0.1 && (screen.y - 208.0).abs() < 0.1, "at {}, {}", screen.x, screen.y);
     }
 
     /// a vertex at x, y of a viewport w by h, with texture coordinates u, v.
