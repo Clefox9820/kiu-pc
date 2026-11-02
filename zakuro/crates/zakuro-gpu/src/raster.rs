@@ -1791,6 +1791,9 @@ pub(crate) struct Portraits {
     /// the lines of text the title last wrote into its text buffer, which
     /// the subtitles show, see note_text.
     text_lines: Vec<TextLine>,
+    /// how far the title shook its top screen's HUD the last time it drew
+    /// the health bar, across in pixels and down in clip x, see hud_shake.
+    shake: (f32, f32),
 }
 
 /// a line of text in the title's 512x128 text buffer, in its pixels, rows
@@ -2196,6 +2199,31 @@ fn faded_top(topology: u32, vertices: &[Vertex]) -> Vec<Vertex> {
     faded
 }
 
+/// how far a top-screen 2D draw that is Kid Icarus Uprising's health bar,
+/// its inner piece 90 by 5 pixels at 32 across and 0.8083 down in clip x
+/// at rest, has been moved from there: across in pixels and down in clip
+/// x, which the title does to the whole HUD when Pit is hit. none for
+/// another draw.
+// ponytail: the bar's place for this one title, as ISLANDS has
+fn hud_shake(vertices: &[Vertex]) -> Option<(f32, f32)> {
+    if vertices.is_empty() || vertices.iter().any(|v| (v.clip[3] - 1.0).abs() > 1e-4) {
+        return None;
+    }
+    let span = |values: &mut dyn Iterator<Item = f32>| values.fold((f32::MAX, f32::MIN), |(l, r), x| (l.min(x), r.max(x)));
+    let (left, right) = span(&mut vertices.iter().map(|v| 200.0 * (1.0 - v.clip[1])));
+    let (top, bottom) = span(&mut vertices.iter().map(|v| v.clip[0]));
+    let near = |a: f32, b: f32, by: f32| (a - b).abs() < by;
+    (near(right - left, 90.0, 0.5) && near(bottom - top, 0.85 - 0.8083, 0.002) && near(left, 32.0, 12.0)).then_some((left - 32.0, top - 0.8083))
+}
+
+/// moves a top-screen draw's vertices across by pixels and down by clip x.
+fn shake(vertices: &mut [Vertex], (across, down): (f32, f32)) {
+    for vertex in vertices {
+        vertex.clip[1] -= across / 200.0 * vertex.clip[3];
+        vertex.clip[0] += down * vertex.clip[3];
+    }
+}
+
 /// a part of the bottom screen's battle display shown on the top screen:
 /// where it is on the bottom screen, left, top, right and bottom from its
 /// top left, where its top left goes on the top screen, and its scale.
@@ -2317,7 +2345,9 @@ fn draw_portraits<M: GpuMemory>(memory: &mut M, resources: &mut Resources) -> bo
     // the battle display as the bottom screen had it, no fading, it is
     // there whenever the game draws it
     let hud = std::mem::take(&mut resources.portraits.hud);
-    for draw in hud {
+    for mut draw in hud {
+        // shaking with the top screen's HUD, as when Pit is hit
+        shake(&mut draw.vertices, resources.portraits.shake);
         rasterize(&draw.registers, memory, resources, Vertices::Shaded(&draw.vertices));
         drew = true;
     }
@@ -4346,6 +4376,20 @@ fn rasterize<M: GpuMemory>(registers: &[u32], memory: &mut M, resources: &mut Re
     // their arrays so their vertices say where they are. portraits and
     // islands come back through here as they are added; subtitles too,
     // centered, and are squeezed then rather than twice
+    // how far the title shook its top screen's HUD, which the battle
+    // display taken from the bottom screen follows
+    if portraits_on()
+        && !resources.portraits.adding
+        && registers[REG_DEPTH_COLOR_MASK] & 1 == 0
+        && read_float24(registers, REG_VIEWPORT_WIDTH) == 120.0
+        && read_float24(registers, REG_VIEWPORT_HEIGHT) == 200.0
+    {
+        // ponytail: arrays left to the GPU say nothing, the islands keep
+        // still then; the widened screen's HUD has them decoded
+        if let Some(shaken) = shaded_in_order(registers, vertices).as_deref().and_then(hud_shake) {
+            resources.portraits.shake = shaken;
+        }
+    }
     let squeezed;
     let vertices = if resources.top_widening > 1.0
         && (resources.portraits.adding || !(portraits_on() && is_subtitle(registers)))
@@ -9282,6 +9326,35 @@ mod tests {
         // text against an edge still keeps to it
         let (left, _) = span(&squeeze_hud(&piece(14.0, 60.0), factor, true, &mut edges).unwrap());
         assert!(near(left, 14.0 / factor), "text along the left edge, from {left}");
+    }
+
+    /// the health bar's inner piece, 90 by 5 pixels at 32 across and 0.8083
+    /// down at rest, says how far the title shook its top screen's HUD; any
+    /// other piece says nothing.
+    #[test]
+    fn the_health_bar_says_how_far_the_hud_shook() {
+        let near = |a: f32, b: f32| (a - b).abs() < 1e-3;
+        let bar = |across: f32, down: f32| quad((0.8083 + down, 0.85 + down), (1.0 - (122.0 + across) / 200.0, 1.0 - (32.0 + across) / 200.0), RED);
+        let (across, down) = hud_shake(&bar(0.0, 0.0)).expect("the bar at rest");
+        assert!(near(across, 0.0) && near(down, 0.0), "at rest, {across} {down}");
+        let (across, down) = hud_shake(&bar(3.5, -0.03)).expect("the bar shaken");
+        assert!(near(across, 3.5) && near(down, -0.03), "shaken, {across} {down}");
+        assert!(hud_shake(&quad((0.8083, 0.85), (1.0 - 200.0 / 200.0, 1.0 - 32.0 / 200.0), RED)).is_none(), "a longer piece");
+        assert!(hud_shake(&quad((-0.9, -0.8), (1.0 - 122.0 / 200.0, 1.0 - 32.0 / 200.0), RED)).is_none(), "a taller piece");
+    }
+
+    /// the battle display taken from the bottom screen shakes with the top
+    /// screen's HUD: moved across and down as far as the health bar went.
+    #[test]
+    fn the_islands_shake_with_the_hud() {
+        let across = |v: &Vertex| 200.0 * (1.0 - v.clip[1]);
+        let mut island = quad((-0.5, -0.4), (1.0 - 60.0 / 200.0, 1.0 - 10.0 / 200.0), RED);
+        let before = island.clone();
+        shake(&mut island, (3.0, 0.02));
+        for (moved, was) in island.iter().zip(&before) {
+            assert!((across(moved) - across(was) - 3.0).abs() < 1e-3, "across");
+            assert!((moved.clip[0] - was.clip[0] - 0.02).abs() < 1e-5, "down");
+        }
     }
 
     /// a line the title draws in pieces side by side, as a menu's help
