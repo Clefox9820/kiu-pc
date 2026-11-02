@@ -2355,13 +2355,14 @@ fn retro_alpha(alpha: f32, drawn: bool) -> f32 {
     }
 }
 
-/// a draw of the retro scene's picture, see RETRO.
-// ponytail: matched by its shape alone, as is_portrait is
+/// a draw of a retro scene's picture, see RETRO: Medusa's 256x128 RGB565
+/// band, or Hewdraw's 64x32 RGBA5551 sprite alone in it.
+// ponytail: matched by their shapes alone, as is_portrait is
 fn is_retro(registers: &[u32]) -> bool {
     let base = TEXTURE_UNIT_BASES[0];
+    let shape = (registers[base + 1], TextureFormat::from_raw(registers[base + 13]));
     registers[REG_TEXTURE_CONFIG] & 1 != 0
-        && registers[base + 1] == (256 << 16 | 128)
-        && TextureFormat::from_raw(registers[base + 13]) == TextureFormat::Rgb565
+        && (shape == (256 << 16 | 128, TextureFormat::Rgb565) || shape == (64 << 16 | 32, TextureFormat::Rgba5551))
 }
 
 /// takes a bottom-screen draw that lies in one of the islands for the top
@@ -9715,6 +9716,13 @@ mod tests {
         // its right one
         let screen = to_screen(&picture.vertices[0], (0.0, 0.0, 240.0, 400.0)).unwrap();
         assert!((screen.x - 81.6).abs() < 0.1 && (screen.y - 104.0).abs() < 0.1, "at {}, {}", screen.x, screen.y);
+        // Hewdraw's is a 64x32 RGBA5551 sprite alone in the band, 112 to 208
+        // across and 60 to 184 down, which goes up the same way
+        let mut resources = Resources::default();
+        resources.portraits.top = Some([0x1F08_0000 >> 3, 0, 256 | (511 << 12)]);
+        let sprite = quad((56.0 / 120.0 - 1.0, 180.0 / 120.0 - 1.0), (112.0 / 160.0 - 1.0, 208.0 / 160.0 - 1.0), RED);
+        mirror_hud(&textured(64, 32, 2), &mut resources, Vertices::Shaded(&sprite));
+        assert_eq!(resources.portraits.retro_draws.len(), 1, "Hewdraw's sprite taken");
     }
 
     /// the retro scene's edges fade out: a draw over its bounds is cut a
