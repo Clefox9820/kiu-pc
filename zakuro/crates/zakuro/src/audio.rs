@@ -12,8 +12,9 @@ use cpal::{FromSample, SampleFormat, SizedSample};
 /// queue that ran dry waits for a quarter of its target before it plays
 /// again, and sound is stretched only once the queue is down to half of it:
 /// every stretch splices the sound, so smaller shortfalls are left to DRIFT.
+const TARGET_DEFAULT: usize = 4096;
 #[cfg(test)]
-const TARGET: usize = 4096;
+const TARGET: usize = TARGET_DEFAULT;
 #[cfg(test)]
 const RESUME: usize = TARGET / 4;
 /// how much faster or slower than the rates say playback may go to keep
@@ -94,6 +95,23 @@ struct Queue {
 }
 
 impl Queue {
+    /// an empty queue playing step console samples per output sample and
+    /// keeping target waiting, which fills up before it plays.
+    fn new(step: f64, target: usize) -> Queue {
+        Queue {
+            samples: VecDeque::new(),
+            fraction: 0.0,
+            step,
+            filter: sinc_filter(step),
+            starved: true,
+            last: [0.0; 2],
+            level: 0.0,
+            underruns: 0,
+            refill: target / 4,
+            target,
+        }
+    }
+
     /// the next output sample, filtered from the console's around it.
     fn next(&mut self) -> [f32; 2] {
         if !self.starved && self.samples.len() < TAPS {
@@ -257,7 +275,88 @@ pub struct Audio {
     /// 0 to 1, applied as samples come in.
     volume: std::cell::Cell<f32>,
     stretch: std::cell::RefCell<Stretch>,
+    /// with ZAKURO_WAV, the sound being saved, see Capture.
+    capture: std::cell::RefCell<Option<Capture>>,
     _stream: cpal::Stream,
+}
+
+/// the rate captured sound is saved at.
+const CAPTURE_RATE: u32 = 48_000;
+
+/// with ZAKURO_WAV=<file.wav>, the console's sound from ZAKURO_WAV_FROM
+/// seconds of it on (5 by default), for ZAKURO_WAV_SECONDS (8), turned into
+/// 48 kHz as the output does, away from the device's timing and whatever
+/// the volume, and saved once there is enough. a save state played with no
+/// input makes the same sound every run, so two builds' files compare by
+/// ear.
+struct Capture {
+    path: std::path::PathBuf,
+    /// the console's samples still to pass over before it starts.
+    skip: usize,
+    queue: Queue,
+    out: Vec<[f32; 2]>,
+    /// how many output samples it saves.
+    wanted: usize,
+}
+
+impl Capture {
+    fn from_env(rate: f64) -> Option<Capture> {
+        let path = std::env::var_os("ZAKURO_WAV")?.into();
+        let seconds = |name: &str, default: f64| std::env::var(name).ok().and_then(|v| v.parse().ok()).unwrap_or(default);
+        let step = rate / CAPTURE_RATE as f64;
+        let mut queue = Queue::new(step, TARGET_DEFAULT);
+        queue.starved = false;
+        queue.level = 1.0;
+        Some(Capture {
+            path,
+            skip: (seconds("ZAKURO_WAV_FROM", 5.0) * rate) as usize,
+            queue,
+            out: Vec::new(),
+            wanted: (seconds("ZAKURO_WAV_SECONDS", 8.0) * CAPTURE_RATE as f64) as usize,
+        })
+    }
+
+    /// takes in what the console played, and says once it saved the file.
+    fn feed(&mut self, samples: &[[i16; 2]]) -> bool {
+        let skipped = self.skip.min(samples.len());
+        self.skip -= skipped;
+        self.queue.samples.extend(samples[skipped..].iter().map(|s| s.map(|v| v as f32 / 32768.0)));
+        // played while the queue is at its target, so DRIFT leaves the pitch alone
+        while self.queue.samples.len() > self.queue.target && self.out.len() < self.wanted {
+            self.out.push(self.queue.next());
+        }
+        if self.out.len() < self.wanted {
+            return false;
+        }
+        match write_wav(&self.path, &self.out) {
+            Ok(()) => log::info!("sound captured to {}", self.path.display()),
+            Err(error) => log::warn!("could not save the sound to {}, {error}", self.path.display()),
+        }
+        true
+    }
+}
+
+/// saves stereo samples as a 16-bit WAV file at CAPTURE_RATE.
+fn write_wav(path: &std::path::Path, samples: &[[f32; 2]]) -> std::io::Result<()> {
+    let data = samples.len() as u32 * 4;
+    let mut bytes = Vec::with_capacity(44 + data as usize);
+    bytes.extend_from_slice(b"RIFF");
+    bytes.extend_from_slice(&(36 + data).to_le_bytes());
+    bytes.extend_from_slice(b"WAVEfmt ");
+    bytes.extend_from_slice(&16u32.to_le_bytes());
+    // PCM, two channels, the rate, bytes a second, bytes a frame, bits
+    bytes.extend_from_slice(&1u16.to_le_bytes());
+    bytes.extend_from_slice(&2u16.to_le_bytes());
+    bytes.extend_from_slice(&CAPTURE_RATE.to_le_bytes());
+    bytes.extend_from_slice(&(CAPTURE_RATE * 4).to_le_bytes());
+    bytes.extend_from_slice(&4u16.to_le_bytes());
+    bytes.extend_from_slice(&16u16.to_le_bytes());
+    bytes.extend_from_slice(b"data");
+    bytes.extend_from_slice(&data.to_le_bytes());
+    for sample in samples.iter().flatten() {
+        bytes.extend_from_slice(&((sample.clamp(-1.0, 1.0) * 32767.0).round() as i16).to_le_bytes());
+    }
+    std::fs::write(path, bytes)
 }
 
 impl Audio {
@@ -280,18 +379,7 @@ impl Audio {
         let format = supported.sample_format();
         let config: cpal::StreamConfig = supported.into();
         let step = rate / config.sample_rate.0 as f64;
-        let queue = Arc::new(Mutex::new(Queue {
-            samples: VecDeque::new(),
-            fraction: 0.0,
-            step,
-            filter: sinc_filter(step),
-            starved: true,
-            last: [0.0; 2],
-            level: 0.0,
-            underruns: 0,
-            refill: target / 4,
-            target,
-        }));
+        let queue = Arc::new(Mutex::new(Queue::new(step, target)));
         let stream = match format {
             SampleFormat::F32 => stream::<f32>(&device, &config, queue.clone()),
             SampleFormat::I16 => stream::<i16>(&device, &config, queue.clone()),
@@ -300,7 +388,13 @@ impl Audio {
             other => return Err(format!("the output takes {other} samples, which Zakuro does not make")),
         }?;
         stream.play().map_err(|e| e.to_string())?;
-        Ok(Audio { queue, volume: std::cell::Cell::new(1.0), stretch: std::cell::RefCell::new(Stretch::new()), _stream: stream })
+        Ok(Audio {
+            queue,
+            volume: std::cell::Cell::new(1.0),
+            stretch: std::cell::RefCell::new(Stretch::new()),
+            capture: std::cell::RefCell::new(Capture::from_env(rate)),
+            _stream: stream,
+        })
     }
 
     /// the names of the sound output devices there are.
@@ -337,6 +431,10 @@ impl Audio {
     /// queues what the console played, stretched when the queue runs low
     /// so that it plays on rather than stops.
     pub fn push(&self, samples: &[[i16; 2]]) {
+        let mut capture = self.capture.borrow_mut();
+        if capture.as_mut().is_some_and(|capture| capture.feed(samples)) {
+            *capture = None;
+        }
         let scale = self.volume.get() / 32768.0;
         let samples: Vec<[f32; 2]> = samples.iter().map(|s| s.map(|v| v as f32 * scale)).collect();
         let Ok(mut queue) = self.queue.lock() else { return };
@@ -511,6 +609,24 @@ mod tests {
         // the same number of cycles a second
         let pitch = rises(&out) as f64 / out.len() as f64 * 32728.0;
         assert!((pitch - 440.0).abs() < 10.0, "pitch {pitch}");
+    }
+
+    /// a capture passes over the start it was told to, then saves as much
+    /// as it was asked for as a 48 kHz stereo WAV file.
+    #[test]
+    fn a_capture_saves_a_wav_of_the_sound_asked_for() {
+        let path = std::env::temp_dir().join(format!("zakuro-capture-{}.wav", std::process::id()));
+        let mut queue = Queue::new(32728.0 / 48000.0, TARGET);
+        queue.starved = false;
+        queue.level = 1.0;
+        let mut capture = Capture { path: path.clone(), skip: 1000, queue, out: Vec::new(), wanted: 4800 };
+        let sound: Vec<[i16; 2]> = (0..20_000).map(|i| [(i % 100) as i16 * 100; 2]).collect();
+        assert!(sound.chunks(547).any(|chunk| capture.feed(chunk)), "it saves once there is enough");
+        let bytes = std::fs::read(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(bytes.len(), 44 + 4800 * 4);
+        assert_eq!((&bytes[..4], &bytes[8..16], &bytes[36..40]), (&b"RIFF"[..], &b"WAVEfmt "[..], &b"data"[..]));
+        assert_eq!(u32::from_le_bytes(bytes[24..28].try_into().unwrap()), CAPTURE_RATE);
     }
 
     /// a straight line of samples comes out on the line, between them.
