@@ -113,6 +113,7 @@ pub fn run_with(linked: Option<Linked>, overlay: Option<Box<dyn GameOverlay>>) {
         scale: options.scale.unwrap_or(settings.scale).max(1),
         layout: settings.layout,
         top_shape: settings.top_shape,
+        shown_top_width: settings.top_shape.width(),
         options,
         settings,
         linked,
@@ -341,6 +342,20 @@ fn run_headless(system: &mut System, frames: u64) {
 /// frame for Kid Icarus.
 const IN_PLAY_QUIET: u32 = 10;
 
+/// frames after the last frame a video's decoder converted before the top
+/// screen goes back to its own shape, a video's frames coming at 30 a
+/// second or fewer.
+const VIDEO_HOLD: u64 = 30;
+
+/// how wide the top screen shows: in its chosen shape, but the console's
+/// while a video plays, a picture made for 400 across that cannot be
+/// widened as the 3D is, and in menus on a 21:9 screen, whose 3D would
+/// show what lies off the console's view there.
+fn top_width_shown(shape: settings::TopShape, video: bool, in_play: bool) -> f32 {
+    let console = video || (!in_play && shape == settings::TopShape::Wide21x9);
+    if console { settings::TopShape::Console.width() } else { shape.width() }
+}
+
 /// a game being played.
 struct Running {
     system: System,
@@ -359,6 +374,10 @@ struct Running {
     fps: f32,
     /// frames since a game override last said the title is in play.
     out_of_play: u32,
+    /// how many video frames the decoder had converted at the last frame,
+    /// and the frame a new one came at, see VIDEO_HOLD.
+    conversions: u64,
+    video_at: Option<u64>,
     /// the game override last said the player is flying, not on foot.
     flying: bool,
     /// when the game started, in seconds since 1970, for Discord.
@@ -438,6 +457,8 @@ impl Running {
             counting_since: Instant::now(),
             fps: 0.0,
             out_of_play: u32::MAX,
+            conversions: 0,
+            video_at: None,
             flying: false,
             started: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |since| since.as_secs()),
             pacing: Pacing::default(),
@@ -486,6 +507,8 @@ struct App {
     layout: Screens,
     /// how wide the top screen shows.
     top_shape: settings::TopShape,
+    /// how wide the presenter shows it now, see top_width_shown.
+    shown_top_width: f32,
     /// the left button is down, and where the pointer is, in window pixels.
     mouse_down: bool,
     /// where the pointer was when the right button went down, which tilts
@@ -1231,6 +1254,7 @@ impl App {
         if let Some(backend) = &mut self.backend {
             backend.set_top_width(self.settings.top_shape.width());
             backend.set_scaling(self.settings.filter.screens(), self.settings.integer_scale);
+            self.shown_top_width = self.settings.top_shape.width();
             backend.set_stereo(self.settings.stereo());
         }
         let scale = if self.options.scale.is_none() { self.settings.scale.max(1) } else { self.scale };
@@ -1668,8 +1692,23 @@ impl App {
         // mouse look on foot, for a game override to take, see input::MOUSE_LOOK
         self.keyboard.feed_mailbox(&mut game.system.memory.host_mailbox);
         // how much wider than the console's the top screen shows, for a game
-        // override to draw a wider scene into the same 400x240
-        let widening = self.settings.top_shape.width() / 400.0;
+        // override to draw a wider scene into the same 400x240: the console's
+        // own shape while a video plays and in 21:9 menus
+        let conversions = game.system.services.y2r.conversions;
+        if conversions != game.conversions {
+            game.conversions = conversions;
+            game.video_at = Some(game.frame);
+        }
+        let video = game.video_at.is_some_and(|at| game.frame.saturating_sub(at) <= VIDEO_HOLD);
+        let width = top_width_shown(self.settings.top_shape, video, in_play);
+        if width != self.shown_top_width {
+            log::debug!(target: "zakuro::screens", "the top screen shows {width} across, a video {video}, in play {in_play}");
+            self.shown_top_width = width;
+            if let Some(backend) = &mut self.backend {
+                backend.set_top_width(width);
+            }
+        }
+        let widening = width / 400.0;
         game.system.memory.host_mailbox[4] = widening.to_bits();
         // and its HUD's 2D draws squeezed back into proportion
         game.system.gpu.set_top_widening(widening);
@@ -2231,6 +2270,21 @@ mod tests {
     }
 
     use super::*;
+
+    /// the top screen takes its chosen shape, but the console's while a
+    /// video plays, which cannot be widened, and in menus on a 21:9 screen,
+    /// whose 3D shows what lies off the console's view there.
+    #[test]
+    fn the_top_screen_keeps_the_consoles_shape_for_videos_and_wide_menus() {
+        use settings::TopShape::*;
+        assert_eq!(top_width_shown(Wide16x9, false, true), Wide16x9.width(), "in play");
+        assert_eq!(top_width_shown(Wide16x9, true, true), 400.0, "a video");
+        assert_eq!(top_width_shown(Wide16x9, false, false), Wide16x9.width(), "16:9 menus stay wide");
+        assert_eq!(top_width_shown(Wide21x9, false, false), 400.0, "21:9 menus");
+        assert_eq!(top_width_shown(Wide21x9, true, false), 400.0, "a video in a 21:9 menu");
+        assert_eq!(top_width_shown(Wide21x9, false, true), Wide21x9.width(), "21:9 in play");
+        assert_eq!(top_width_shown(Console, false, true), 400.0, "the console's shape");
+    }
 
     /// a frame goes unshown only while the game runs behind with a
     /// presenter that waits for the display, a few in a row at most.

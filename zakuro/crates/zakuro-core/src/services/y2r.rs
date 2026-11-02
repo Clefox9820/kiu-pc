@@ -49,6 +49,10 @@ pub struct Y2rState {
     event: Option<ObjectId>,
     #[serde(skip)]
     scratch: Scratch,
+    /// how many conversions have run, which tells the frontend a video is
+    /// playing; not kept in a saved state, so states keep their format.
+    #[serde(skip)]
+    pub conversions: u64,
 }
 
 /// what a conversion works in, kept from one to the next, a movie
@@ -90,6 +94,7 @@ impl Default for Y2rState {
             output: Buffer::default(),
             event: None,
             scratch: Scratch::default(),
+            conversions: 0,
         }
     }
 }
@@ -638,6 +643,7 @@ fn convert(system: &mut System) {
     system.sync_gpu(output.address, end.wrapping_sub(output.address));
     scatter(system, output, &scratch.out);
     system.services.y2r.scratch = scratch;
+    system.services.y2r.conversions += 1;
 }
 
 #[cfg(test)]
