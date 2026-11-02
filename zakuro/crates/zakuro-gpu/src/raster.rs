@@ -2254,9 +2254,91 @@ const ISLANDS: [Island; 2] = [
 
 /// Kid Icarus Uprising's retro scenes, Medusa and Hewdraw as the NES game
 /// drew them, a band across the bottom screen whose 256x128 RGB565 picture
-/// is drawn first: on the top screen at 0.6 against the left edge, its foot
-/// on the left portrait's head, 144 down, so it shows who speaks.
-const RETRO: Island = Island { from: [0.0, 56.0, 320.0, 184.0], to: [0.0, 144.0 - 128.0 * 0.6], scale: 0.6 };
+/// is drawn first: on the top screen at 0.6 in its middle, so it shows who
+/// speaks, its edges fading out, see feathered.
+const RETRO: Island = Island { from: [0.0, 56.0, 320.0, 184.0], to: [200.0 - 320.0 * 0.6 / 2.0, 120.0 - 128.0 * 0.6 / 2.0], scale: 0.6 };
+
+/// how many of the top screen's pixels the retro scene fades out over at
+/// each of its edges.
+const RETRO_FEATHER: f32 = 10.0;
+
+/// a top-screen draw's triangles, as a list, each cut a feather's width in
+/// from the edges of bounds, low and high corners in clip x and y over w,
+/// the feather given the same way, and fading out from there to the edges
+/// by their vertices' alpha: none at an edge, all of it a feather in.
+fn feathered(topology: u32, vertices: &[Vertex], (low, high): ([f32; 2], [f32; 2]), feather: [f32; 2]) -> Vec<Vertex> {
+    let at = |vertex: &Vertex, axis: usize| vertex.clip[axis] / vertex.clip[3];
+    let mut polygons: Vec<Vec<Vertex>> = assemble(topology, vertices.len()).into_iter().map(|(a, b, c)| vec![vertices[a], vertices[b], vertices[c]]).collect();
+    for axis in 0..2 {
+        for line in [low[axis] + feather[axis], high[axis] - feather[axis]] {
+            polygons = polygons
+                .into_iter()
+                .flat_map(|polygon| {
+                    // the part on each side of the line
+                    let mut sides = [Vec::new(), Vec::new()];
+                    for (i, current) in polygon.iter().enumerate() {
+                        let next = &polygon[(i + 1) % polygon.len()];
+                        let (d0, d1) = (at(current, axis) - line, at(next, axis) - line);
+                        if d0 <= 0.0 {
+                            sides[0].push(*current);
+                        }
+                        if d0 >= 0.0 {
+                            sides[1].push(*current);
+                        }
+                        if d0 * d1 < 0.0 {
+                            let cut = current.lerp(next, d0 / (d0 - d1));
+                            sides[0].push(cut);
+                            sides[1].push(cut);
+                        }
+                    }
+                    sides.into_iter().filter(|side| side.len() >= 3)
+                })
+                .collect();
+        }
+    }
+    let mut cut = Vec::with_capacity(polygons.len() * 6);
+    for polygon in polygons {
+        for i in 1..polygon.len() - 1 {
+            cut.extend([polygon[0], polygon[i], polygon[i + 1]]);
+        }
+    }
+    for vertex in &mut cut {
+        let mut keep = 1.0f32;
+        for axis in 0..2 {
+            let value = at(vertex, axis);
+            keep = keep.min(((value - low[axis]) / feather[axis]).clamp(0.0, 1.0));
+            keep = keep.min(((high[axis] - value) / feather[axis]).clamp(0.0, 1.0));
+        }
+        vertex.color[3] *= keep;
+    }
+    cut
+}
+
+/// a draw's registers made to blend by the alpha its vertices carry: the
+/// combiner's last stage takes the stage before's alpha times the vertex
+/// colour's, its colours as they were; the result goes over the buffer by
+/// that alpha, the buffer's alpha kept, with no alpha test to cut a faded
+/// edge off. a draw that blends already is left as it is: the game's retro
+/// scenes blend by their texture's alpha times their vertices'.
+// ponytail: a title whose last stage works on alpha loses that, not one of
+// Kid Icarus Uprising's retro scenes
+fn by_vertex_alpha(registers: &[u32]) -> Vec<u32> {
+    let mut blended = registers.to_vec();
+    if registers[REG_COLOR_OPERATION] & 0x100 != 0 {
+        return blended;
+    }
+    let last = TEV_STAGES[5];
+    // sources: the previous stage's alpha and the vertex colour's, their
+    // alphas, multiplied, at 1x
+    blended[last] = (blended[last] & 0xFFFF) | 0xF << 16;
+    blended[last + 1] &= !(0xFFF << 12);
+    blended[last + 2] = (blended[last + 2] & 0xFFFF) | 1 << 16;
+    blended[last + 4] &= !(3 << 16);
+    blended[REG_COLOR_OPERATION] |= 0x100;
+    blended[REG_BLEND_FUNC] = 6 << 16 | 7 << 20 | 1 << 28;
+    blended[REG_ALPHA_TEST] &= !1;
+    blended
+}
 
 /// how much of the retro scene shows at most on the top screen, so the
 /// scene behind it shows through a little, and how much more or less of it
@@ -2399,8 +2481,26 @@ fn draw_portraits<M: GpuMemory>(memory: &mut M, resources: &mut Resources) -> bo
         (true, None) => {}
     }
     if let Some(shown) = retro.as_ref().filter(|shown| shown.alpha > 0.0) {
+        // its edges, all its draws' together, fading out
+        let at = |vertex: &Vertex, axis: usize| vertex.clip[axis] / vertex.clip[3];
+        let (mut low, mut high) = ([f32::MAX; 2], [f32::MIN; 2]);
+        for vertex in shown.draws.iter().flat_map(|draw| &draw.vertices) {
+            for axis in 0..2 {
+                low[axis] = low[axis].min(at(vertex, axis));
+                high[axis] = high[axis].max(at(vertex, axis));
+            }
+        }
+        let feather = [RETRO_FEATHER / 120.0, RETRO_FEATHER / 200.0];
         for draw in &shown.draws {
-            draw_faded(memory, resources, draw, shown.alpha);
+            let mut registers = by_vertex_alpha(&draw.registers);
+            let topology = registers[REG_PRIMITIVE_CONFIG] >> 8 & 3;
+            registers[REG_PRIMITIVE_CONFIG] &= !(3 << 8);
+            let mut vertices = draw.vertices.clone();
+            for vertex in &mut vertices {
+                vertex.color[3] *= shown.alpha;
+            }
+            let vertices = feathered(topology, &vertices, (low, high), feather);
+            rasterize(&registers, memory, resources, Vertices::Shaded(&vertices));
             drew = true;
         }
     }
@@ -9582,11 +9682,10 @@ mod tests {
 
     /// a retro scene on the bottom screen, its 256x128 RGB565 picture across
     /// the screen from 56 to 184 down, goes to the top screen with all that
-    /// is drawn over it there, scaled by 0.6 against the left edge, its foot
-    /// on the left portrait's head at 144 down; with no retro picture that
-    /// band of the bottom screen stays there.
+    /// is drawn over it there, scaled by 0.6 in the middle of it; with no
+    /// retro picture that band of the bottom screen stays there.
     #[test]
-    fn a_retro_scene_goes_to_the_top_screen_above_the_left_portrait() {
+    fn a_retro_scene_goes_to_the_middle_of_the_top_screen() {
         let mut registers = target_registers();
         sized(&mut registers, 240, 320);
         let base = TEXTURE_UNIT_BASES[0];
@@ -9609,12 +9708,62 @@ mod tests {
         mirror_hud(&textured(128, 64, 2), &mut resources, Vertices::Shaded(&label));
         assert!(resources.portraits.hud.is_empty(), "apart from the battle display, to fade");
         let [picture, _label] = &resources.portraits.retro_draws[..] else { panic!("the picture and the label taken") };
-        // its corner at the band's foot on the right, 320 across and 184
-        // down below, lands 192 across and 144 down above, which in the top
-        // screen's buffer is 96 up from its bottom edge and 208 left of its
-        // right one
+        // the band, 192 by 76.8 above, from 104 to 296 across and 81.6 to
+        // 158.4 down: its corner at the foot on the right, 320 across and
+        // 184 down below, lands 296 across and 158.4 down, which in the top
+        // screen's buffer is 81.6 up from its bottom edge and 104 left of
+        // its right one
         let screen = to_screen(&picture.vertices[0], (0.0, 0.0, 240.0, 400.0)).unwrap();
-        assert!((screen.x - 96.0).abs() < 0.1 && (screen.y - 208.0).abs() < 0.1, "at {}, {}", screen.x, screen.y);
+        assert!((screen.x - 81.6).abs() < 0.1 && (screen.y - 104.0).abs() < 0.1, "at {}, {}", screen.x, screen.y);
+    }
+
+    /// the retro scene's edges fade out: a draw over its bounds is cut a
+    /// feather's width in from each edge, showing none at the edges and
+    /// all of it from the feather in.
+    #[test]
+    fn a_retro_scene_fades_out_at_its_edges() {
+        let whole = quad((-0.5, 0.5), (-0.5, 0.5), RED);
+        let bounds = ([-0.5, -0.5], [0.5, 0.5]);
+        let cut = feathered(0, &whole, bounds, [0.1, 0.1]);
+        assert_eq!(cut.len() % 3, 0, "a list of triangles");
+        assert!(cut.len() > whole.len(), "cut along the feathers");
+        let near = |a: f32, b: f32| (a - b).abs() < 1e-4;
+        for vertex in &cut {
+            let [x, y] = [vertex.clip[0], vertex.clip[1]];
+            let edge = near(x.abs(), 0.5) || near(y.abs(), 0.5);
+            let inside = x.abs() <= 0.4 + 1e-4 && y.abs() <= 0.4 + 1e-4;
+            if edge {
+                assert!(near(vertex.color[3], 0.0), "none at the edge, {x} {y} {}", vertex.color[3]);
+            } else if inside {
+                assert!(near(vertex.color[3], RED[3]), "all inside, {x} {y} {}", vertex.color[3]);
+            }
+        }
+        // the same area, cut or not
+        let area = |triangles: &[Vertex]| -> f32 {
+            triangles.chunks_exact(3).map(|t| ((t[1].clip[0] - t[0].clip[0]) * (t[2].clip[1] - t[0].clip[1]) - (t[2].clip[0] - t[0].clip[0]) * (t[1].clip[1] - t[0].clip[1])).abs() / 2.0).sum()
+        };
+        assert!(near(area(&cut), 1.0), "area {}", area(&cut));
+    }
+
+    /// a retro scene's draws blend by the alpha their vertices carry, the
+    /// combiner's last stage taking it in, the colours they make kept.
+    #[test]
+    fn a_retro_scene_blends_by_its_vertices_alpha() {
+        let registers = target_registers();
+        let blended = by_vertex_alpha(&registers);
+        let last = TEV_STAGES[5];
+        assert_eq!(blended[last] & 0xFFFF, registers[last] & 0xFFFF, "its colours as they were");
+        assert_eq!((blended[last] >> 16) & 0xFF, 0x0F, "the previous stage's alpha times the vertex's");
+        assert_eq!((blended[last + 2] >> 16) & 0xF, 1, "multiplied");
+        assert_ne!(blended[REG_COLOR_OPERATION] & 0x100, 0, "blending");
+        assert_eq!(blended[REG_BLEND_FUNC], 6 << 16 | 7 << 20 | 1 << 28, "by the source's alpha, the buffer's alpha kept");
+        assert_eq!(blended[REG_ALPHA_TEST] & 1, 0, "no alpha test to cut the faded edges off");
+        // the game's own retro draws blend by their vertices' alpha already,
+        // the texture's times the vertex's: they are left as they are
+        let mut blending = registers.clone();
+        blending[REG_COLOR_OPERATION] |= 0x100;
+        blending[REG_BLEND_FUNC] = 0x0176_0000;
+        assert_eq!(by_vertex_alpha(&blending), blending, "a draw that blends already");
     }
 
     /// a retro scene fades in over a few frames while the game draws it, up
