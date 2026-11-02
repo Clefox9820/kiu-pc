@@ -23,6 +23,7 @@ Load before launching or closing the game, touching Zakuro settings, saves or lo
 - Inside the Claude desktop app (MSIX), your processes see a virtualized `%APPDATA%` and `%LOCALAPPDATA%`. Changes you make there do not reach the user. To read or write their real files, write a `.bat` with the Write tool on a normal drive and run it with `explorer.exe <bat>`.
 - Back up the user's real `settings.toml` before changing it.
 - `explorer.exe <bat>` passes no arguments to the `.bat`; have it read them from a small text file instead (see `build\prueba-fsr.bat`).
+- Write Windows paths into such files with `printf '%s' "$path"` or forward slashes: a path in printf's format string loses `\b`, `\f` and the like to escapes, and the game silently gets a broken path.
 - Never answer Windows security prompts (firewall, UAC) for the user.
 - `E:\3dsrecomp-work\Jugar Kid Icarus.bat` is the maintainer's own launcher (it sets `ZAKURO_PORTRAITS` and `ZAKURO_UPSCALER`); back it up before editing it.
 - E: is a slow hard disk: `du` over the whole drive ran for 2+ hours. Measure folder by folder with `timeout`, and read game sizes from Steam `appmanifest_*.acf` (`SizeOnDisk`) and Epic `C:/ProgramData/Epic/EpicGamesLauncher/Data/Manifests/*.item` (`InstallSize`).

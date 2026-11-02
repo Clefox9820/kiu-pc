@@ -982,6 +982,74 @@ struct BoundTexture {
     /// the texture pack's picture for it, which the host's GPU draws with
     /// in its place once it has been read.
     replacement: Option<Arc<crate::pack::Material>>,
+    /// how many of its sizes texels holds, one after another from its own,
+    /// each half the one before, see mip_chain; 1 for its own alone.
+    levels: u32,
+    /// how its smaller sizes are sampled, from the unit's registers.
+    lod: TextureLod,
+}
+
+/// how a texture's smaller sizes are sampled, from a unit's
+/// GPUREG_TEXUNITn_PARAM and _LOD registers.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub(crate) struct TextureLod {
+    /// bilinear rather than point sampling when minifying, PARAM bit 2.
+    pub(crate) min_linear: bool,
+    /// blending between two sizes rather than taking the nearest, PARAM
+    /// bit 24.
+    pub(crate) mip_linear: bool,
+    /// the smallest and largest level to sample, LOD bits 24-27 and 16-19,
+    /// 0 being the texture's own size.
+    pub(crate) min_level: u32,
+    pub(crate) max_level: u32,
+    /// added to the level the GPU works out, in 256ths, LOD bits 0-12 as a
+    /// signed fixed-point number with 8 fractional bits.
+    pub(crate) bias: i32,
+}
+
+impl TextureLod {
+    fn from_registers(param: u32, lod: u32) -> TextureLod {
+        TextureLod {
+            min_linear: param & 0x4 != 0,
+            mip_linear: param & (1 << 24) != 0,
+            min_level: (lod >> 24) & 0xF,
+            max_level: (lod >> 16) & 0xF,
+            bias: ((lod & 0x1FFF) as i32) << 19 >> 19,
+        }
+    }
+}
+
+/// a texture's sizes as they follow one another in memory, from its own,
+/// each half the one before: where each starts in bytes and its size, at
+/// most `levels` of them and none under 8x8, the size of a tile and of an
+/// ETC block row, with the bytes they take in all.
+pub(crate) fn mip_chain(format: TextureFormat, width: u32, height: u32, levels: u32) -> (Vec<(usize, u32, u32)>, usize) {
+    let mut chain = Vec::new();
+    let mut offset = 0;
+    for level in 0..levels.max(1) {
+        let (w, h) = (width >> level, height >> level);
+        if level > 0 && (w < 8 || h < 8) {
+            break;
+        }
+        chain.push((offset, w, h));
+        offset += (w as u64 * h as u64 * format.bits_per_pixel() as u64).div_ceil(8) as usize;
+    }
+    (chain, offset)
+}
+
+/// how many of a width x height texture's sizes texels holds, one after
+/// another from its own as mip_chain lays them out.
+fn levels_in(texels: &[[u8; 4]], width: u32, height: u32) -> u32 {
+    let (mut count, mut levels) = (0, 0);
+    while count < texels.len() && levels < 16 {
+        let (w, h) = (width >> levels, height >> levels);
+        if w == 0 || h == 0 || count + (w * h) as usize > texels.len() {
+            break;
+        }
+        count += (w * h) as usize;
+        levels += 1;
+    }
+    levels
 }
 
 /// what a draw does for frame interpolation, see crate::interpolation.
@@ -1892,13 +1960,24 @@ impl TextureCache {
         (list == self.list && !overwritten).then(|| (decoded.texels.clone(), decoded.replacement.clone()))
     }
 
+    /// a texture of its own size alone, see decoded_levels.
+    #[cfg(test)]
     fn decoded(&mut self, key: TextureKey, data: &[u8]) -> Found {
+        let (_, format, width, height) = key;
+        self.decoded_levels(key, data, &mip_chain(format, width, height, 1).0)
+    }
+
+    /// a texture decoded from data, which holds the sizes chain lays out,
+    /// one after another from its own, into texels in the same order. the
+    /// pack, the HD pictures and their names take its own size alone.
+    fn decoded_levels(&mut self, key: TextureKey, data: &[u8], chain: &[(usize, u32, u32)]) -> Found {
         let _timer = crate::stats::time(&crate::stats::TEXTURES);
         let (_, format, width, height) = key;
         let hash = fingerprint(data);
         let checked = (self.list, self.written.len());
+        let own = chain.get(1).map_or(data.len(), |&(offset, _, _)| offset);
         if let Some(decoded) = self.entries.get_mut(&key) {
-            if decoded.hash != hash && decoded.bytes.len() == data.len() && width % 8 == 0 && height % 8 == 0 {
+            if decoded.hash != hash && decoded.bytes.len() == data.len() && chain.len() == 1 && width % 8 == 0 && height % 8 == 0 {
                 // a title changing a few sprites of an atlas rewrites a
                 // handful of its 8x8 tiles, those alone are decoded again,
                 // into a copy, as the old texels may still be uploading
@@ -1926,18 +2005,26 @@ impl TextureCache {
                 return (decoded.texels.clone(), decoded.replacement.clone());
             }
         }
-        let count = (width * height) as usize;
+        let count: usize = chain.iter().map(|&(_, w, h)| (w * h) as usize).sum();
         if self.texels + count > CACHED_TEXELS {
             self.entries.clear();
             self.texels = 0;
         }
-        let texels: Arc<[[u8; 4]]> = (0..height)
-            .flat_map(|y| (0..width).map(move |x| (x, y)))
-            .map(|(x, y)| crate::texture::sample_texel(data, format, width, x, y))
+        let texels: Arc<[[u8; 4]]> = chain
+            .iter()
+            .flat_map(|&(offset, w, h)| {
+                let level = &data[offset.min(data.len())..];
+                (0..h).flat_map(move |y| (0..w).map(move |x| crate::texture::sample_texel(level, format, w, x, y)))
+            })
             .collect();
+        // the pack and the HD pictures know a texture by its own size
+        let own_texels = match chain.len() {
+            1 => texels.clone(),
+            _ => Arc::from(&texels[..(width * height) as usize]),
+        };
         let portrait = self.portraits.contains(&key.0);
         let (replacement, hd) =
-            picture_for(self.pack.as_deref(), self.hd.as_deref(), portrait, data, &texels, key, &mut self.rows);
+            picture_for(self.pack.as_deref(), self.hd.as_deref(), portrait, &data[..own], &own_texels, key, &mut self.rows);
         let decoded = Decoded { hash, bytes: data.to_vec(), texels: texels.clone(), checked, replacement: replacement.clone(), hd };
         if let Some(old) = self.entries.insert(key, decoded) {
             self.texels -= old.texels.len();
@@ -2126,6 +2213,8 @@ fn empty_texture() -> BoundTexture {
         height: 1,
         border: [0.0; 4],
         replacement: None,
+        levels: 1,
+        lod: TextureLod::default(),
     }
 }
 
@@ -2162,8 +2251,15 @@ fn bind_texture<M: GpuMemory>(
 
     let addr = memory.translate(address);
     log::trace!("texture unit {unit}: 0x{address:08X} -> 0x{addr:08X}, {width}x{height} {format:?}");
-    let bits = (width as u64) * (height as u64) * format.bits_per_pixel() as u64;
-    let size = bits.div_ceil(8) as usize;
+    // its smaller sizes follow it in memory, all but for a buffer drawn
+    // into, and for a chain running past the memory there is, which keeps
+    // its own size alone rather than sample nothing
+    let lod = TextureLod::from_registers(registers[base + 2], registers[base + 3]);
+    let levels = if drawn.is_some() { 1 } else { lod.max_level + 1 };
+    let (mut chain, mut size) = mip_chain(format, width, height, levels);
+    if chain.len() > 1 && memory.slice(addr, size).is_none() {
+        (chain, size) = mip_chain(format, width, height, 1);
+    }
 
     let key = (addr, format, width, height);
     if format == TextureFormat::Etc1 {
@@ -2173,19 +2269,23 @@ fn bind_texture<M: GpuMemory>(
         (Some(_), _) if !past => (Arc::default(), None),
         (_, Some(found)) => found,
         (_, None) => match memory.slice(addr, size) {
-            Some(data) => cache.decoded(key, data),
+            Some(data) => cache.decoded_levels(key, data, &chain),
             None => {
                 let mut data = vec![0u8; size];
                 memory.read(addr, &mut data);
-                cache.decoded(key, &data)
+                cache.decoded_levels(key, &data, &chain)
             }
         },
     };
+    // what the cache held may be of other sizes than these registers ask
+    let levels = levels_in(&texels, width, height).min(chain.len() as u32);
 
     // filter mode in bit 1 (magnification) and 2 (minification), the wrap
     // modes for T and S in bits 8-10 and 12-14.
     let config = registers[base + 2];
     Some(BoundTexture {
+        levels: levels.max(1),
+        lod,
         texels,
         drawn,
         linear: config & 0x2 != 0,
@@ -2280,8 +2380,10 @@ fn texture_range<M: GpuMemory>(registers: &[u32], memory: &M, unit: usize) -> Op
     if width == 0 || height == 0 || address == 0 {
         return None;
     }
-    let bits = width as u64 * height as u64 * format.bits_per_pixel() as u64;
-    Some((memory.translate(address), bits.div_ceil(8) as u32))
+    // its smaller sizes too, which follow it
+    let levels = TextureLod::from_registers(registers[base + 2], registers[base + 3]).max_level + 1;
+    let (_, size) = mip_chain(format, width, height, levels);
+    Some((memory.translate(address), size as u32))
 }
 
 /// where and how depth testing reads/writes, or None when disabled.
@@ -4280,6 +4382,8 @@ mod tests {
             height: 8,
             border: RED,
             replacement: None,
+            levels: 1,
+            lod: TextureLod::default(),
         };
         let white = [1.0; 4];
         assert_eq!(texture(Wrap::ClampToBorder).texel(-1, 3), RED);
@@ -7687,6 +7791,95 @@ mod tests {
     fn quad(x: (f32, f32), y: (f32, f32), color: Vec4) -> Vec<Vertex> {
         let vertex = |x: f32, y: f32| Vertex { clip: [x, y, -0.5, 1.0], color, texcoords: [[0.0; 2]; 3], quaternion: [0.0, 0.0, 0.0, 1.0], view: [0.0; 3] };
         [(x.0, y.0), (x.1, y.0), (x.1, y.1), (x.0, y.0), (x.1, y.1), (x.0, y.1)].into_iter().map(|(x, y)| vertex(x, y)).collect()
+    }
+
+    /// a texture's smaller sizes follow it in memory, each half the one
+    /// before, down to 8x8 at the smallest.
+    #[test]
+    fn a_textures_sizes_follow_one_another_down_to_eight_by_eight() {
+        let (chain, size) = mip_chain(TextureFormat::Rgba8, 64, 32, 6);
+        assert_eq!(chain, vec![(0, 64, 32), (8192, 32, 16), (10240, 16, 8)], "none under 8x8");
+        assert_eq!(size, 10240 + 16 * 8 * 4);
+        let (chain, size) = mip_chain(TextureFormat::Etc1, 128, 128, 1);
+        assert_eq!((chain, size), (vec![(0, 128, 128)], 128 * 128 / 2), "its own size alone");
+    }
+
+    /// the LOD register's bias is a signed number with 8 fractional bits,
+    /// over the smallest and largest level; PARAM picks the filters.
+    #[test]
+    fn a_units_lod_registers_say_how_its_sizes_are_sampled() {
+        // as Kid Icarus Uprising sets them for its ground
+        let lod = TextureLod::from_registers(0x2206, 0x0003_1E00);
+        assert_eq!(lod, TextureLod { min_linear: true, mip_linear: false, min_level: 0, max_level: 3, bias: -512 });
+        let lod = TextureLod::from_registers(1 << 24, 0x0204_0007);
+        assert_eq!(lod, TextureLod { min_linear: false, mip_linear: true, min_level: 2, max_level: 4, bias: 7 });
+    }
+
+    /// the cache decodes every size it is given one after another, its own
+    /// first as it would alone, so the pack and the HD pictures see the
+    /// same.
+    #[test]
+    fn the_cache_decodes_a_textures_sizes_after_its_own() {
+        let key = (0x1000, TextureFormat::Rgba8, 16, 16);
+        let (chain, size) = mip_chain(TextureFormat::Rgba8, 16, 16, 2);
+        let mut data = vec![0xFFu8; size];
+        data[16 * 16 * 4..].fill(0x40);
+        let (texels, _) = TextureCache::default().decoded_levels(key, &data, &chain);
+        assert_eq!(texels.len(), 16 * 16 + 8 * 8);
+        assert_eq!(levels_in(&texels, 16, 16), 2);
+        let (own, _) = TextureCache::default().decoded(key, &data[..16 * 16 * 4]);
+        assert_eq!(&texels[..16 * 16], &own[..], "its own size as alone");
+        assert!(texels[16 * 16..].iter().all(|&texel| texel == [0x40; 4]), "the smaller size after it");
+    }
+
+    /// drawn 8 times smaller than it is, a texture whose registers give it
+    /// smaller sizes is sampled from one of them on the GPU, not from its
+    /// own size; without them, and in software, as before.
+    #[test]
+    fn the_gpu_samples_a_textures_smaller_sizes_when_minified() {
+        let Ok(hardware) = hardware::Hardware::new() else { return };
+        const TEXTURE: u32 = 0x8_0000;
+        let mut registers = target_registers();
+        registers[REG_TEXTURE_CONFIG] = 1;
+        registers[REG_TEXTURE0_DIMENSIONS] = 64 | (64 << 16);
+        registers[REG_TEXTURE0_ADDRESS] = TEXTURE >> 3;
+        registers[REG_TEXTURE0_PARAMETERS] = 0x6;
+        registers[0x0C0] = 0x3 | (0x3 << 16);
+        for stage in [0x0C8, 0x0D0, 0x0D8, 0x0F0, 0x0F8] {
+            registers[stage] = 0xF | (0xF << 16);
+        }
+        // white at its own size, opaque black-ish at each smaller one
+        let (_, size) = mip_chain(TextureFormat::Rgba8, 64, 64, 4);
+        let mut data = vec![0xFFu8; size];
+        for texel in data[64 * 64 * 4..].chunks_mut(4) {
+            texel.copy_from_slice(&[0xFF, 0, 0, 0]);
+        }
+        // the texture over the whole 8x8 target
+        let triangle: Vec<Vertex> = [[-1.0, -1.0], [3.0, -1.0], [-1.0, 3.0]]
+            .into_iter()
+            .map(|[x, y]| Vertex {
+                clip: [x, y, -0.5, 1.0],
+                color: RED,
+                texcoords: [[(x + 1.0) / 2.0, (y + 1.0) / 2.0]; 3],
+                quaternion: [0.0, 0.0, 0.0, 1.0],
+                view: [0.0; 3],
+            })
+            .collect();
+        let white = |pixel: [u8; 4]| pixel[..3] == [0xFF; 3];
+        let mut resources = Resources { hardware: Some(hardware), ..Default::default() };
+        let mut drawn = |lod: u32, resources: &mut Resources| {
+            registers[0x084] = lod;
+            let mut memory = ConsoleMemory::default();
+            memory.write(TEXTURE, &data);
+            rasterize_shaded(&registers, &mut memory, resources, &triangle);
+            if let Some(hardware) = resources.hardware.as_mut() {
+                hardware.flush(&mut memory).unwrap();
+            }
+            pixels(&mut memory)[4 * 8 + 4]
+        };
+        assert!(!white(drawn(3 << 16, &mut resources)), "a smaller size on the GPU");
+        assert!(white(drawn(0, &mut resources)), "its own size alone without them");
+        assert!(white(drawn(3 << 16, &mut Resources::default())), "software keeps its own size");
     }
 
     /// on a top screen shown wider than the console's, the HUD's 2D draws
