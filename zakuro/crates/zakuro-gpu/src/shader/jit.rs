@@ -694,9 +694,8 @@ struct Helpers {
     emit: FuncRef,
 }
 
-/// compiles the program for an entry point, why not when the host has no
-/// backend or the program goes too many ways.
-pub(super) fn compile(program: &Program, entry: u32, tier: Tier) -> Result<Compiled, String> {
+/// Cranelift's settings for a tier.
+fn flags(tier: Tier) -> Result<settings::Flags, String> {
     let mut flags = settings::builder();
     // the verifier looks the code over for Cranelift's own sake, a quarter
     // of the time compiling took, the tests have it
@@ -711,11 +710,22 @@ pub(super) fn compile(program: &Program, entry: u32, tier: Tier) -> Result<Compi
         ("is_pic", "false"),
         ("enable_verifier", verify),
         ("regalloc_algorithm", allocator),
+        // a frame past a page touches its pages in order: Windows grows a
+        // thread's stack a page at a time, and the quick tier's frames
+        // spill to tens of kilobytes
+        ("enable_probestack", "true"),
+        ("probestack_strategy", "inline"),
     ];
     for (name, value) in flagged {
         flags.set(name, value).map_err(|error| format!("{name}, {error}"))?;
     }
-    let isa = cranelift_native::builder()?.finish(settings::Flags::new(flags)).map_err(|error| error.to_string())?;
+    Ok(settings::Flags::new(flags))
+}
+
+/// compiles the program for an entry point, why not when the host has no
+/// backend or the program goes too many ways.
+pub(super) fn compile(program: &Program, entry: u32, tier: Tier) -> Result<Compiled, String> {
+    let isa = cranelift_native::builder()?.finish(flags(tier)?).map_err(|error| error.to_string())?;
     if isa.pointer_type() != types::I64 {
         return Err("the host's pointers are not 64-bit".to_owned());
     }
@@ -1613,6 +1623,17 @@ fn branch(op: &Op, pc: u32, taken: bool, frames: &[Frame]) -> State {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// both tiers probe a frame's pages, which a frame of the quick tier
+    /// skipped past the stack's guard page without on Windows.
+    #[test]
+    fn frames_probe_their_pages() {
+        for tier in [Tier::Quick, Tier::Full] {
+            let flags = flags(tier).expect("flags");
+            assert!(flags.enable_probestack(), "{tier:?}");
+            assert_eq!(flags.probestack_strategy(), settings::ProbestackStrategy::Inline, "{tier:?}");
+        }
+    }
 
     /// quick code asked for once it has shaded HOT batches comes back as it
     /// is while the program compiles in full, which then takes its place.
