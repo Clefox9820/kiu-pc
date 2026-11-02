@@ -1613,7 +1613,10 @@ impl App {
         self.keyboard.feed_mailbox(&mut game.system.memory.host_mailbox);
         // how much wider than the console's the top screen shows, for a game
         // override to draw a wider scene into the same 400x240
-        game.system.memory.host_mailbox[4] = (self.settings.top_shape.width() / 400.0).to_bits();
+        let widening = self.settings.top_shape.width() / 400.0;
+        game.system.memory.host_mailbox[4] = widening.to_bits();
+        // and its HUD's 2D draws squeezed back into proportion
+        game.system.gpu.set_top_widening(widening);
         let interpreted =|system: &System| system.interpreted_instructions + system.recompiled.as_ref().map_or(0, |library| library.fallbacks());
         let before = interpreted(&game.system);
         let faults = warm::page_faults();

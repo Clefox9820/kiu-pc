@@ -710,6 +710,12 @@ impl Gpu {
         self.resources.portraits.in_play = on;
     }
 
+    /// says how many times wider than the console's the top screen shows,
+    /// so that its HUD's 2D draws keep their proportions; 1 for as it is.
+    pub fn set_top_widening(&mut self, factor: f32) {
+        self.resources.top_widening = factor;
+    }
+
     /// says which screens the window shows now, the top one and the bottom
     /// one. a screen it does not show needs no picture in between, which
     /// frame interpolation then leaves out.

@@ -286,9 +286,10 @@ Tools used to work on it:
   them from both ROMs and checks the table. It prints only addresses.
 - Widescreen: **Top screen shape** (16:9 or 21:9) makes the game draw a
   wider 3D scene instead of stretching it, through an override of the
-  camera's projection. The HUD keeps the console's layout, stretched with
-  the screen. A shape changed during play applies to each camera the next
-  time the game asks for its projection.
+  camera's projection. Zakuro keeps the HUD in proportion: each 2D piece
+  along an edge is squeezed back toward that edge, and the rest, such as
+  markers, around its own middle. A shape changed during play applies to
+  each camera the next time the game asks for its projection.
 - **Screen filter: FSR (AMD)**, when the window is bigger than the
   resolution the game is drawn at, first smooths each screen's jagged edges
   with SMAA (iryoku/smaa, MIT), then upscales it with AMD FidelityFX Super

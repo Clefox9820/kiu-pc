@@ -1025,6 +1025,47 @@ pub struct Resources {
     pub(crate) hardware: Option<hardware::Hardware>,
     /// dialogue portraits drawn again on the top screen, see mirror_portrait.
     pub(crate) portraits: Portraits,
+    /// how many times wider than the console's the top screen shows, which
+    /// squeeze_hud takes back out of its 2D draws; 1 or less for not at all.
+    pub(crate) top_widening: f32,
+}
+
+/// a 2D draw of the top screen, every vertex at w 1, kept in proportion on
+/// a top screen shown factor times wider than the console's, when it is
+/// not as wide as the screen: squeezed across by factor toward the screen's
+/// edge it starts at, for a HUD's pieces along an edge, which keep their
+/// places there and to one another, or else toward its own middle, for
+/// what follows the scene, as markers do. none for a draw left as it is.
+fn squeeze_hud(vertices: &[Vertex], factor: f32) -> Option<Vec<Vertex>> {
+    if factor <= 1.0 || vertices.is_empty() || vertices.iter().any(|v| (v.clip[3] - 1.0).abs() > 1e-4) {
+        return None;
+    }
+    // across the top screen's 400 pixels from its left edge; a vertex's
+    // clip y runs the other way, from 1 on the left to -1 on the right
+    let across = |v: &Vertex| 200.0 * (1.0 - v.clip[1]);
+    let (left, right) = vertices.iter().map(across).fold((f32::MAX, f32::MIN), |(l, r), x| (l.min(x), r.max(x)));
+    // as wide as the screen: a fade, a flash or the scene put together
+    if right - left > 360.0 {
+        return None;
+    }
+    let anchor = if left < 48.0 && right < 200.0 {
+        0.0
+    } else if right > 352.0 && left > 200.0 {
+        400.0
+    } else {
+        (left + right) / 2.0
+    };
+    Some(
+        vertices
+            .iter()
+            .map(|vertex| {
+                let mut squeezed = *vertex;
+                let x = anchor + (across(vertex) - anchor) / factor;
+                squeezed.clip[1] = 1.0 - x / 200.0;
+                squeezed
+            })
+            .collect(),
+    )
 }
 
 /// what mirror_portrait needs to put the bottom screen's portraits on the
@@ -3335,6 +3376,28 @@ fn assemble(topology: u32, count: usize) -> Vec<(usize, usize, usize)> {
 /// the triangles drawn, none for arrays the GPU could not decode, which the
 /// CPU decodes then.
 fn rasterize<M: GpuMemory>(registers: &[u32], memory: &mut M, resources: &mut Resources, vertices: Vertices) -> Option<u32> {
+    // on a top screen shown wider than the console's, its HUD kept in
+    // proportion: 2D draws go without a depth test, and the CPU decodes
+    // their arrays so their vertices say where they are
+    let squeezed;
+    let vertices = if resources.top_widening > 1.0
+        && !resources.portraits.adding
+        && registers[REG_DEPTH_COLOR_MASK] & 1 == 0
+        && read_float24(registers, REG_VIEWPORT_WIDTH) == 120.0
+        && read_float24(registers, REG_VIEWPORT_HEIGHT) == 200.0
+    {
+        #[cfg(feature = "vulkan")]
+        if matches!(vertices, Vertices::Raw { .. }) {
+            return None;
+        }
+        squeezed = shaded_in_order(registers, vertices).and_then(|shaded| squeeze_hud(&shaded, resources.top_widening));
+        match &squeezed {
+            Some(squeezed) => Vertices::Shaded(squeezed),
+            None => vertices,
+        }
+    } else {
+        vertices
+    };
     if portraits_on() && !resources.portraits.adding {
         if read_float24(registers, REG_VIEWPORT_WIDTH) == 120.0 && read_float24(registers, REG_VIEWPORT_HEIGHT) == 200.0 {
             note_top_buffer(registers, resources);
@@ -7596,6 +7659,31 @@ mod tests {
     fn quad(x: (f32, f32), y: (f32, f32), color: Vec4) -> Vec<Vertex> {
         let vertex = |x: f32, y: f32| Vertex { clip: [x, y, -0.5, 1.0], color, texcoords: [[0.0; 2]; 3], quaternion: [0.0, 0.0, 0.0, 1.0], view: [0.0; 3] };
         [(x.0, y.0), (x.1, y.0), (x.1, y.1), (x.0, y.0), (x.1, y.1), (x.0, y.1)].into_iter().map(|(x, y)| vertex(x, y)).collect()
+    }
+
+    /// on a top screen shown wider than the console's, the HUD's 2D draws
+    /// are squeezed back into shape: pieces along an edge toward that edge,
+    /// the rest toward their own middle; the 3D scene, what spans the
+    /// screen and the console's own shape are left as they are.
+    #[test]
+    fn the_hud_keeps_its_proportions_on_a_wider_top_screen() {
+        let across = |v: &Vertex| 200.0 * (1.0 - v.clip[1]);
+        let span = |vertices: &[Vertex]| vertices.iter().map(across).fold((f32::MAX, f32::MIN), |(l, r), x| (l.min(x), r.max(x)));
+        // a piece from left to right across the top screen's 400
+        let piece = |left: f32, right: f32| quad((-0.9, -0.8), (1.0 - right / 200.0, 1.0 - left / 200.0), RED);
+        let near = |a: f32, b: f32| (a - b).abs() < 1e-3;
+        let factor = 1.25;
+        let (left, right) = span(&squeeze_hud(&piece(14.0, 143.0), factor).unwrap());
+        assert!(near(left, 14.0 / factor) && near(right, 143.0 / factor), "the health bar, {left} to {right}");
+        let (left, right) = span(&squeeze_hud(&piece(312.0, 400.0), factor).unwrap());
+        assert!(near(right, 400.0) && near(left, 400.0 - 88.0 / factor), "the score, {left} to {right}");
+        let (left, right) = span(&squeeze_hud(&piece(180.0, 240.0), factor).unwrap());
+        assert!(near((left + right) / 2.0, 210.0) && near(right - left, 60.0 / factor), "a marker, {left} to {right}");
+        assert!(squeeze_hud(&piece(0.0, 400.0), factor).is_none(), "across the whole screen");
+        let mut scene = piece(100.0, 200.0);
+        scene[0].clip[3] = 2.0;
+        assert!(squeeze_hud(&scene, factor).is_none(), "the 3D scene");
+        assert!(squeeze_hud(&piece(14.0, 143.0), 1.0).is_none(), "the console's shape");
     }
 
     /// a portrait on one side of the bottom screen goes to the top screen's
