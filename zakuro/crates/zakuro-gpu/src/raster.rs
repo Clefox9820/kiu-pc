@@ -1686,7 +1686,10 @@ pub struct Resources {
 /// not as wide as the screen: squeezed across by factor toward the screen's
 /// edge it starts at, for a HUD's pieces along an edge, which keep their
 /// places there and to one another, or else toward its own middle, for
-/// what follows the scene, as markers do. none for a draw left as it is.
+/// what follows the scene, as markers do. the title's text, which it can
+/// write in several draws of a few letters each, goes toward the screen's
+/// middle instead, so the spaces between the draws shrink with the letters.
+/// none for a draw left as it is.
 /// a 2D draw squeeze_hud kept against an edge this frame, by where it was
 /// across the top screen's 400 and down its height in clip x, and the edge.
 #[derive(Clone, Copy)]
@@ -1700,7 +1703,7 @@ pub(crate) struct EdgePiece {
 /// within this many pixels, as a figure on its badge.
 const HUD_TOUCH: f32 = 8.0;
 
-fn squeeze_hud(vertices: &[Vertex], factor: f32, edges: &mut Vec<EdgePiece>) -> Option<Vec<Vertex>> {
+fn squeeze_hud(vertices: &[Vertex], factor: f32, text: bool, edges: &mut Vec<EdgePiece>) -> Option<Vec<Vertex>> {
     if factor <= 1.0 || vertices.is_empty() || vertices.iter().any(|v| (v.clip[3] - 1.0).abs() > 1e-4) {
         return None;
     }
@@ -1729,7 +1732,7 @@ fn squeeze_hud(vertices: &[Vertex], factor: f32, edges: &mut Vec<EdgePiece>) -> 
     if let Some(edge) = edge {
         edges.push(EdgePiece { across: (left, right), down, edge });
     }
-    let anchor = edge.unwrap_or((left + right) / 2.0);
+    let anchor = edge.unwrap_or(if text { 200.0 } else { (left + right) / 2.0 });
     Some(
         vertices
             .iter()
@@ -1779,6 +1782,16 @@ struct TextLine {
     top: f32,
     left: f32,
     right: f32,
+}
+
+/// a draw of letters from Kid Icarus Uprising's font, an A4 256x256
+/// picture, into its text buffer or straight onto a screen.
+// ponytail: matched by its shape alone, as is_portrait is
+fn is_font(registers: &[u32]) -> bool {
+    let base = TEXTURE_UNIT_BASES[0];
+    registers[REG_TEXTURE_CONFIG] & 1 != 0
+        && registers[base + 1] == (256 << 16 | 256)
+        && TextureFormat::from_raw(registers[base + 13]) == TextureFormat::A4
 }
 
 /// a draw into Kid Icarus Uprising's 512x128 text buffer, where it writes
@@ -4325,7 +4338,8 @@ fn rasterize<M: GpuMemory>(registers: &[u32], memory: &mut M, resources: &mut Re
         if matches!(vertices, Vertices::Raw { .. }) {
             return None;
         }
-        squeezed = shaded_in_order(registers, vertices).and_then(|shaded| squeeze_hud(&shaded, resources.top_widening, &mut resources.hud_edges));
+        let text = is_font(registers);
+        squeezed = shaded_in_order(registers, vertices).and_then(|shaded| squeeze_hud(&shaded, resources.top_widening, text, &mut resources.hud_edges));
         match &squeezed {
             Some(squeezed) => Vertices::Shaded(squeezed),
             None => vertices,
@@ -9222,6 +9236,32 @@ mod tests {
     /// are squeezed back into shape: pieces along an edge toward that edge,
     /// the rest toward their own middle; the 3D scene, what spans the
     /// screen and the console's own shape are left as they are.
+    /// squeeze_hud for a draw that is not the title's text.
+    fn squeeze_hud_plain(vertices: &[Vertex], factor: f32, edges: &mut Vec<EdgePiece>) -> Option<Vec<Vertex>> {
+        squeeze_hud(vertices, factor, false, edges)
+    }
+
+    /// text the title writes straight onto the top screen in several draws,
+    /// a few letters each, is squeezed toward the screen's middle as one,
+    /// so the spaces between the draws shrink with the letters rather than
+    /// open up between them.
+    #[test]
+    fn text_drawn_in_pieces_keeps_its_spacing_on_a_wider_top_screen() {
+        let across = |v: &Vertex| 200.0 * (1.0 - v.clip[1]);
+        let span = |vertices: &[Vertex]| vertices.iter().map(across).fold((f32::MAX, f32::MIN), |(l, r), x| (l.min(x), r.max(x)));
+        let piece = |left: f32, right: f32| quad((-0.9, -0.8), (1.0 - right / 200.0, 1.0 - left / 200.0), RED);
+        let near = |a: f32, b: f32| (a - b).abs() < 1e-3;
+        let factor = 1.25;
+        let mut edges = Vec::new();
+        let (_, first) = span(&squeeze_hud(&piece(100.0, 180.0), factor, true, &mut edges).unwrap());
+        let (second, end) = span(&squeeze_hud(&piece(190.0, 300.0), factor, true, &mut edges).unwrap());
+        assert!(near(second - first, 10.0 / factor), "the space between them, {first} to {second}");
+        assert!(near(end, 200.0 + 100.0 / factor), "toward the screen's middle, ending at {end}");
+        // text against an edge still keeps to it
+        let (left, _) = span(&squeeze_hud(&piece(14.0, 60.0), factor, true, &mut edges).unwrap());
+        assert!(near(left, 14.0 / factor), "text along the left edge, from {left}");
+    }
+
     #[test]
     fn the_hud_keeps_its_proportions_on_a_wider_top_screen() {
         let across = |v: &Vertex| 200.0 * (1.0 - v.clip[1]);
@@ -9231,25 +9271,25 @@ mod tests {
         let near = |a: f32, b: f32| (a - b).abs() < 1e-3;
         let factor = 1.25;
         let mut edges = Vec::new();
-        let (left, right) = span(&squeeze_hud(&piece(14.0, 143.0), factor, &mut edges).unwrap());
+        let (left, right) = span(&squeeze_hud_plain(&piece(14.0, 143.0), factor, &mut edges).unwrap());
         assert!(near(left, 14.0 / factor) && near(right, 143.0 / factor), "the health bar, {left} to {right}");
-        let (left, right) = span(&squeeze_hud(&piece(312.0, 400.0), factor, &mut edges).unwrap());
+        let (left, right) = span(&squeeze_hud_plain(&piece(312.0, 400.0), factor, &mut edges).unwrap());
         assert!(near(right, 400.0) && near(left, 400.0 - 88.0 / factor), "the score, {left} to {right}");
-        let (left, right) = span(&squeeze_hud(&piece(180.0, 240.0), factor, &mut edges).unwrap());
+        let (left, right) = span(&squeeze_hud_plain(&piece(180.0, 240.0), factor, &mut edges).unwrap());
         assert!(near((left + right) / 2.0, 210.0) && near(right - left, 60.0 / factor), "a marker, {left} to {right}");
         // a figure on a badge against the right edge goes with the badge,
         // though it does not reach the edge itself
-        let (left, right) = span(&squeeze_hud(&piece(340.0, 350.0), factor, &mut edges).unwrap());
+        let (left, right) = span(&squeeze_hud_plain(&piece(340.0, 350.0), factor, &mut edges).unwrap());
         assert!(near(left, 352.0) && near(right, 360.0), "the figure on the score's badge, {left} to {right}");
         // the same place lower down, touching nothing, keeps its middle
         let lower = quad((0.0, 0.1), (1.0 - 350.0 / 200.0, 1.0 - 340.0 / 200.0), RED);
-        let (left, right) = span(&squeeze_hud(&lower, factor, &mut edges).unwrap());
+        let (left, right) = span(&squeeze_hud_plain(&lower, factor, &mut edges).unwrap());
         assert!(near((left + right) / 2.0, 345.0), "a marker lower down, {left} to {right}");
-        assert!(squeeze_hud(&piece(0.0, 400.0), factor, &mut edges).is_none(), "across the whole screen");
+        assert!(squeeze_hud_plain(&piece(0.0, 400.0), factor, &mut edges).is_none(), "across the whole screen");
         let mut scene = piece(100.0, 200.0);
         scene[0].clip[3] = 2.0;
-        assert!(squeeze_hud(&scene, factor, &mut edges).is_none(), "the 3D scene");
-        assert!(squeeze_hud(&piece(14.0, 143.0), 1.0, &mut edges).is_none(), "the console's shape");
+        assert!(squeeze_hud_plain(&scene, factor, &mut edges).is_none(), "the 3D scene");
+        assert!(squeeze_hud_plain(&piece(14.0, 143.0), 1.0, &mut edges).is_none(), "the console's shape");
     }
 
     /// a portrait on one side of the bottom screen goes to the top screen's
