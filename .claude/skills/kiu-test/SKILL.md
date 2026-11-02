@@ -23,6 +23,7 @@ Load before claiming a change works, after any edit under `zakuro/`, and for any
 - Start test copies minimized (`start "" /min ...` in a `.bat`) and capture with `ZAKURO_SHOT`, not the window, so the maintainer's screen is left alone.
 - `pacing:` counts are meaningless while the maintainer plays or builds; compare per-frame work with `RUST_LOG=info,zakuro::frames=debug` (took, drawing, waiting) and interleaved runs.
 - `ZAKURO_SHOT` saves the screens before the presenter, so it never shows a screen filter (FSR, Sharp); check those with `scripts\drive-window.ps1` `shot:` on a window bigger than the resolution (for example `resolution = 1`, `scale = 2`).
+- Compare sound between builds with `ZAKURO_WAV=<file.wav>` (`ZAKURO_WAV_FROM`, `ZAKURO_WAV_SECONDS`) from the same save state with no input; `build\port-usa` builds straight from this repo's `zakuro/`, so it is the port to switch between code versions, then rebuild it on the branch.
 - To see whether a texture replacement is used at all, make it fully transparent in a throwaway build: if the picture still shows, the draw never takes it.
 - Behaviour changes need a test that fails before the fix (RED) and passes after (GREEN) when a deterministic test is possible.
 
