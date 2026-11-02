@@ -1825,11 +1825,25 @@ pub struct Hardware {
     twin_frames: u32,
 }
 
+/// whether the GPU runs the vertex shaders rather than the CPU: a dedicated
+/// GPU does, an integrated one leaves them to the CPU, ZAKURO_CPU_SHADERS=1
+/// or ZAKURO_GPU_SHADERS=1 picking one instead. on a Ryzen 5600G at twice
+/// the resolution with frame interpolation the GPU's shading took two thirds
+/// of its time and left up to a sixth of a flight's frames late, the CPU's
+/// one in a hundred at most, on foot about the same either way.
+// ponytail: one integrated GPU measured, the switches for one that does worse
+fn shades_on_gpu(integrated: bool, cpu: bool, gpu: bool) -> bool {
+    !cpu && (gpu || !integrated)
+}
+
 impl Hardware {
     /// on a device of its own, keeping no pipelines, as the tests draw.
     #[cfg(test)]
     pub fn new() -> Result<Hardware, String> {
-        Hardware::with_device(Arc::new(own_device()?), false, None)
+        let mut hardware = Hardware::with_device(Arc::new(own_device()?), false, None)?;
+        // the GPU's shading is what the tests check, whatever the GPU
+        hardware.shades = std::env::var_os("ZAKURO_CPU_SHADERS").is_none();
+        Ok(hardware)
     }
 
     /// draws with a device made by render_device, which the presenter may
@@ -1967,13 +1981,12 @@ impl Hardware {
                 fragment_shader,
                 depth_fragment_shader,
                 shade_shader,
-                // shading on the CPU instead, ZAKURO_CPU_SHADERS=1, to tell
-                // the two apart. integrated GPUs shade too: on a Ryzen 5600G
-                // the CPU's shading was most of each hitch, and the GPU's
-                // halved the hitches in battle, 22 against 48 over four runs
-                // ponytail: one integrated GPU measured, ZAKURO_CPU_SHADERS
-                // for one that does worse
-                shades: std::env::var_os("ZAKURO_CPU_SHADERS").is_none(),
+                // see shades_on_gpu
+                shades: shades_on_gpu(
+                    properties.device_type == vk::PhysicalDeviceType::INTEGRATED_GPU,
+                    std::env::var_os("ZAKURO_CPU_SHADERS").is_some(),
+                    std::env::var_os("ZAKURO_GPU_SHADERS").is_some(),
+                ),
                 // interpreting them all instead, to tell the two apart
                 translates: std::env::var_os("ZAKURO_INTERPRET_SHADERS").is_none(),
                 scratch: Vec::new(),
@@ -6939,6 +6952,16 @@ mod tests {
         gather(&mut block, &[1, 2, 4]);
         block.at = None;
         assert_eq!(block.staged(), None, "the batch was handed over");
+    }
+
+    /// an integrated GPU leaves the vertex shaders to the CPU, a dedicated
+    /// one runs them, and either switch overrides that.
+    #[test]
+    fn integrated_gpus_leave_vertex_shading_to_the_cpu() {
+        assert!(!shades_on_gpu(true, false, false));
+        assert!(shades_on_gpu(false, false, false));
+        assert!(shades_on_gpu(true, false, true));
+        assert!(!shades_on_gpu(false, true, false));
     }
 
     /// what a surface keeps of guest memory, through a pixel standing in for

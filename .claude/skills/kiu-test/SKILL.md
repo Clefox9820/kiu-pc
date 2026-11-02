@@ -14,7 +14,8 @@ Load before claiming a change works, after any edit under `zakuro/`, and for any
 ## Hard Rules
 
 - Run the suites for every crate you touched; report failures, never hide them.
-- Vertices are shaded on the GPU by default; with `ZAKURO_CPU_SHADERS=1` 5 raster tests fail on integrated GPUs (known, not a regression).
+- The game shades vertices on the CPU with an integrated GPU (the maintainer's 5600G) and on a dedicated GPU; `ZAKURO_GPU_SHADERS=1` or `ZAKURO_CPU_SHADERS=1` forces one for an A/B. The tests shade on the GPU; with `ZAKURO_CPU_SHADERS=1` 5 raster tests fail on integrated GPUs (known, not a regression).
+- `ZAKURO_GPU_TIMES=1` logs the GPU's time per kind of work every 600 batches (`zakuro_gpu::times`); it stays valid with the display off, unlike pacing. Check whether a cost scales with resolution before optimizing pixels: on the 5600G it did not, the vertex shading was the cost.
 - Never judge performance from one run: automated runs varied 4–188 hitches. Use interleaved A/B (a1 b1 a2 b2) with an env switch.
 - Never measure during the boot cinematic or the white title screen; measure in real battles.
 - Measure frame pacing (unshown frames, present times) only with the display on: Windows turns it off after 15 idle minutes on this PC and then throttles presentation to ~33 fps, whatever the build or settings. CPU and GPU times and screen dumps (`ZAKURO_SHOT`) stay valid with it off.

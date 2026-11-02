@@ -269,10 +269,11 @@ Tools used to work on it:
   instructions are native.
 - Mouse aim on foot (mode 3) was recently redesigned and has not yet been
   confirmed in real play. Feedback is welcome.
-- Vertices are shaded on the GPU, integrated GPUs included; on a Ryzen 5600G
-  this halved the hitches in battle. `ZAKURO_CPU_SHADERS=1` shades them on
-  the CPU, where five `zakuro-gpu` raster tests fail on some AMD integrated
-  GPUs.
+- Vertices are shaded on a dedicated GPU and on the CPU with an integrated
+  one: on a Ryzen 5600G at 2x with frame interpolation the GPU's shading
+  took two thirds of its time and left up to a sixth of a flight's frames
+  late, the CPU's 1% at most. `ZAKURO_CPU_SHADERS=1` or
+  `ZAKURO_GPU_SHADERS=1` picks one.
 - Mouse look on foot, mouse aim while flying and the automatic aim mode
   come from hand-written
   overrides in `overrides/`, found for the European release

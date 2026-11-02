@@ -59,8 +59,10 @@ cargo test -p zakuro-core --release --lib
 cargo test -p zakuro-gpu --release --features vulkan --lib
 ```
 
-Vertices are shaded on the GPU by default; `ZAKURO_CPU_SHADERS=1` shades them
-on the CPU instead, where five raster tests fail on some AMD integrated GPUs.
+The game shades vertices on a dedicated GPU and on the CPU with an integrated
+one; `ZAKURO_CPU_SHADERS=1` or `ZAKURO_GPU_SHADERS=1` picks one. The tests shade
+on the GPU; with `ZAKURO_CPU_SHADERS=1` five raster tests fail on some AMD
+integrated GPUs.
 
 ## Reading the diagnostics
 
