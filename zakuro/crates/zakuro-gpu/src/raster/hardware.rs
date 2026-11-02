@@ -67,7 +67,8 @@ const IN_FLIGHT: usize = 3;
 const RING_FLUSH: u64 = RING_SIZE / 2;
 
 /// a vertex is six vectors, position, color, texture coordinates 0 and 1,
-/// coordinate 2 with the mapped depth, the quaternion and the view vector.
+/// coordinate 2 with the mapped depth and coordinate 0's w, the quaternion
+/// and the view vector.
 const VERTEX_SIZE: usize = 24 * 4;
 /// the words of a draw's uniform block, the combiners, the texture units
 /// and the flags, then the lighting.
@@ -4001,7 +4002,7 @@ impl Hardware {
                 t[2][0] * w,
                 t[2][1] * w,
                 depth,
-                0.0,
+                v.texcoord0_w_over_w * w,
                 q[0] * w,
                 q[1] * w,
                 q[2] * w,

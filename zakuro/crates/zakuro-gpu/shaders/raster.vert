@@ -11,7 +11,8 @@ layout(location = 5) in vec4 view;
 
 layout(location = 0) out vec4 out_color;
 layout(location = 1) out vec4 out_texcoords01;
-layout(location = 2) out vec2 out_texcoord2;
+// texture coordinate set 2, and set 0's w, which a projected texture divides by
+layout(location = 2) out vec3 out_texcoord2;
 // the mapped depth before any w-buffer scaling, linear on the screen
 layout(location = 3) noperspective out float out_depth;
 layout(location = 4) out vec4 out_quaternion;
@@ -23,7 +24,7 @@ void main() {
     gl_Position = vec4(position.xy, texcoord2_depth.z * position.w, position.w);
     out_color = color;
     out_texcoords01 = texcoords01;
-    out_texcoord2 = texcoord2_depth.xy;
+    out_texcoord2 = vec3(texcoord2_depth.xy, texcoord2_depth.w);
     out_depth = texcoord2_depth.z;
     out_quaternion = quaternion;
     out_view = view.xyz;

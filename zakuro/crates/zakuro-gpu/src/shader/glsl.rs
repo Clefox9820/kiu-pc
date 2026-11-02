@@ -202,7 +202,8 @@ impl<'a> Translator<'a> {
         out.push_str(EPILOGUE);
         let _ = writeln!(out, "    out_color = vec4({});", vector(4..8, "1.0"));
         let _ = writeln!(out, "    out_texcoords01 = vec4({});", vector(8..12, "0.0"));
-        let _ = writeln!(out, "    out_texcoord2 = vec2({});", vector(12..14, "0.0"));
+        // coordinate 2, and coordinate 0's w, 1 when the shader gives none
+        let _ = writeln!(out, "    out_texcoord2 = vec3({}, {});", vector(12..14, "0.0"), component(21, "1.0"));
         out.push_str("    out_depth = position.z / position.w * depth_map.x + depth_map.y;\n");
         let _ = writeln!(out, "    out_quaternion = vec4({});", vector(14..18, "0.0"));
         let _ = writeln!(out, "    out_view = vec3({});", vector(18..21, "0.0"));
@@ -694,7 +695,7 @@ const HEADER: &str = r#"#version 450
 
 layout(location = 0) out vec4 out_color;
 layout(location = 1) out vec4 out_texcoords01;
-layout(location = 2) out vec2 out_texcoord2;
+layout(location = 2) out vec3 out_texcoord2;
 layout(location = 3) noperspective out float out_depth;
 layout(location = 4) out vec4 out_quaternion;
 layout(location = 5) out vec3 out_view;

@@ -383,6 +383,9 @@ struct Vertex {
     /// fragment lighting works from.
     quaternion: Vec4,
     view: [f32; 3],
+    /// texture coordinate set 0's w, which a projected texture divides it
+    /// by; 1 when the shader gives none.
+    texcoord0_w: f32,
 }
 
 impl Vertex {
@@ -398,6 +401,7 @@ impl Vertex {
             }),
             quaternion: std::array::from_fn(|i| mix(self.quaternion[i], other.quaternion[i])),
             view: std::array::from_fn(|i| mix(self.view[i], other.view[i])),
+            texcoord0_w: mix(self.texcoord0_w, other.texcoord0_w),
         }
     }
 }
@@ -413,6 +417,8 @@ struct OutputMap {
     texcoords: [[Option<(usize, usize)>; 2]; 3],
     quaternion: [Option<(usize, usize)>; 4],
     view: [Option<(usize, usize)>; 3],
+    /// texture coordinate set 0's w, semantic 16.
+    texcoord0_w: Option<(usize, usize)>,
 }
 
 impl Default for OutputMap {
@@ -430,6 +436,7 @@ impl Default for OutputMap {
             texcoords: [[Some((3, 0)), Some((3, 1))], [None; 2], [None; 2]],
             quaternion: [None; 4],
             view: [None; 3],
+            texcoord0_w: None,
         }
     }
 }
@@ -446,6 +453,7 @@ fn read_output_map(registers: &[u32]) -> OutputMap {
         texcoords: [[None; 2]; 3],
         quaternion: [None; 4],
         view: [None; 3],
+        texcoord0_w: None,
     };
     let mut saw_position = false;
 
@@ -464,6 +472,7 @@ fn read_output_map(registers: &[u32]) -> OutputMap {
                 8..=11 => map.color[semantic - 8] = Some(slot),
                 12..=13 => map.texcoords[0][semantic - 12] = Some(slot),
                 14..=15 => map.texcoords[1][semantic - 14] = Some(slot),
+                16 => map.texcoord0_w = Some(slot),
                 18..=20 => map.view[semantic - 18] = Some(slot),
                 22..=23 => map.texcoords[2][semantic - 22] = Some(slot),
                 _ => {}
@@ -496,15 +505,16 @@ fn pack_outputs(outputs: &[Vec4; shader::OUTPUT_REGISTERS], mask: u32) -> [Vec4;
     packed
 }
 
-/// where each of a vertex's 21 values comes from in a stage's output
+/// where each of a vertex's 22 values comes from in a stage's output
 /// registers, worked out once a draw from the output map and the stage's
 /// output mask: what packing the outputs and picking the varyings out of
 /// them gives, without packing every vertex.
 #[derive(Clone, Copy)]
 struct VertexPlan {
     /// the output register times four plus the component, or PLAN_ZERO or
-    /// PLAN_ONE, in the order of clip, color, texcoords, quaternion and view.
-    from: [u8; 21],
+    /// PLAN_ONE, in the order of clip, color, texcoords, quaternion, view
+    /// and texture coordinate set 0's w.
+    from: [u8; 22],
 }
 
 /// a value that no output register gives.
@@ -527,7 +537,7 @@ impl VertexPlan {
         // an attribute past the enabled registers is packed as zero
         let read = |(attribute, component): (usize, usize)| registers[attribute].map_or(PLAN_ZERO, |register| (register * 4 + component) as u8);
         let or = |slot: Option<(usize, usize)>, missing: u8| slot.map_or(missing, read);
-        let mut from = [PLAN_ZERO; 21];
+        let mut from = [PLAN_ZERO; 22];
         for i in 0..4 {
             from[i] = read(map.position[i]);
             from[4 + i] = or(map.color[i], PLAN_ONE);
@@ -541,6 +551,8 @@ impl VertexPlan {
         for (i, &slot) in map.view.iter().enumerate() {
             from[18 + i] = or(slot, PLAN_ZERO);
         }
+        // a w of 1 leaves a projected texture's coordinates as they are
+        from[21] = or(map.texcoord0_w, PLAN_ONE);
         VertexPlan { from }
     }
 
@@ -558,6 +570,7 @@ impl VertexPlan {
             texcoords: [[get(8), get(9)], [get(10), get(11)], [get(12), get(13)]],
             quaternion: [get(14), get(15), get(16), get(17)],
             view: [get(18), get(19), get(20)],
+            texcoord0_w: get(21),
         }
     }
 }
@@ -669,7 +682,8 @@ fn output_semantics(registers: &[u32]) -> [u32; 24] {
         .chain(t1)
         .chain(t2)
         .chain(map.quaternion)
-        .chain(map.view);
+        .chain(map.view)
+        .chain([map.texcoord0_w]);
     let mut semantics = [hardware::MISSING; 24];
     for (semantic, found) in semantics.iter_mut().zip(slots) {
         *semantic = slot(found);
@@ -873,6 +887,7 @@ struct Screen {
     inv_w: f32,
     color_over_w: Vec4,
     texcoords_over_w: [[f32; 2]; 3],
+    texcoord0_w_over_w: f32,
     quaternion_over_w: Vec4,
     view_over_w: [f32; 3],
 }
@@ -898,6 +913,7 @@ fn to_screen(vertex: &Vertex, viewport: (f32, f32, f32, f32)) -> Option<Screen> 
         inv_w,
         color_over_w: vertex.color.map(|c| c * inv_w),
         texcoords_over_w: vertex.texcoords.map(|[u, v]| [u * inv_w, v * inv_w]),
+        texcoord0_w_over_w: vertex.texcoord0_w * inv_w,
         quaternion_over_w: vertex.quaternion.map(|c| c * inv_w),
         view_over_w: vertex.view.map(|c| c * inv_w),
     })
@@ -987,6 +1003,9 @@ struct BoundTexture {
     levels: u32,
     /// how its smaller sizes are sampled, from the unit's registers.
     lod: TextureLod,
+    /// a projected texture, unit 0's PARAM type 3, whose coordinates are
+    /// divided by texture coordinate set 0's w.
+    projected: bool,
 }
 
 /// how a texture's smaller sizes are sampled, from a unit's
@@ -2215,6 +2234,7 @@ fn empty_texture() -> BoundTexture {
         replacement: None,
         levels: 1,
         lod: TextureLod::default(),
+        projected: false,
     }
 }
 
@@ -2286,6 +2306,8 @@ fn bind_texture<M: GpuMemory>(
     Some(BoundTexture {
         levels: levels.max(1),
         lod,
+        // the type in bits 28-30, which unit 0 alone has
+        projected: unit == 0 && (registers[base + 2] >> 28) & 7 == 3,
         texels,
         drawn,
         linear: config & 0x2 != 0,
@@ -3059,6 +3081,14 @@ fn fill_triangle(
                     };
                     let u = interpolate([a.texcoords_over_w[set][0], b.texcoords_over_w[set][0], c.texcoords_over_w[set][0]]);
                     let v = interpolate([a.texcoords_over_w[set][1], b.texcoords_over_w[set][1], c.texcoords_over_w[set][1]]);
+                    // a projected texture's coordinates divided by their w
+                    let (u, v) = match texture.projected {
+                        true => {
+                            let w = interpolate([a.texcoord0_w_over_w, b.texcoord0_w_over_w, c.texcoord0_w_over_w]);
+                            (u / w, v / w)
+                        }
+                        false => (u, v),
+                    };
                     samples[unit] = texture.sample(u, v);
                 }
                 if let Some(proctex) = &state.proctex {
@@ -3970,12 +4000,13 @@ mod tests {
             texcoords: map.texcoords.map(|set| [set[0].map_or(0.0, get), set[1].map_or(0.0, get)]),
             quaternion: map.quaternion.map(|slot| slot.map_or(0.0, get)),
             view: map.view.map(|slot| slot.map_or(0.0, get)),
+            texcoord0_w: map.texcoord0_w.map_or(1.0, get),
         }
     }
 
     fn vertex_bits(vertex: &Vertex) -> Vec<u32> {
         let texcoords = vertex.texcoords.as_flattened();
-        [&vertex.clip[..], &vertex.color, texcoords, &vertex.quaternion, &vertex.view].concat().iter().map(|v| v.to_bits()).collect()
+        [&vertex.clip[..], &vertex.color, texcoords, &vertex.quaternion, &vertex.view, &[vertex.texcoord0_w]].concat().iter().map(|v| v.to_bits()).collect()
     }
 
     /// placing a vertex's fields gives the bits reading each component
@@ -4208,7 +4239,7 @@ mod tests {
     fn cover(z: f32, color: Vec4) -> Vec<Vertex> {
         [[-1.0, -1.0], [3.0, -1.0], [-1.0, 3.0]]
             .into_iter()
-            .map(|[x, y]| Vertex { clip: [x, y, z, 1.0], color, texcoords: [[0.0; 2]; 3], quaternion: [0.0, 0.0, 0.0, 1.0], view: [0.0; 3] })
+            .map(|[x, y]| Vertex { clip: [x, y, z, 1.0], color, texcoords: [[0.0; 2]; 3], quaternion: [0.0, 0.0, 0.0, 1.0], view: [0.0; 3] , texcoord0_w: 1.0})
             .collect()
     }
 
@@ -4263,7 +4294,7 @@ mod tests {
     fn a_triangle_crossing_the_camera_is_clipped_not_dropped() {
         let registers = target_registers();
         let mut memory = ConsoleMemory::default();
-        let vertex = |clip: Vec4| Vertex { clip, color: RED, texcoords: [[0.0; 2]; 3], quaternion: [0.0, 0.0, 0.0, 1.0], view: [0.0; 3] };
+        let vertex = |clip: Vec4| Vertex { clip, color: RED, texcoords: [[0.0; 2]; 3], quaternion: [0.0, 0.0, 0.0, 1.0], view: [0.0; 3] , texcoord0_w: 1.0};
         let triangle = [
             vertex([-1.0, -1.0, -0.5, 1.0]),
             vertex([1.0, -1.0, -0.5, 1.0]),
@@ -4293,7 +4324,7 @@ mod tests {
     fn a_quad_covers_every_pixel_once() {
         let registers = target_registers();
         let mut memory = ConsoleMemory::default();
-        let vertex = |x: f32, y: f32| Vertex { clip: [x, y, -0.5, 1.0], color: RED, texcoords: [[0.0; 2]; 3], quaternion: [0.0, 0.0, 0.0, 1.0], view: [0.0; 3] };
+        let vertex = |x: f32, y: f32| Vertex { clip: [x, y, -0.5, 1.0], color: RED, texcoords: [[0.0; 2]; 3], quaternion: [0.0, 0.0, 0.0, 1.0], view: [0.0; 3] , texcoord0_w: 1.0};
         let quad = [
             vertex(-1.0, -1.0),
             vertex(1.0, -1.0),
@@ -4318,7 +4349,7 @@ mod tests {
         registers[REG_DEPTH_BUFFER_ADDRESS] = BIG_DEPTH >> 3;
         registers[REG_FRAMEBUFFER_DIMENSIONS] = 256 | (255 << 12);
         let mut memory = ConsoleMemory::default();
-        let vertex = |x: f32, y: f32| Vertex { clip: [x, y, -0.5, 1.0], color: RED, texcoords: [[0.0; 2]; 3], quaternion: [0.0, 0.0, 0.0, 1.0], view: [0.0; 3] };
+        let vertex = |x: f32, y: f32| Vertex { clip: [x, y, -0.5, 1.0], color: RED, texcoords: [[0.0; 2]; 3], quaternion: [0.0, 0.0, 0.0, 1.0], view: [0.0; 3] , texcoord0_w: 1.0};
         let quad = [
             vertex(-1.0, -1.0),
             vertex(1.0, -1.0),
@@ -4338,7 +4369,7 @@ mod tests {
     /// culling keeps the winding the register asks for and drops the other.
     #[test]
     fn face_culling_keeps_one_winding() {
-        let vertex = |x: f32, y: f32| Vertex { clip: [x, y, -0.5, 1.0], color: RED, texcoords: [[0.0; 2]; 3], quaternion: [0.0, 0.0, 0.0, 1.0], view: [0.0; 3] };
+        let vertex = |x: f32, y: f32| Vertex { clip: [x, y, -0.5, 1.0], color: RED, texcoords: [[0.0; 2]; 3], quaternion: [0.0, 0.0, 0.0, 1.0], view: [0.0; 3] , texcoord0_w: 1.0};
         // counter-clockwise with y up.
         let triangle = [vertex(-1.0, -1.0), vertex(3.0, -1.0), vertex(-1.0, 3.0)];
         for (mode, expected) in [(0, 64), (1, 0), (2, 64)] {
@@ -4384,6 +4415,7 @@ mod tests {
             replacement: None,
             levels: 1,
             lod: TextureLod::default(),
+            projected: false,
         };
         let white = [1.0; 4];
         assert_eq!(texture(Wrap::ClampToBorder).texel(-1, 3), RED);
@@ -4511,7 +4543,7 @@ mod tests {
             color: RED,
             texcoords: [[0.0; 2]; 3],
             quaternion: [0.0, 0.0, 0.0, 1.0],
-            view: [0.0; 3],
+            view: [0.0; 3], texcoord0_w: 1.0,
         };
         for (left, right) in [(1.5, 3.5), (1.4999967, 3.499992)] {
             let quad = [(left, 1.5), (right, 1.5), (right, 3.5), (left, 1.5), (right, 3.5), (left, 3.5)];
@@ -4566,7 +4598,7 @@ mod tests {
                     color: RED,
                     texcoords: [[0.0; 2]; 3],
                     quaternion: [0.0, 0.0, 0.0, 1.0],
-                    view: [0.0; 3],
+                    view: [0.0; 3], texcoord0_w: 1.0,
                 })
                 .collect();
             let cleared = vec![0u8; (SIZE * SIZE * 4) as usize];
@@ -4610,7 +4642,7 @@ mod tests {
                 color,
                 texcoords: [[0.0; 2]; 3],
                 quaternion: [0.0, 0.0, 0.0, 1.0],
-                view: [0.0; 3],
+                view: [0.0; 3], texcoord0_w: 1.0,
             };
             vec![corner(-1.0, bottom), corner(1.0, bottom), corner(1.0, top), corner(-1.0, bottom), corner(1.0, top), corner(-1.0, top)]
         };
@@ -4725,7 +4757,7 @@ mod tests {
                             color: [1.0; 4],
                             texcoords: [[0.0; 2]; 3],
                             quaternion: [0.0, 0.0, 0.0, 1.0],
-                            view: [0.0; 3],
+                            view: [0.0; 3], texcoord0_w: 1.0,
                         })
                         .collect();
                     rasterize_shaded(&registers, &mut software, &mut Resources::default(), &vertices);
@@ -5161,7 +5193,7 @@ mod tests {
                 color: [1.0; 4],
                 texcoords: [[u, v], [0.0; 2], [0.0; 2]],
                 quaternion: [0.0, 0.0, 0.0, 1.0],
-                view: [0.0; 3],
+                view: [0.0; 3], texcoord0_w: 1.0,
             })
             .collect()
     }
@@ -5333,7 +5365,7 @@ mod tests {
             color,
             texcoords: [[0.0; 2]; 3],
             quaternion: [0.0, 0.0, 0.0, 1.0],
-            view: [0.0; 3],
+            view: [0.0; 3], texcoord0_w: 1.0,
         };
         let [a, b, c, d] = [corner(left, bottom, RED), corner(right, bottom, GREEN), corner(right, top, BLUE), corner(left, top, [1.0, 1.0, 0.0, 1.0])];
         vec![a, b, c, a, c, d]
@@ -5703,7 +5735,7 @@ mod tests {
                         color,
                         texcoords: [[0.0; 2]; 3],
                         quaternion: [0.0, 0.0, 0.0, 1.0],
-                        view: [0.0; 3],
+                        view: [0.0; 3], texcoord0_w: 1.0,
                     })
                     .collect()
             })
@@ -5715,7 +5747,7 @@ mod tests {
                 color: [1.0; 4],
                 texcoords: [[u, v], [0.0; 2], [0.0; 2]],
                 quaternion: [0.0, 0.0, 0.0, 1.0],
-                view: [0.0; 3],
+                view: [0.0; 3], texcoord0_w: 1.0,
             })
             .collect();
         // what memory holds past the buffer, where the texture reaches
@@ -5935,7 +5967,7 @@ mod tests {
                         color,
                         texcoords: [[0.0; 2]; 3],
                         quaternion: [0.0, 0.0, 0.0, 1.0],
-                        view: [0.0; 3],
+                        view: [0.0; 3], texcoord0_w: 1.0,
                     })
                     .collect()
             })
@@ -5949,7 +5981,7 @@ mod tests {
                 color: [1.0; 4],
                 texcoords: [[u, v], [0.0; 2], [0.0; 2]],
                 quaternion: [0.0, 0.0, 0.0, 1.0],
-                view: [0.0; 3],
+                view: [0.0; 3], texcoord0_w: 1.0,
             })
             .collect();
 
@@ -6879,7 +6911,7 @@ mod tests {
                                     color: [float().abs(), float().abs(), float().abs(), float().abs()],
                                     texcoords: [[float() * 2.0, float() * 2.0], [float() * 2.0, float() * 2.0], [float() * 2.0, float() * 2.0]],
                                     quaternion: [float(), float(), float(), float()],
-                                    view: [float(), float(), float()],
+                                    view: [float(), float(), float()], texcoord0_w: 1.0,
                                 }
                             })
                             .collect()
@@ -7118,7 +7150,7 @@ mod tests {
                         color,
                         texcoords: [[0.0; 2]; 3],
                         quaternion: [0.0, 0.0, 0.0, 1.0],
-                        view: [0.0; 3],
+                        view: [0.0; 3], texcoord0_w: 1.0,
                     })
                     .collect()
             })
@@ -7131,7 +7163,7 @@ mod tests {
                 color: [1.0; 4],
                 texcoords: [[u, v], [0.0; 2], [0.0; 2]],
                 quaternion: [0.0, 0.0, 0.0, 1.0],
-                view: [0.0; 3],
+                view: [0.0; 3], texcoord0_w: 1.0,
             })
             .collect();
 
@@ -7190,7 +7222,7 @@ mod tests {
                         color,
                         texcoords: [[0.0; 2]; 3],
                         quaternion: [0.0, 0.0, 0.0, 1.0],
-                        view: [0.0; 3],
+                        view: [0.0; 3], texcoord0_w: 1.0,
                     })
                     .collect();
                 rasterize_shaded(&registers, &mut drawn, &mut resources, &triangle);
@@ -7345,7 +7377,7 @@ mod tests {
                     color,
                     texcoords: [[0.0; 2]; 3],
                     quaternion: [0.0, 0.0, 0.0, 1.0],
-                    view: [0.0; 3],
+                    view: [0.0; 3], texcoord0_w: 1.0,
                 })
                 .collect();
             rasterize_shaded(&registers, &mut drawn, &mut resources, &triangle);
@@ -7459,7 +7491,7 @@ mod tests {
                 color: [0.2, 0.6, 0.9, 1.0],
                 texcoords: [[0.0; 2]; 3],
                 quaternion: [0.0, 0.0, 0.0, 1.0],
-                view: [0.0; 3],
+                view: [0.0; 3], texcoord0_w: 1.0,
             })
             .collect();
         rasterize_shaded(&registers, &mut gpu, &mut resources, &triangle);
@@ -7540,7 +7572,7 @@ mod tests {
                             color,
                             texcoords: [[0.0; 2]; 3],
                             quaternion: [0.0, 0.0, 0.0, 1.0],
-                            view: [0.0; 3],
+                            view: [0.0; 3], texcoord0_w: 1.0,
                         })
                         .collect();
                     rasterize_shaded(&registers, &mut memory, &mut resources, &triangle);
@@ -7603,7 +7635,7 @@ mod tests {
         let band = |left: f32, color: Vec4| -> Vec<Vertex> {
             [[left, -1.0], [left + 1.0, -1.0], [left, 1.0], [left + 1.0, -1.0], [left + 1.0, 1.0], [left, 1.0]]
                 .into_iter()
-                .map(|[x, y]| Vertex { clip: [x, y, 0.0, 1.0], color, texcoords: [[0.0; 2]; 3], quaternion: [0.0, 0.0, 0.0, 1.0], view: [0.0; 3] })
+                .map(|[x, y]| Vertex { clip: [x, y, 0.0, 1.0], color, texcoords: [[0.0; 2]; 3], quaternion: [0.0, 0.0, 0.0, 1.0], view: [0.0; 3] , texcoord0_w: 1.0})
                 .collect()
         };
         let mut registers = target_registers();
@@ -7789,8 +7821,78 @@ mod tests {
     /// a quad covering x from `x.0` to `x.1` and y from `y.0` to `y.1` in
     /// normalized device coordinates, as a list of two triangles.
     fn quad(x: (f32, f32), y: (f32, f32), color: Vec4) -> Vec<Vertex> {
-        let vertex = |x: f32, y: f32| Vertex { clip: [x, y, -0.5, 1.0], color, texcoords: [[0.0; 2]; 3], quaternion: [0.0, 0.0, 0.0, 1.0], view: [0.0; 3] };
+        let vertex = |x: f32, y: f32| Vertex { clip: [x, y, -0.5, 1.0], color, texcoords: [[0.0; 2]; 3], quaternion: [0.0, 0.0, 0.0, 1.0], view: [0.0; 3] , texcoord0_w: 1.0};
         [(x.0, y.0), (x.1, y.0), (x.1, y.1), (x.0, y.0), (x.1, y.1), (x.0, y.1)].into_iter().map(|(x, y)| vertex(x, y)).collect()
+    }
+
+    /// semantic 16 is texture coordinate set 0's w, 1 when the shader
+    /// writes none.
+    #[test]
+    fn texture_coordinate_zeros_w_comes_from_semantic_16() {
+        let mut registers = vec![0u32; 0x300];
+        registers[REG_SHADER_OUTPUT_TOTAL] = 2;
+        registers[REG_SHADER_OUTPUT_MAP] = 0x0302_0100;
+        registers[REG_SHADER_OUTPUT_MAP + 1] = 0x1F10_0D0C;
+        let map = read_output_map(&registers);
+        assert_eq!(map.texcoord0_w, Some((1, 2)));
+        let outputs: [Vec4; shader::OUTPUT_REGISTERS] = std::array::from_fn(|r| std::array::from_fn(|c| (r * 4 + c) as f32));
+        assert_eq!(VertexPlan::new(&map, 0).vertex(&outputs).texcoord0_w, 6.0);
+        registers[REG_SHADER_OUTPUT_MAP + 1] = 0x1F1F_0D0C;
+        let map = read_output_map(&registers);
+        assert_eq!(VertexPlan::new(&map, 0).vertex(&outputs).texcoord0_w, 1.0, "none written");
+    }
+
+    /// a projected texture, unit 0's type 3, divides its coordinates by
+    /// coordinate set 0's w, in software and on the GPU: coordinates and w
+    /// both doubled draw what the plain texture does with them as they are.
+    #[test]
+    fn a_projected_texture_divides_its_coordinates_by_their_w() {
+        const TEXTURE: u32 = 0x8_0000;
+        let mut registers = target_registers();
+        registers[REG_TEXTURE_CONFIG] = 1;
+        registers[REG_TEXTURE0_DIMENSIONS] = 8 | (8 << 16);
+        registers[REG_TEXTURE0_ADDRESS] = TEXTURE >> 3;
+        registers[0x0C0] = 0x3 | (0x3 << 16);
+        for stage in [0x0C8, 0x0D0, 0x0D8, 0x0F0, 0x0F8] {
+            registers[stage] = 0xF | (0xF << 16);
+        }
+        let mut seed = 3u32;
+        let texture: Vec<u8> = (0..8 * 8 * 4)
+            .map(|_| {
+                seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                (seed >> 24) as u8
+            })
+            .collect();
+        let triangle = |scale: f32| -> Vec<Vertex> {
+            [[-1.0, -1.0], [3.0, -1.0], [-1.0, 3.0]]
+                .into_iter()
+                .map(|[x, y]| Vertex {
+                    clip: [x, y, -0.5, 1.0],
+                    color: RED,
+                    texcoords: [[(x + 1.0) / 2.0 * scale, (y + 1.0) / 2.0 * scale], [0.0; 2], [0.0; 2]],
+                    quaternion: [0.0, 0.0, 0.0, 1.0],
+                    view: [0.0; 3],
+                    texcoord0_w: scale,
+                })
+                .collect()
+        };
+        let mut drawn = |param: u32, scale: f32, resources: &mut Resources| {
+            registers[REG_TEXTURE0_PARAMETERS] = param;
+            let mut memory = ConsoleMemory::default();
+            memory.write(TEXTURE, &texture);
+            rasterize_shaded(&registers, &mut memory, resources, &triangle(scale));
+            if let Some(hardware) = resources.hardware.as_mut() {
+                hardware.flush(&mut memory).unwrap();
+            }
+            pixels(&mut memory)
+        };
+        let plain = drawn(0, 1.0, &mut Resources::default());
+        assert_eq!(drawn(3 << 28, 2.0, &mut Resources::default()), plain, "in software");
+        assert_ne!(drawn(0, 2.0, &mut Resources::default()), plain, "doubled, the plain texture repeats");
+        let Ok(hardware) = hardware::Hardware::new() else { return };
+        let mut resources = Resources { hardware: Some(hardware), ..Default::default() };
+        let plain = drawn(0, 1.0, &mut resources);
+        assert_eq!(drawn(3 << 28, 2.0, &mut resources), plain, "on the GPU");
     }
 
     /// a texture's smaller sizes follow it in memory, each half the one
@@ -7862,7 +7964,7 @@ mod tests {
                 color: RED,
                 texcoords: [[(x + 1.0) / 2.0, (y + 1.0) / 2.0]; 3],
                 quaternion: [0.0, 0.0, 0.0, 1.0],
-                view: [0.0; 3],
+                view: [0.0; 3], texcoord0_w: 1.0,
             })
             .collect();
         let white = |pixel: [u8; 4]| pixel[..3] == [0xFF; 3];
@@ -8013,7 +8115,7 @@ mod tests {
     /// a vertex at x, y of a viewport w by h, with texture coordinates u, v.
     fn at(x: f32, y: f32, (w, h): (f32, f32), [u, v]: [f32; 2]) -> Vertex {
         let clip = [x / w * 2.0 - 1.0, y / h * 2.0 - 1.0, -0.5, 1.0];
-        Vertex { clip, color: RED, texcoords: [[u, v], [0.0; 2], [0.0; 2]], quaternion: [0.0, 0.0, 0.0, 1.0], view: [0.0; 3] }
+        Vertex { clip, color: RED, texcoords: [[u, v], [0.0; 2], [0.0; 2]], quaternion: [0.0, 0.0, 0.0, 1.0], view: [0.0; 3] , texcoord0_w: 1.0}
     }
 
     /// a quad from x0, y0 to x1, y1 of a viewport, as two triangles.
