@@ -528,6 +528,43 @@ fn convert_strips<const BYTES: usize>(
     }
 }
 
+/// smooths where a compressed video's 8 by 8 blocks meet, across and down
+/// a plane of samples width to a row: a seam whose sides are both flat and
+/// whose step is small is a block's edge, not the picture's, and becomes a
+/// ramp over the three samples on each side; any other is left alone.
+// ponytail: one fixed strength, where a decoder's loop filter would follow
+// the stream's quantiser, which Y2R does not see
+fn deblock(plane: &mut [u8], width: usize, lines: usize) {
+    const BLOCK: usize = 8;
+    /// the most a block's edge steps by, and the most its sides vary
+    const STEP: i32 = 24;
+    const FLAT: i32 = 8;
+    fn seam(plane: &mut [u8], at: [usize; 6]) {
+        let v = at.map(|i| plane[i] as i32);
+        let flat = (v[0] - v[1]).abs() < FLAT && (v[1] - v[2]).abs() < FLAT && (v[3] - v[4]).abs() < FLAT && (v[4] - v[5]).abs() < FLAT;
+        if !flat || (v[2] - v[3]).abs() >= STEP {
+            return;
+        }
+        for (k, &i) in at.iter().enumerate().take(5).skip(1) {
+            let k = k as i32;
+            plane[i] = ((v[0] * (5 - k) + v[5] * k + 2) / 5) as u8;
+        }
+    }
+    if plane.len() < width * lines {
+        return;
+    }
+    for row in (0..lines).map(|y| y * width) {
+        for x in (BLOCK..width.saturating_sub(2)).step_by(BLOCK) {
+            seam(plane, [row + x - 3, row + x - 2, row + x - 1, row + x, row + x + 1, row + x + 2]);
+        }
+    }
+    for y in (BLOCK..lines.saturating_sub(2)).step_by(BLOCK) {
+        for x in 0..width {
+            seam(plane, [-3isize, -2, -1, 0, 1, 2].map(|d| (y as isize + d) as usize * width + x));
+        }
+    }
+}
+
 /// runs the conversion the title set up.
 fn convert(system: &mut System) {
     let state = &system.services.y2r;
@@ -566,6 +603,14 @@ fn convert(system: &mut System) {
             Layout::Yuyv
         }
     };
+    // a video's frame, its compression's blocks smoothed out where they meet,
+    // its colour planes at half the width, and half the lines in 4:2:0
+    if let Layout::Planar { lines_per_chroma } = layout {
+        let Scratch { planes: [luma, chroma_u, chroma_v], .. } = &mut scratch;
+        deblock(luma, width, lines);
+        deblock(chroma_u, width / 2, lines / lines_per_chroma);
+        deblock(chroma_v, width / 2, lines / lines_per_chroma);
+    }
     let bytes = match output_format {
         // 32 bit with alpha first in memory and then blue, green and red, 24
         // bit without the alpha, the way the GPU has them
@@ -653,7 +698,7 @@ mod tests {
             let pixels = width * lines;
             // 16 bit samples keep their low byte
             let sample = if format == 2 || format == 3 { 2 } else { 1 };
-            let (luma, chroma_u, chroma_v, interleaved) = match format {
+            let (mut luma, mut chroma_u, mut chroma_v, interleaved) = match format {
                 // 4:2:2 and 4:2:0, eight or sixteen bits a sample
                 0 | 2 => (
                     gather(system, y_buffer, pixels, sample),
@@ -669,6 +714,18 @@ mod tests {
                 ),
                 _ => (Vec::new(), Vec::new(), Vec::new(), gather(system, yuyv_buffer, pixels * 2, 1)),
             };
+            // the video's blocks smoothed out as the conversion does, which
+            // this one is to match
+            let chroma_lines = match format {
+                0 | 2 => Some(lines),
+                1 | 3 => Some(lines / 2),
+                _ => None,
+            };
+            if let Some(chroma_lines) = chroma_lines {
+                crate::services::y2r::deblock(&mut luma, width, lines);
+                crate::services::y2r::deblock(&mut chroma_u, width / 2, chroma_lines);
+                crate::services::y2r::deblock(&mut chroma_v, width / 2, chroma_lines);
+            }
             let yuv = |x: usize, y: usize| -> (i32, i32, i32) {
                 match format {
                     0 | 2 => {
@@ -728,6 +785,37 @@ mod tests {
         let terms = Terms::new(c);
         let luma = terms.luma(y);
         terms.chroma(u, v).map(|term| channel(luma + term) as u8)
+    }
+
+    /// a compressed video's blocks: a step where two flat 8 by 8 blocks
+    /// meet is smoothed into a ramp, across the plane and down it; a real
+    /// edge, a step that is not at a block's side and a textured side stay
+    /// as they are.
+    #[test]
+    fn video_blocks_are_smoothed_where_they_meet() {
+        let plane = |left: u8, right: u8| -> Vec<u8> { (0..16).map(|x| if x < 8 { left } else { right }).collect::<Vec<u8>>().repeat(8) };
+        let mut flat = plane(100, 112);
+        deblock(&mut flat, 16, 8);
+        let line = flat[..16].to_vec();
+        assert!(line.windows(2).all(|w| w[0] <= w[1]), "a ramp, {line:?}");
+        assert!(line[8] - line[7] < 6, "no step left at the seam, {line:?}");
+        assert!(flat.chunks(16).all(|row| row == line), "every row alike");
+        let mut edge = plane(20, 200);
+        deblock(&mut edge, 16, 8);
+        assert_eq!(edge, plane(20, 200), "a real edge stays");
+        let mut off: Vec<u8> = (0..16).map(|x| if x < 5 { 100 } else { 112 }).collect::<Vec<u8>>().repeat(8);
+        let before = off.clone();
+        deblock(&mut off, 16, 8);
+        assert_eq!(off, before, "a step off the block's side stays");
+        let mut textured: Vec<u8> = (0..16).map(|x| if x % 2 == 0 { 90 } else { 120 }).collect::<Vec<u8>>().repeat(8);
+        let before = textured.clone();
+        deblock(&mut textured, 16, 8);
+        assert_eq!(textured, before, "texture stays");
+        // where a row of blocks meets the one below
+        let mut tall: Vec<u8> = (0..16).flat_map(|y| [if y < 8 { 100u8 } else { 112 }; 8]).collect();
+        deblock(&mut tall, 8, 16);
+        let column: Vec<u8> = (0..16).map(|y| tall[y * 8]).collect();
+        assert!(column.windows(2).all(|w| w[0] <= w[1]) && column[8] - column[7] < 6, "no step down the seam, {column:?}");
     }
 
     /// black, white and grey come out the way BT.601 says, full range.
