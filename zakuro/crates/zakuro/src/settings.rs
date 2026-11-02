@@ -510,9 +510,6 @@ pub struct Settings {
     pub resolution: u32,
     /// draw the texture packs put in games' mods folders.
     pub texture_packs: bool,
-    /// have games' small textures, HUDs', menus' and portraits', made into
-    /// HD pictures by an AI upscaler, kept on this computer.
-    pub hd_textures: bool,
     /// draw a picture in between each two of a game at 30 frames a second.
     pub frame_interpolation: bool,
     /// run a game's recompiled code when it has some, rather than
@@ -590,7 +587,6 @@ impl Default for Settings {
             hardware_rasterizer: true,
             resolution: 3,
             texture_packs: true,
-            hd_textures: false,
             frame_interpolation: false,
             recompiled: true,
             scale: 2,
@@ -736,6 +732,16 @@ mod tests {
         assert!(settings.show_fps);
         assert_eq!(settings.layout, Screens::default());
         assert_eq!(settings.filter, Filter::default());
+    }
+
+    /// a setting an older build wrote and this one no longer has, the AI
+    /// textures' hd_textures among them, is passed over, the rest kept.
+    #[test]
+    fn a_setting_since_removed_keeps_the_others() {
+        let settings: Settings = toml::from_str("hd_textures = true
+show_fps = true
+").unwrap();
+        assert!(settings.show_fps);
     }
 
     #[test]

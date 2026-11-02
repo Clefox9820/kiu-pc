@@ -700,8 +700,6 @@ impl Menus {
                 .on_hover_text("How many times the console's resolution the 3D is drawn at. Past what the window shows, the extra pixels smooth the edges, at a cost to the GPU that grows fast.");
                 ui.add_enabled(settings.hardware_rasterizer, egui::Checkbox::new(&mut settings.texture_packs, "Texture packs"))
                     .on_hover_text("Draw a game's texture pack, made for Citra or Azahar, put in the textures folder of the game's mods folder.");
-                ui.add_enabled(settings.hardware_rasterizer, egui::Checkbox::new(&mut settings.hd_textures, "HD HUD, menus and portraits (AI)"))
-                    .on_hover_text("Have a game's small pictures, its HUD's, menus' and portraits', remade 4 times bigger by an AI upscaler (Real-ESRGAN) the first time each shows, and kept on this computer, so they show in HD from then on. Each takes a few seconds on the GPU, while the picture shows as before. Needs realesrgan-ncnn-vulkan beside the program or in ZAKURO_UPSCALER. Takes effect when a game starts.");
                 let interpolates = settings.hardware_rasterizer && settings.renderer == Renderer::Vulkan;
                 ui.add_enabled(interpolates, egui::Checkbox::new(&mut settings.frame_interpolation, "Frame interpolation"))
                     .on_hover_text("A game at 30 frames a second gets a picture drawn in between each two of its own, with everything halfway between where it was in both, so it moves at 60. The screens show a 60th of a second late. It takes the 3D drawn on the GPU and the Vulkan presenter.");

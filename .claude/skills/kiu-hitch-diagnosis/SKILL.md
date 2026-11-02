@@ -17,7 +17,7 @@ Load when the user reports freezes, stutter or lag, or asks to read `zakuro.log`
 - Read the user's real log (`%APPDATA%\zakuro\zakuro.log`), not an agent sandbox copy (see `kiu-host-hygiene`).
 - Exclude the first ~40 s after launch: the warm preload is still running and startup hitches are expected.
 - Check for a concurrent heavy process (gcc builds) before blaming the game; it evicts preloaded pages.
-- `replacement pictures fill the room they may take` means texture pack or HD pictures stopped being shown; on integrated GPUs that room used to be only 64 MiB.
+- `replacement pictures fill the room they may take` means texture pack pictures stopped being shown; on integrated GPUs that room used to be only 64 MiB.
 
 ## Decision Gates
 

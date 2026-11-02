@@ -58,10 +58,6 @@ pub struct Config {
     /// draw the pictures of the texture pack in the title's mods folder in
     /// place of its textures, which takes the host's GPU.
     pub texture_packs: bool,
-    /// Real-ESRGAN's realesrgan-ncnn-vulkan, which makes a title's small
-    /// textures, its HUD's, menus' and portraits', into HD pictures kept in
-    /// the data folder, which takes the host's GPU; none for not at all.
-    pub hd_upscaler: Option<std::path::PathBuf>,
     /// the title's update, an update's CIA, whose code and data it runs.
     pub update: Option<std::path::PathBuf>,
     /// the title's downloadable content, DLC CIAs.
@@ -111,7 +107,6 @@ impl Default for Config {
             data_dir: None,
             hardware_renderer: false,
             texture_packs: true,
-            hd_upscaler: None,
             update: None,
             dlc: Vec::new(),
             enhancements: std::collections::BTreeMap::new(),

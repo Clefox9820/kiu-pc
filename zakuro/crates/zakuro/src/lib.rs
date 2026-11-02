@@ -386,18 +386,6 @@ struct Running {
     pacing: Pacing,
 }
 
-/// where Real-ESRGAN's realesrgan-ncnn-vulkan is, for HD textures: the
-/// path in ZAKURO_UPSCALER, or else realesrgan\realesrgan-ncnn-vulkan(.exe)
-/// beside the program, when it is there.
-fn hd_upscaler() -> Option<std::path::PathBuf> {
-    if let Some(path) = std::env::var_os("ZAKURO_UPSCALER") {
-        return Some(path.into());
-    }
-    let name = if cfg!(windows) { "realesrgan-ncnn-vulkan.exe" } else { "realesrgan-ncnn-vulkan" };
-    let beside = std::env::current_exe().ok()?.parent()?.join("realesrgan").join(name);
-    beside.is_file().then_some(beside)
-}
-
 /// with ZAKURO_SHOT=<path prefix>, saves both screens as the GPU shows them
 /// to <prefix>-<frame>-top.png and -bottom.png, once a pacing window, for
 /// checking a change to the renderer by eye where the window can't be
@@ -824,7 +812,6 @@ impl App {
             find_recompiled: !interpret,
             hardware_renderer: self.options.hardware_rasterizer.unwrap_or(self.settings.hardware_rasterizer),
             texture_packs: self.settings.texture_packs,
-            hd_upscaler: self.settings.hd_textures.then(hd_upscaler).flatten(),
             interpolate: self.settings.frame_interpolation,
             enhancements: self
                 .settings

@@ -232,12 +232,6 @@ pub fn load(path: impl AsRef<std::path::Path>, mut config: Config) -> Result<Sys
             system.gpu.set_texture_pack(Some(std::sync::Arc::new(pack)));
         }
     }
-    if let (Some(tool), Some(data_dir), true) = (system.config.hd_upscaler.as_deref(), system.config.data_dir.as_deref(), on_gpu) {
-        let dir = data_dir.join("cache").join("hd").join(format!("{:016X}", title.program_id()));
-        if let Some(hd) = zakuro_gpu::hd::HdCache::new(tool, &dir) {
-            system.gpu.set_texture_hd(Some(std::sync::Arc::new(hd)));
-        }
-    }
 
     system.title = Some(title);
     Ok(system)

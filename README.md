@@ -301,17 +301,6 @@ Tools used to work on it:
   drawn at 1x in 2x and 3x windows on a Ryzen 5 5600G: smooth, sharp edges
   where Smooth shows stairs, at frame times within 0.5 ms of Smooth's.
   Long play was not checked.
-- **HD HUD, menus and portraits (AI)** (off by default, same settings) has
-  the AI upscaler [Real-ESRGAN](https://github.com/xinntao/Real-ESRGAN) (its fast anime model)
-  remake each small color picture and each dialogue portrait 4 times bigger
-  the first time it shows, a few seconds on the GPU while the picture shows
-  as before, and keeps it in `cache\hd` in the data folder, so it shows in
-  HD from then on. Letters and digits (pictures of grey and alpha alone)
-  keep their own, as the AI bends their shapes.
-  `scripts\setup.ps1` downloads Real-ESRGAN into `tools\realesrgan` and
-  `Play.bat` points the game at it with `ZAKURO_UPSCALER`; without it the
-  option does nothing. Everything is made on your computer from your own
-  ROM and nothing is shared. Subtitles are not sharper.
 - Sound: the console's 32.7 kHz output reaches your device's rate through
   a windowed-sinc filter, voices the game plays at another pitch follow a
   cubic curve, and loud peaks are softened instead of cut off. Settings >

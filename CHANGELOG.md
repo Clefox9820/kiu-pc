@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+- Removed the AI option "HD HUD, menus and portraits" (Real-ESRGAN):
+  `scripts\setup.ps1` no longer downloads it and `Play.bat` no longer sets
+  `ZAKURO_UPSCALER`. A `cache\hd` folder an earlier build left in the data
+  folder is no longer read and can be deleted. Settings files that still
+  name the option load as before.
+
 ## v0.1.0 — first release
 
 The first public release of kiu-pc: a PC build of *Kid Icarus: Uprising*
@@ -44,9 +52,6 @@ powershell -ExecutionPolicy Bypass -File scripts\setup.ps1 -Rom "D:\path\to\your
   USA release they were matched by code and not tried in play.
 - Local wireless play reaches the warm-up arena, but the battle does not
   start for the player who joined.
-- HD HUD, menus and portraits (Real-ESRGAN, made on the player's computer)
-  was checked in one chapter on the European release; subtitles stay as
-  blurry as before.
 - Widescreen (Top screen shape 16:9 or 21:9) was checked in one battle on
   foot and one in flight; cutscenes and menus with 3D were not checked. The
   HUD is still stretched with the screen.

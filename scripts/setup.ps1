@@ -54,10 +54,6 @@ $RecompRepo = "https://github.com/fearkov/3dsrecomp"
 $RecompCommit = "c3f21f94ba50d688025febc8974ff348d471b587"
 $WinLibsUrl = "https://github.com/brechtsanders/winlibs_mingw/releases/download/16.2.0posix-23.1.3-14.0.0-ucrt-r3/winlibs-x86_64-posix-seh-gcc-16.2.0-mingw-w64ucrt-14.0.0-r3.zip"
 $RustupUrl = "https://static.rust-lang.org/rustup/dist/x86_64-pc-windows-gnu/rustup-init.exe"
-# the AI upscaler that remakes the HUD, menus and portraits in HD on this
-# computer (Real-ESRGAN, BSD-3; its ncnn Vulkan program, MIT)
-$RealEsrganUrl = "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.5.0/realesrgan-ncnn-vulkan-20220424-windows.zip"
-$RealEsrganSha256 = "ABC02804E17982A3BE33675E4D471E91EA374E65B70167ABC09E31ACB412802D"
 
 $Root = Split-Path -Parent $PSScriptRoot
 $Tools = Join-Path $Root "tools"
@@ -121,26 +117,6 @@ if (-not (Test-Path (Join-Path $Tools "mingw64\bin\gcc.exe"))) {
     Remove-Item $zip
 }
 & gcc --version | Select-Object -First 1
-
-Step "AI upscaler for HD textures (Real-ESRGAN)"
-$Upscaler = Join-Path $Tools "realesrgan\realesrgan-ncnn-vulkan.exe"
-if (-not (Test-Path $Upscaler)) {
-    $zip = Join-Path $Tools "realesrgan.zip"
-    Write-Host "Downloading Real-ESRGAN (about 45 MB)..."
-    Invoke-WebRequest -UseBasicParsing -Uri $RealEsrganUrl -OutFile $zip
-    if ((Get-FileHash -Algorithm SHA256 $zip).Hash -ne $RealEsrganSha256) {
-        Remove-Item $zip
-        Fail "the Real-ESRGAN download is not the expected file"
-    }
-    $unpacked = Join-Path $Tools "realesrgan-unpacked"
-    Expand-Archive -LiteralPath $zip -DestinationPath $unpacked -Force
-    $folder = New-Item -ItemType Directory -Force -Path (Join-Path $Tools "realesrgan")
-    # the program, its runtime and its models; not the demo pictures and video
-    Get-ChildItem $unpacked -Include *.exe, *.dll -Recurse | Move-Item -Destination $folder -Force
-    Move-Item (Get-ChildItem $unpacked -Directory -Recurse -Filter models | Select-Object -First 1).FullName $folder -Force
-    Remove-Item -Recurse -Force $unpacked, $zip
-}
-Write-Host "  $Upscaler"
 
 Step "Rust (GNU toolchain)"
 if (-not (Test-Path (Join-Path $Tools "cargo\bin\cargo.exe"))) {
@@ -272,6 +248,6 @@ END
 }
 
 $Play = Join-Path $Root "Play.bat"
-Set-Content -Path $Play -Value "@echo off`r`nset ZAKURO_UPSCALER=$Upscaler`r`n`"$Exe`" `"$Rom`""
+Set-Content -Path $Play -Value "@echo off`r`n`"$Exe`" `"$Rom`""
 Step "Done"
 Write-Host "Play with $Play"
