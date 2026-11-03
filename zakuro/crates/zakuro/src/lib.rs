@@ -5,13 +5,18 @@
 mod audio;
 mod camera;
 mod cli;
+mod dev_env;
 mod discord;
+mod frame_log;
 mod gamepad;
 mod gui;
 mod input;
-mod kiu_options;
+mod kiu_controls;
+mod kiu_play;
+mod kiu_theme;
 mod library;
 mod menus;
+mod mouse_aim;
 mod present;
 mod recompile;
 mod report;
@@ -23,18 +28,19 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use winit::application::ApplicationHandler;
-use winit::event::{DeviceEvent, DeviceId, ElementState, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent};
+use winit::event::{DeviceEvent, DeviceId, ElementState, KeyEvent, MouseButton, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{KeyCode, PhysicalKey};
-use winit::window::{CursorGrabMode, Fullscreen, Window, WindowId};
+use winit::window::{Fullscreen, Window, WindowId};
 
+use zakuro_common::memory_map::{HOST_MAILBOX_GAME_MODE, HOST_MAILBOX_TOP_WIDENING};
 use zakuro_common::Screen;
-use zakuro_core::services::hid::PadState;
 use zakuro_core::{loader, Config, FrameOutcome, System};
-use zakuro_gpu::{layout, GpuScreen, Overlay, PresentError, RendererKind, ScreenImage, Viewport};
+use zakuro_gpu::{layout, GpuScreen, Overlay, PresentError, RendererKind, ScreenImage};
 
 use gui::Gui;
-use input::{AimMode, Keyboard};
+use input::Keyboard;
+use mouse_aim::AimMode;
 use library::Library;
 use menus::{Action, Menus};
 use present::Backend;
@@ -137,7 +143,6 @@ pub fn run_with(linked: Option<Linked>, overlay: Option<Box<dyn GameOverlay>>) {
         tilting_from: None,
         cursor: (0.0, 0.0),
         last_title_update: Instant::now(),
-        last_emulated: None,
         next_frame: Instant::now(),
         skipped: 0,
         shown: 0,
@@ -337,25 +342,6 @@ fn run_headless(system: &mut System, frames: u64) {
     }
 }
 
-/// frames without a game override saying the game is in play before it is
-/// taken to be in a menu. the overrides say it once a tick, every second
-/// frame for Kid Icarus.
-const IN_PLAY_QUIET: u32 = 10;
-
-/// frames after the last frame a video's decoder converted before the top
-/// screen goes back to its own shape, a video's frames coming at 30 a
-/// second or fewer.
-const VIDEO_HOLD: u64 = 30;
-
-/// how wide the top screen shows: in its chosen shape, but the console's
-/// while a video plays, a picture made for 400 across that cannot be
-/// widened as the 3D is, and in menus on a 21:9 screen, whose 3D would
-/// show what lies off the console's view there.
-fn top_width_shown(shape: settings::TopShape, video: bool, in_play: bool) -> f32 {
-    let console = video || (!in_play && shape == settings::TopShape::Wide21x9);
-    if console { settings::TopShape::Console.width() } else { shape.width() }
-}
-
 /// a game being played.
 struct Running {
     system: System,
@@ -372,64 +358,12 @@ struct Running {
     frames: u32,
     counting_since: Instant,
     fps: f32,
-    /// frames since a game override last said the title is in play.
-    out_of_play: u32,
-    /// how many video frames the decoder had converted at the last frame,
-    /// and the frame a new one came at, see VIDEO_HOLD.
-    conversions: u64,
-    video_at: Option<u64>,
-    /// the game override last said the player is flying, not on foot.
-    flying: bool,
+    /// what the game overrides say the game is doing.
+    play: kiu_play::PlayState,
     /// when the game started, in seconds since 1970, for Discord.
     started: u64,
-    /// how evenly the frames came, for the log.
-    pacing: Pacing,
-}
-
-/// with ZAKURO_SHOT=<path prefix>, saves both screens as the GPU shows them
-/// to <prefix>-<frame>-top.png and -bottom.png, once a pacing window, for
-/// checking a change to the renderer by eye where the window can't be
-/// captured. frame interpolation's pictures in between go to
-/// -top-between.png and -bottom-between.png, when it made them, to compare
-/// them between builds pixel by pixel.
-fn save_screens(system: &mut System, frame: u64) {
-    static PREFIX: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
-    let Some(prefix) = PREFIX.get_or_init(|| std::env::var("ZAKURO_SHOT").ok()) else { return };
-    for (screen, name) in [(zakuro_common::Screen::Top, "top"), (zakuro_common::Screen::Bottom, "bottom")] {
-        for (between, suffix) in [(false, ""), (true, "-between")] {
-            let Some((pixels, width, height)) = system.upright_screen(screen, between) else { continue };
-            let path = format!("{prefix}-{frame}-{name}{suffix}.png");
-            if let Err(error) = image::save_buffer(&path, &pixels, width, height, image::ExtendedColorType::Rgba8) {
-                log::warn!("could not save {path}, {error}");
-            }
-        }
-    }
-}
-
-/// how many frames of a window came late, the small stutters a hitch line
-/// is too coarse for: one over 20 ms shows a frame twice, one over 33 ms
-/// shows it three times or more.
-#[derive(Debug, Default, PartialEq)]
-struct Pacing {
-    frames: u32,
-    late: u32,
-    very_late: u32,
-    worst: Duration,
-}
-
-impl Pacing {
-    /// frames counted before the log hears of them, 10 s at 60 a second.
-    const WINDOW: u32 = 600;
-
-    /// counts a frame that came the time given after the one before; the
-    /// window's counts, once it is full.
-    fn note(&mut self, since: Duration) -> Option<Pacing> {
-        self.frames += 1;
-        self.late += (since > Duration::from_millis(20)) as u32;
-        self.very_late += (since > Duration::from_millis(33)) as u32;
-        self.worst = self.worst.max(since);
-        (self.frames >= Self::WINDOW).then(|| std::mem::take(self))
-    }
+    /// what each frame cost, for the log.
+    probe: frame_log::FrameProbe,
 }
 
 impl Running {
@@ -444,12 +378,9 @@ impl Running {
             frames: 0,
             counting_since: Instant::now(),
             fps: 0.0,
-            out_of_play: u32::MAX,
-            conversions: 0,
-            video_at: None,
-            flying: false,
+            play: kiu_play::PlayState::default(),
             started: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |since| since.as_secs()),
-            pacing: Pacing::default(),
+            probe: frame_log::FrameProbe::default(),
         }
     }
 
@@ -495,7 +426,7 @@ struct App {
     layout: Screens,
     /// how wide the top screen shows.
     top_shape: settings::TopShape,
-    /// how wide the presenter shows it now, see top_width_shown.
+    /// how wide the presenter shows it now, see kiu_play::top_width_shown.
     shown_top_width: f32,
     /// the left button is down, and where the pointer is, in window pixels.
     mouse_down: bool,
@@ -504,8 +435,6 @@ struct App {
     tilting_from: Option<(f32, f32)>,
     cursor: (f32, f32),
     last_title_update: Instant,
-    /// when the last frame was emulated, to tell hitches from the frames' spacing.
-    last_emulated: Option<Instant>,
     /// when the next frame is due. frames run to a schedule rather than one
     /// after another, so that a slow one is made up by those after it and
     /// the sound, made as the console runs, keeps up.
@@ -593,24 +522,6 @@ const CATCH_UP_LIMIT: Duration = Duration::from_millis(200);
 /// frames that may go unshown in a row while catching up.
 const MAX_SKIPPED: u32 = 4;
 
-/// the window's rectangles no screen covers, beside, above and below each
-/// screen as far as the next screen or the window's edge, in window pixels, as
-/// [x0, y0, x1, y1].
-fn free_regions(width: f32, height: f32, screens: &[Viewport]) -> Vec<[f32; 4]> {
-    let mut free = Vec::new();
-    for s in screens {
-        let (x0, y0, x1, y1) = (s.x, s.y, s.x + s.width, s.y + s.height);
-        let in_rows = |o: &&Viewport| o.y < y1 && o.y + o.height > y0;
-        let in_columns = |o: &&Viewport| o.x < x1 && o.x + o.width > x0;
-        let left = screens.iter().filter(in_rows).map(|o| o.x + o.width).filter(|&e| e <= x0).fold(0.0, f32::max);
-        let right = screens.iter().filter(in_rows).map(|o| o.x).filter(|&e| e >= x1).fold(width, f32::min);
-        let above = screens.iter().filter(in_columns).map(|o| o.y + o.height).filter(|&e| e <= y0).fold(0.0, f32::max);
-        let below = screens.iter().filter(in_columns).map(|o| o.y).filter(|&e| e >= y1).fold(height, f32::min);
-        free.extend([[left, y0, x0, y1], [x1, y0, right, y1], [x0, above, x1, y0], [x0, y1, x1, below]]);
-    }
-    free.retain(|[x0, y0, x1, y1]| x1 - x0 >= 1.0 && y1 - y0 >= 1.0);
-    free
-}
 
 /// whether a frame goes unshown, the game running behind the schedule with
 /// a presenter that waits for the display, and fewer than MAX_SKIPPED
@@ -629,12 +540,6 @@ fn window_title(port: bool, game: Option<(&str, &str)>) -> String {
     }
 }
 
-/// the mouse's raw movement as aim, at a speed, its vertical turned round
-/// when inverted.
-fn aim_delta(delta: (f64, f64), speed: f32, invert_y: bool) -> (f32, f32) {
-    let y = if invert_y { -delta.1 } else { delta.1 };
-    (delta.0 as f32 * speed, y as f32 * speed)
-}
 
 /// what the window losing the focus leaves to undo when it gets it back: a
 /// pause it made, and the mouse aim it let go of.
@@ -649,6 +554,7 @@ struct Away {
 fn leave(pause: bool, already_paused: bool, aim: Option<AimMode>, recapture: bool) -> Away {
     Away { paused: pause && !already_paused, aim: aim.filter(|_| recapture) }
 }
+
 /// what the player is told when the 3D can't be drawn on the GPU.
 const GPU_FALLBACK: &str = "The 3D can't be drawn on the GPU, as Vulkan isn't working on this computer, so it's drawn in software. \
 Games run much slower that way, and texture packs are left out. Updating the graphics driver usually fixes it; the log says \
@@ -720,7 +626,7 @@ impl ApplicationHandler for App {
                 // a room's others keep playing, so it never pauses there
                 let pause = self.settings.pause_unfocused && self.game.is_some() && self.room.is_none();
                 // the aim in use, read before release() forgets it
-                self.away = leave(pause, self.paused, self.keyboard.aim_mode(), self.settings.recapture_mouse);
+                self.away = leave(pause, self.paused, self.keyboard.aim.mode(), self.settings.recapture_mouse);
                 self.paused |= self.away.paused;
                 self.fast_forward_key = false;
                 self.set_mouse_aim(None);
@@ -742,32 +648,18 @@ impl ApplicationHandler for App {
                 }
             }
             WindowEvent::KeyboardInput { event, .. } => self.key(event, consumed),
+            // mouse aim takes the buttons and the wheel while it has the pointer
+            ref aimed if self.mouse_aim_event(aimed) => {}
             WindowEvent::MouseInput { state, button, .. } => {
-                if button == MouseButton::Left && self.keyboard.aiming() {
-                    self.keyboard.fire(state == ElementState::Pressed);
-                } else if button == MouseButton::Left {
+                if button == MouseButton::Left {
                     self.mouse_down = state == ElementState::Pressed && !self.pointer_taken(consumed);
                     self.touch();
                 }
-                // while aiming the middle button uses the power, as the D-pad's down does
-                if button == MouseButton::Middle {
-                    self.keyboard.mouse_button(PadState::DOWN, state == ElementState::Pressed);
-                }
-                if button == MouseButton::Right && self.keyboard.aiming() {
-                    self.keyboard.stylus(state == ElementState::Pressed);
-                } else if button == MouseButton::Right {
+                if button == MouseButton::Right {
                     let pressed = state == ElementState::Pressed && !self.pointer_taken(consumed);
                     self.tilting_from = pressed.then_some(self.cursor);
                     self.tilt();
                 }
-            }
-            // while aiming the wheel steps through powers, the D-pad's left and right
-            WindowEvent::MouseWheel { delta, .. } => {
-                let up = match delta {
-                    MouseScrollDelta::LineDelta(_, y) => y > 0.0,
-                    MouseScrollDelta::PixelDelta(position) => position.y > 0.0,
-                };
-                self.keyboard.wheel(if up { PadState::LEFT } else { PadState::RIGHT });
             }
             WindowEvent::CursorMoved { position, .. } => {
                 self.cursor = (position.x as f32, position.y as f32);
@@ -780,15 +672,7 @@ impl ApplicationHandler for App {
     }
 
     fn device_event(&mut self, _event_loop: &ActiveEventLoop, _device: DeviceId, event: DeviceEvent) {
-        // raw movement, which keeps coming with the pointer locked in place
-        if let DeviceEvent::MouseMotion { delta } = event {
-            let speed = match self.keyboard.aim_mode() {
-                Some(AimMode::Air) => self.settings.air_aim_speed,
-                _ => self.settings.land_aim_speed,
-            };
-            let (x, y) = aim_delta(delta, speed, self.settings.invert_aim_y);
-            self.keyboard.aim_by(x, y);
-        }
+        self.mouse_aim_device_event(&event);
     }
 
     fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
@@ -954,11 +838,11 @@ impl App {
         self.link_room();
         self.menus.menu_open = false;
         self.keyboard.release();
+        self.keyboard.aim.forget_game_mode();
         self.paused = false;
         self.next_frame = Instant::now();
-        // ZAKURO_LOAD_SLOT=<1-9> goes straight on from that slot's state, for
-        // runs nobody has to steer to the same spot
-        if let Some(slot) = std::env::var("ZAKURO_LOAD_SLOT").ok().and_then(|slot| slot.parse().ok()).filter(|slot| (1..=9).contains(slot)) {
+        // ZAKURO_LOAD_SLOT goes straight on from that slot's state
+        if let Some(slot) = dev_env::load_slot() {
             self.menus.slot = slot;
             self.load_state();
         }
@@ -978,8 +862,8 @@ impl App {
             audio.clear();
         }
         self.menus.menu_open = false;
-        self.menus.options_open = false;
         self.keyboard.release();
+        self.keyboard.aim.forget_game_mode();
     }
 
     fn key(&mut self, event: KeyEvent, consumed: bool) {
@@ -1006,15 +890,13 @@ impl App {
         }
         if pressed && !event.repeat {
             match code {
-                // the options go back to the menu they came from
-                KeyCode::Escape if self.menus.options_open => {
-                    self.menus.options_open = false;
+                // the settings, opened from the menu as its options, go back to it
+                KeyCode::Escape if self.game.is_some() && self.menus.settings_open => {
+                    self.menus.settings_open = false;
                     return;
                 }
                 KeyCode::Escape if self.game.is_some() => {
-                    self.menus.menu_open = !self.menus.menu_open;
-                    self.set_mouse_aim(None);
-                    self.keyboard.release();
+                    self.toggle_menu();
                     return;
                 }
                 KeyCode::F1 => {
@@ -1033,16 +915,7 @@ impl App {
                 }
                 KeyCode::F11 => self.toggle_fullscreen(),
                 // mouse aim: 1 off, for menus, 2 for flying, 3 on foot
-                KeyCode::Digit1 | KeyCode::Digit2 | KeyCode::Digit3
-                    if self.game.is_some() && !self.menus.menu_open && !self.settings.keys.binds(code) =>
-                {
-                    let mode = match code {
-                        KeyCode::Digit2 => Some(AimMode::Air),
-                        KeyCode::Digit3 => Some(AimMode::Land),
-                        _ => None,
-                    };
-                    self.pick_aim(mode);
-                }
+                _ if self.mouse_aim_key(code) => {}
                 KeyCode::F5 if self.game.is_some() => self.save_state(),
                 KeyCode::F8 if self.game.is_some() => self.load_state(),
                 _ => {}
@@ -1069,11 +942,20 @@ impl App {
                 }
                 self.apply_settings();
             } else if button == gilrs::Button::Mode && self.game.is_some() {
-                self.menus.menu_open = !self.menus.menu_open;
-                self.menus.options_open = false;
-                self.keyboard.release();
+                self.toggle_menu();
             }
         }
+    }
+
+    /// opens or closes the menu over the game, with Escape or Home: the
+    /// settings opened from it close too, and the mouse aim lets go of the
+    /// pointer, for the game's next word to pick it again once play goes on.
+    fn toggle_menu(&mut self) {
+        self.menus.menu_open = !self.menus.menu_open;
+        self.menus.settings_open = false;
+        self.set_mouse_aim(None);
+        self.keyboard.release();
+        self.keyboard.aim.forget_game_mode();
     }
 
     /// whether the pointer is busy with something other than the game.
@@ -1081,31 +963,6 @@ impl App {
         consumed || self.game.is_none() || self.menus.menu_open || self.gui.as_ref().is_some_and(Gui::wants_pointer)
     }
 
-    /// changes the mouse aim mode and says so.
-    fn pick_aim(&mut self, mode: Option<AimMode>) {
-        self.set_mouse_aim(mode);
-        let said = match mode {
-            Some(AimMode::Air) => "Mouse aim: flying",
-            Some(AimMode::Land) => "Mouse aim: on foot",
-            None => "Mouse aim off",
-        };
-        self.menus.toast = Some((said.to_owned(), Instant::now()));
-    }
-
-    /// mouse aim: the mouse drags the stylus with the pointer hidden and held
-    /// in the window, the left button fires.
-    fn set_mouse_aim(&mut self, mode: Option<AimMode>) {
-        let on = mode.is_some();
-        self.keyboard.set_aim(mode);
-        if let Some(window) = &self.window {
-            let grab = if on { CursorGrabMode::Locked } else { CursorGrabMode::None };
-            // Windows has no locked mode, confined does there
-            if window.set_cursor_grab(grab).is_err() && on {
-                let _ = window.set_cursor_grab(CursorGrabMode::Confined);
-            }
-            window.set_cursor_visible(!on);
-        }
-    }
 
     /// touches the bottom screen while the button is down over it.
     fn touch(&mut self) {
@@ -1229,15 +1086,14 @@ impl App {
         self.camera = Some(wanted);
     }
 
-    /// puts the screens' arrangement and the window scale to use, sizing
-    /// the window to them.
     /// the screens shown now, the automatic layout's by whether the game is
     /// in play; before a game runs, as in menus.
     fn screens(&self) -> zakuro_gpu::ScreenLayout {
-        let in_play = self.game.as_ref().is_some_and(|game| game.out_of_play <= IN_PLAY_QUIET);
-        self.layout.screens_in(in_play)
+        self.layout.screens_in(self.game.as_ref().is_some_and(|game| game.play.in_play()))
     }
 
+    /// puts the screens' arrangement and the window scale to use, sizing
+    /// the window to them.
     fn apply_layout(&mut self) {
         if let Some(backend) = &mut self.backend {
             backend.set_top_width(self.settings.top_shape.width());
@@ -1517,16 +1373,7 @@ impl App {
             self.menus.message = Some("The room closed, or the connection to it was lost.".into());
         }
         self.download_play();
-        let activity = self.game.as_ref().filter(|_| self.settings.discord_presence).map(|game| discord::Activity {
-            doing: match (game.out_of_play <= IN_PLAY_QUIET, game.flying) {
-                (false, _) => discord::Doing::Menus,
-                (true, false) => discord::Doing::OnFoot,
-                (true, true) => discord::Doing::Flying,
-            },
-            chapter: discord::chapter(&game.system.services.fs.last_read),
-            since: game.started,
-        });
-        self.presence.show(activity);
+        self.show_presence();
 
         // a game waiting on its keyboard waits for the user, not running
         let typing = self.game.as_ref().is_some_and(|game| game.system.keyboard_request().is_some());
@@ -1558,8 +1405,9 @@ impl App {
             self.emulate();
             self.spent.emulating.add(start.elapsed());
         } else {
-            // a pause is no hitch, the next frame's spacing starts afresh
-            self.last_emulated = None;
+            if let Some(game) = &mut self.game {
+                game.probe.pause();
+            }
             if let Some(audio) = &self.audio {
                 // the sound stops with the game, which is not falling behind
                 audio.hold();
@@ -1622,47 +1470,31 @@ impl App {
         if !sleep.is_zero() {
             std::thread::sleep(sleep);
         }
-        // with RUST_LOG=zakuro::frames=debug, how the frame met the display:
-        // how long showing it took, a presenter waiting for the display
-        // blocks there, or that it went unshown, and the sleep after
         if playing {
-            match presented {
-                Some(took) => log::debug!(
-                    target: "zakuro::frames",
-                    "shown in {:.1} ms, then slept {:.1} ms",
-                    took.as_secs_f64() * 1000.0,
-                    sleep.as_secs_f64() * 1000.0
-                ),
-                None => log::debug!(target: "zakuro::frames", "unshown, behind, slept {:.1} ms", sleep.as_secs_f64() * 1000.0),
-            }
+            frame_log::shown(presented, sleep);
         }
     }
 
     /// runs one frame of the game.
     fn emulate(&mut self) {
         // what game overrides say the game is doing picks the mouse aim mode,
-        // see input::GAME_ON_FOOT; not while the window or a menu has it
-        let said = self.game.as_mut().map_or(0, |game| std::mem::take(&mut game.system.memory.host_mailbox[3]));
+        // see kiu_play::GAME_ON_FOOT; not while the window or a menu has it
+        let said = self.game.as_mut().map_or(0, |game| std::mem::take(&mut game.system.memory.host_mailbox[HOST_MAILBOX_GAME_MODE]));
         if self.focused && !self.menus.menu_open {
-            if let Some(mode) = self.keyboard.game_mode(said) {
+            if let Some(mode) = self.keyboard.aim.game_mode(said) {
                 self.pick_aim(mode);
             }
         }
         let Some(game) = &mut self.game else { return };
-        // in play while the overrides say so, see IN_PLAY_QUIET
-        let was_in_play = game.out_of_play <= IN_PLAY_QUIET;
-        game.out_of_play = if said != 0 { 0 } else { game.out_of_play.saturating_add(1) };
-        if said != 0 {
-            game.flying = said == input::GAME_FLYING;
-        }
-        let in_play = game.out_of_play <= IN_PLAY_QUIET;
+        let changed = game.play.update(said);
+        let in_play = game.play.in_play();
         game.system.gpu.set_in_play(in_play);
         // a screen the window does not show needs no picture in between
-        let (top, bottom) = shows(self.layout.screens_in(in_play));
+        let (top, bottom) = kiu_play::shows(self.layout.screens_in(in_play));
         game.system.gpu.set_shown(top, bottom);
         // the automatic layout shows the bottom screen over the top one in
         // menus, where the game is played on it
-        if in_play != was_in_play && self.layout == Screens::Auto {
+        if changed && self.layout == Screens::Auto {
             if let Some(backend) = &mut self.backend {
                 backend.set_layout(self.layout.screens_in(in_play));
             }
@@ -1671,24 +1503,19 @@ impl App {
             Some(replay) => replay.input(game.frame),
             None => self.gamepads.apply(self.keyboard.state()),
         };
-        self.keyboard.frame_done();
+        self.keyboard.aim.frame_done();
         game.frame += 1;
         if let Some(recorder) = &mut game.recorder {
             recorder.record(input);
         }
         game.system.set_input(input);
         // mouse look on foot, for a game override to take, see input::MOUSE_LOOK
-        self.keyboard.feed_mailbox(&mut game.system.memory.host_mailbox);
+        self.keyboard.aim.feed_mailbox(&mut game.system.memory.host_mailbox);
         // how much wider than the console's the top screen shows, for a game
         // override to draw a wider scene into the same 400x240: the console's
         // own shape while a video plays and in 21:9 menus
-        let conversions = game.system.services.y2r.conversions;
-        if conversions != game.conversions {
-            game.conversions = conversions;
-            game.video_at = Some(game.frame);
-        }
-        let video = game.video_at.is_some_and(|at| game.frame.saturating_sub(at) <= VIDEO_HOLD);
-        let width = top_width_shown(self.settings.top_shape, video, in_play);
+        let video = game.play.video(game.system.services.y2r.conversions, game.frame);
+        let width = kiu_play::top_width_shown(self.settings.top_shape, video, in_play);
         if width != self.shown_top_width {
             log::debug!(target: "zakuro::screens", "the top screen shows {width} across, a video {video}, in play {in_play}");
             self.shown_top_width = width;
@@ -1697,68 +1524,12 @@ impl App {
             }
         }
         let widening = width / 400.0;
-        game.system.memory.host_mailbox[4] = widening.to_bits();
+        game.system.memory.host_mailbox[HOST_MAILBOX_TOP_WIDENING] = widening.to_bits();
         // and its HUD's 2D draws squeezed back into proportion
         game.system.gpu.set_top_widening(widening);
-        let interpreted =|system: &System| system.interpreted_instructions + system.recompiled.as_ref().map_or(0, |library| library.fallbacks());
-        let before = interpreted(&game.system);
-        let faults = warm::page_faults();
-        let started = Instant::now();
+        game.probe.start(&game.system);
         let outcome = game.system.run_frame();
-        // a frame far over its 16.7 ms is a hitch the player feels; the log
-        // around it says what the game was doing
-        let took = started.elapsed();
-        let gpu = zakuro_gpu::stats::take();
-        // and the whole time since the last frame, showing it included, which
-        // catches a stall outside the emulation too; a pause or the menu is no hitch
-        let since = self.last_emulated.replace(started).map(|last| started - last).unwrap_or_default();
-        let menu = self.paused || self.menus.menu_open;
-        // fast forward runs frames as fast as it can, no pacing to speak of
-        // every frame, with RUST_LOG=zakuro::frames=debug, to see a pattern
-        // the window's counts only add up
-        log::debug!(
-            target: "zakuro::frames",
-            "frame {} took {:.1} ms, {:.1} ms since the last, {} draws in {:.1} ms, waiting for the GPU {:.1} ms",
-            game.frame,
-            took.as_secs_f64() * 1000.0,
-            since.as_secs_f64() * 1000.0,
-            gpu.draws,
-            gpu.drawing,
-            gpu.waiting
-        );
-        if !menu && !self.fast_forwarding && !since.is_zero() {
-            if let Some(window) = game.pacing.note(since) {
-                log::info!(
-                    "pacing: {} frames, {} over 20 ms, {} over 33 ms, the worst {:.0} ms",
-                    window.frames,
-                    window.late,
-                    window.very_late,
-                    window.worst.as_secs_f64() * 1000.0
-                );
-                save_screens(&mut game.system, game.frame);
-            }
-        }
-        if !menu && (took.as_millis() >= 50 || since.as_millis() >= 100) {
-            log::warn!(
-                "hitch: frame {} took {:.0} ms, {:.0} ms since the last, {} instructions interpreted,                  {} draws in {:.0} ms: vertices {:.0} ms, textures {:.0} ms, waiting for the GPU {:.0} ms;                  recompiled code {:.0} ms, services {:.0} ms, frame end {:.0} ms, sound {:.0} ms,                  {} syncs with the GPU in {:.0} ms, {} pages brought in",
-                game.frame,
-                took.as_secs_f64() * 1000.0,
-                since.as_secs_f64() * 1000.0,
-                interpreted(&game.system) - before,
-                gpu.draws,
-                gpu.drawing,
-                gpu.shading,
-                gpu.textures,
-                gpu.waiting,
-                gpu.recompiled,
-                gpu.services,
-                gpu.frame_end,
-                gpu.audio,
-                gpu.syncs,
-                gpu.sync,
-                warm::page_faults() - faults
-            );
-        }
+        game.probe.end(&mut game.system, game.frame, self.paused || self.menus.menu_open, self.fast_forwarding);
         // the overlay reads the game the program was built on, not another
         // one its library opened
         let ours = self.linked.as_ref().is_none_or(|linked| game.system.title.as_ref().is_some_and(|title| title.program_id() == linked.program_id()));
@@ -2014,20 +1785,19 @@ impl App {
         });
         // where the controls can go, the window's pixels no screen covers, while
         // a game runs without the 3D, which places the screens otherwise
-        let screens = self.layout.screens_in(self.game.as_ref().is_some_and(|game| game.out_of_play <= IN_PLAY_QUIET));
-        let free = (menus::CONTROLS_HINT_ENABLED && self.game.is_some() && self.settings.show_controls &&self.settings.stereo == settings::Stereo3d::Off)
-            .then(|| {
-                let size = window.inner_size();
-                let (top, bottom) =
-                    layout(size.width, size.height, screens, self.top_shape.width(), self.settings.integer_scale);
-                free_regions(size.width as f32, size.height as f32, &[top, bottom].into_iter().flatten().collect::<Vec<_>>())
-            })
-            .unwrap_or_default();
-        let aim = match self.keyboard.aim_mode() {
-            Some(AimMode::Air) => "2",
-            Some(AimMode::Land) => "3",
-            None => "1",
+        let screens = self.layout.screens_in(self.game.as_ref().is_some_and(|game| game.play.in_play()));
+        let shows_controls = kiu_controls::CONTROLS_HINT_ENABLED
+            && self.game.is_some()
+            && self.settings.show_controls
+            && self.settings.stereo == settings::Stereo3d::Off;
+        let free = if shows_controls {
+            let size = window.inner_size();
+            let (top, bottom) = layout(size.width, size.height, screens, self.top_shape.width(), self.settings.integer_scale);
+            kiu_play::free_regions(size.width as f32, size.height as f32, &[top, bottom].into_iter().flatten().collect::<Vec<_>>())
+        } else {
+            Vec::new()
         };
+        let aim = AimMode::digit(self.keyboard.aim.mode());
         let warming = self.game.as_ref().and(warm::progress());
         let corner = self.overlay_corner.clone().filter(|_| game.is_some());
         let (menus, library, settings, jobs) = (&mut self.menus, &self.library, &mut self.settings, &self.jobs);
@@ -2051,7 +1821,7 @@ impl App {
                     .iter()
                     .map(|[x0, y0, x1, y1]| egui::Rect::from_min_max(egui::pos2(x0 / points, y0 / points), egui::pos2(x1 / points, y1 / points)))
                     .collect();
-                menus::controls_hint(ui.ctx(), &rects, &settings.keys, aim);
+                kiu_controls::controls_hint(ui.ctx(), &rects, &settings.keys, aim);
             }
             match &game {
                 Some((name, fps, recompiled)) => {
@@ -2062,7 +1832,6 @@ impl App {
                 }
                 None => actions.extend(menus.library(ui, library, settings, jobs)),
             }
-            actions.extend(menus.options(ui.ctx(), settings));
             actions.extend(menus.settings(ui.ctx(), settings));
             if menus.multiplayer_open {
                 actions.extend(menus.multiplayer(ui.ctx(), settings, room.as_ref()));
@@ -2170,14 +1939,6 @@ fn download_play_view(guest: &zakuro_core::download_play::Guest, members: &[zaku
     menus::DlpView { offers, doing }
 }
 
-/// whether a layout shows the top screen and the bottom one.
-fn shows(layout: zakuro_gpu::ScreenLayout) -> (bool, bool) {
-    match layout {
-        zakuro_gpu::ScreenLayout::TopOnly => (true, false),
-        zakuro_gpu::ScreenLayout::BottomOnly => (false, true),
-        _ => (true, true),
-    }
-}
 
 /// a screen as the presenter takes it, straight from the GPU when it shares
 /// the renderer's device and the GPU drew what the screen shows, else its
@@ -2205,74 +1966,7 @@ const _: RendererKind = RendererKind::Software;
 
 #[cfg(test)]
 mod tests {
-    use zakuro_gpu::Viewport;
-
-    /// the layouts with one screen hide the other one, the rest show both,
-    /// the bottom screen over the top one's included.
-    #[test]
-    fn a_layout_with_one_screen_hides_the_other() {
-        use zakuro_gpu::ScreenLayout::*;
-        assert_eq!(super::shows(TopOnly), (true, false));
-        assert_eq!(super::shows(BottomOnly), (false, true));
-        for layout in [Stacked, SideBySide, LargeTop, BottomOverTop] {
-            assert_eq!(super::shows(layout), (true, true), "{layout:?}");
-        }
-    }
-
-    #[test]
-    fn pacing_counts_late_frames_once_a_window() {
-        use super::Pacing;
-        use std::time::Duration;
-        let mut pacing = Pacing::default();
-        let ms = Duration::from_millis;
-        for frame in 1..Pacing::WINDOW {
-            let since = match frame {
-                10 => ms(25),
-                20 => ms(40),
-                _ => ms(16),
-            };
-            assert_eq!(pacing.note(since), None, "frame {frame} is before the window is full");
-        }
-        let window = pacing.note(ms(21)).expect("the window is full");
-        assert_eq!(window, Pacing { frames: Pacing::WINDOW, late: 3, very_late: 1, worst: ms(40) });
-        // the next window starts from nothing
-        assert_eq!(pacing, Pacing::default());
-    }
-
-    fn viewport(x: f32, y: f32, width: f32, height: f32) -> Viewport {
-        Viewport { x, y, width, height }
-    }
-
-    #[test]
-    fn free_regions_are_the_margins_and_gaps_beside_the_screens() {
-        // stacked in a wide window: margins left and right, wider beside the
-        // narrower bottom screen
-        let free = super::free_regions(1000.0, 960.0, &[viewport(100.0, 0.0, 800.0, 480.0), viewport(180.0, 480.0, 640.0, 480.0)]);
-        assert!(free.contains(&[0.0, 0.0, 100.0, 480.0]));
-        assert!(free.contains(&[0.0, 480.0, 180.0, 960.0]));
-        assert!(free.contains(&[820.0, 480.0, 1000.0, 960.0]));
-        // large top: the block above the small bottom screen, beside the top
-        let free = super::free_regions(1120.0, 480.0, &[viewport(0.0, 0.0, 800.0, 480.0), viewport(800.0, 240.0, 320.0, 240.0)]);
-        assert!(free.contains(&[800.0, 0.0, 1120.0, 240.0]));
-        assert!(!free.iter().any(|[x0, _, _, _]| *x0 < 800.0), "nothing over the top screen");
-    }
-
     use super::*;
-
-    /// the top screen takes its chosen shape, but the console's while a
-    /// video plays, which cannot be widened, and in menus on a 21:9 screen,
-    /// whose 3D shows what lies off the console's view there.
-    #[test]
-    fn the_top_screen_keeps_the_consoles_shape_for_videos_and_wide_menus() {
-        use settings::TopShape::*;
-        assert_eq!(top_width_shown(Wide16x9, false, true), Wide16x9.width(), "in play");
-        assert_eq!(top_width_shown(Wide16x9, true, true), 400.0, "a video");
-        assert_eq!(top_width_shown(Wide16x9, false, false), Wide16x9.width(), "16:9 menus stay wide");
-        assert_eq!(top_width_shown(Wide21x9, false, false), 400.0, "21:9 menus");
-        assert_eq!(top_width_shown(Wide21x9, true, false), 400.0, "a video in a 21:9 menu");
-        assert_eq!(top_width_shown(Wide21x9, false, true), Wide21x9.width(), "21:9 in play");
-        assert_eq!(top_width_shown(Console, false, true), 400.0, "the console's shape");
-    }
 
     /// a frame goes unshown only while the game runs behind with a
     /// presenter that waits for the display, a few in a row at most.
@@ -2293,11 +1987,6 @@ mod tests {
         assert_eq!(window_title(false, None), "Zakuro");
     }
 
-    #[test]
-    fn inverted_aim_turns_only_the_vertical_round() {
-        assert_eq!(aim_delta((4.0, 2.0), 1.5, false), (6.0, 3.0));
-        assert_eq!(aim_delta((4.0, 2.0), 1.5, true), (6.0, -3.0));
-    }
 
     #[test]
     fn leaving_the_window_pauses_and_keeps_the_aim_as_the_settings_say() {
