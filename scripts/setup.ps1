@@ -131,6 +131,13 @@ function Install-Rust {
         Run $installer @("-y", "--no-modify-path", "--default-host", "x86_64-pc-windows-gnu", "--default-toolchain", $RustVersion, "--profile", "minimal") $Tools
         Remove-Item $installer
     }
+    # every cargo run of this setup uses the install's default toolchain:
+    # 3dsrecomp and zakuro carry a rust-toolchain.toml asking for stable,
+    # which would otherwise download whatever stable is that day. a new
+    # install's default is $RustVersion; an older one keeps its own.
+    $default = (& rustup default) -split '\s+' | Select-Object -First 1
+    if (-not $default) { Fail "rustup has no default toolchain" }
+    $env:RUSTUP_TOOLCHAIN = $default
     & cargo --version
 }
 
