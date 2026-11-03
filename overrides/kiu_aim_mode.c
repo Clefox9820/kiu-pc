@@ -12,7 +12,13 @@
  */
 #include "overrides.h"
 
-#define GAME_MODE 0x0700000Cu /* Zakuro's HOST_MAILBOX_VADDR + 12 */
+/* Zakuro's host mailbox, words of 4 bytes from its start, named and
+   numbered as in zakuro/crates/zakuro-common/src/memory_map.rs */
+#define HOST_MAILBOX_VADDR 0x07000000u
+#define HOST_MAILBOX_GAME_MODE 3
+#define HOST_MAILBOX_WORD(index) (HOST_MAILBOX_VADDR + 4u * (index))
+
+#define GAME_MODE HOST_MAILBOX_WORD(HOST_MAILBOX_GAME_MODE)
 #define GAME_ON_FOOT 1u
 #define GAME_FLYING 2u
 
