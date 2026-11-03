@@ -7,6 +7,10 @@ Set-StrictMode -Version 2.0
 
 $AddressPattern = '0x[0-9A-Fa-f]{8}'
 
+# The functions an override replaces or calls, as 3dsrecomp reads them: hex
+# of any length.
+$MarkPattern = 'RECOMP_(?:OVERRIDE|ORIGINAL)\((0x[0-9A-Fa-f]+)\)'
+
 # The table as European address => USA address, both [uint32].
 function Get-UsaAddressTable([string]$Path) {
     $table = @{}
@@ -36,10 +40,25 @@ function Get-OverrideAddress([string]$Directory, [uint32]$Start, [uint64]$End) {
     }
 }
 
-# The addresses in [Start, End) the overrides name without a USA address in
-# the table: what would stay European in the USA build. Empty when all map.
+# Every address a RECOMP_OVERRIDE or RECOMP_ORIGINAL mark names, whatever its
+# length, as File and Address.
+function Get-MarkedAddress([string]$Directory) {
+    foreach ($file in Get-OverrideFile $Directory) {
+        $source = [System.IO.File]::ReadAllText($file.FullName)
+        foreach ($m in [regex]::Matches($source, $MarkPattern)) {
+            [pscustomobject]@{ File = $file.Name; Address = [Convert]::ToUInt32($m.Groups[1].Value.Substring(2), 16) }
+        }
+    }
+}
+
+# The addresses the overrides name without a USA address in the table: what
+# would stay European in the USA build. Every 8-digit address in [Start, End)
+# counts, and every address a RECOMP_ mark names, in any range or length.
+# Empty when all map.
 function Find-UnmappedAddress([string]$Directory, [hashtable]$Table, [uint32]$Start, [uint64]$End) {
-    Get-OverrideAddress $Directory $Start $End | Where-Object { -not $Table.ContainsKey($_.Address) }
+    @(Get-OverrideAddress $Directory $Start $End) + @(Get-MarkedAddress $Directory) |
+        Where-Object { -not $Table.ContainsKey($_.Address) } |
+        Sort-Object File, Address -Unique
 }
 
 # The source with every address the table names replaced by its USA one.

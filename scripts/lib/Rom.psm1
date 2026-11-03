@@ -40,15 +40,19 @@ function Read-RomHeader([string]$Path) {
 }
 
 # Throws unless the dump is Kid Icarus Uprising, decrypted; with -Region,
-# that release only.
-function Assert-KiuRom($Rom, [string]$Region) {
+# that release only. With -ReadableCode a dump whose NoCrypto flag is clear
+# still passes when its exheader reads as plain (its text segment at
+# 0x00100000): some decrypting tools leave the flag clear, and reading the
+# code needs no more than that. setup.ps1 keeps the stricter flag test.
+function Assert-KiuRom($Rom, [string]$Region, [switch]$ReadableCode) {
     if ($Region) {
         $want = if ($Region -eq "USA") { $KiuUsaId } else { $KiuEuropeId }
         if ($Rom.ProgramId -ne $want) { throw "$($Rom.Path) is $($Rom.ProgramId), not $want" }
     } elseif (-not $Rom.Region) {
         throw "this ROM is $($Rom.ProgramId), not Kid Icarus Uprising (Europe $KiuEuropeId or USA $KiuUsaId)"
     }
-    if ($Rom.Encrypted) { throw "the ROM is encrypted; dump it decrypted from your own console" }
+    $readable = $ReadableCode -and [BitConverter]::ToUInt32($Rom.Header, 0x210) -eq 0x00100000
+    if ($Rom.Encrypted -and -not $readable) { throw "the ROM is encrypted; dump it decrypted from your own console" }
 }
 
 # The code's segments from the exheader: text, read-only data and data, with

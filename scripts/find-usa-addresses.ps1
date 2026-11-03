@@ -41,7 +41,7 @@ function Fail($text) { Write-Host "error: $text" -ForegroundColor Red; exit 1 }
 function Read-Code($path, $region) {
     try {
         $rom = Read-RomHeader $path
-        Assert-KiuRom $rom $region
+        Assert-KiuRom $rom $region -ReadableCode
         $code = Read-RomCode $rom
     } catch { Fail $_.Exception.Message }
     [pscustomobject]@{
