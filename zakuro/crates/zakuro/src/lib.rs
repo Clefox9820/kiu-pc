@@ -10,6 +10,7 @@ mod gamepad;
 mod gui;
 mod input;
 mod kiu_controls;
+mod kiu_play;
 mod kiu_theme;
 mod library;
 mod menus;
@@ -33,7 +34,7 @@ use zakuro_common::memory_map::{HOST_MAILBOX_GAME_MODE, HOST_MAILBOX_TOP_WIDENIN
 use zakuro_common::Screen;
 use zakuro_core::services::hid::PadState;
 use zakuro_core::{loader, Config, FrameOutcome, System};
-use zakuro_gpu::{layout, GpuScreen, Overlay, PresentError, RendererKind, ScreenImage, Viewport};
+use zakuro_gpu::{layout, GpuScreen, Overlay, PresentError, RendererKind, ScreenImage};
 
 use gui::Gui;
 use input::{AimMode, Keyboard};
@@ -339,25 +340,6 @@ fn run_headless(system: &mut System, frames: u64) {
     }
 }
 
-/// frames without a game override saying the game is in play before it is
-/// taken to be in a menu. the overrides say it once a tick, every second
-/// frame for Kid Icarus.
-const IN_PLAY_QUIET: u32 = 10;
-
-/// frames after the last frame a video's decoder converted before the top
-/// screen goes back to its own shape, a video's frames coming at 30 a
-/// second or fewer.
-const VIDEO_HOLD: u64 = 30;
-
-/// how wide the top screen shows: in its chosen shape, but the console's
-/// while a video plays, a picture made for 400 across that cannot be
-/// widened as the 3D is, and in menus on a 21:9 screen, whose 3D would
-/// show what lies off the console's view there.
-fn top_width_shown(shape: settings::TopShape, video: bool, in_play: bool) -> f32 {
-    let console = video || (!in_play && shape == settings::TopShape::Wide21x9);
-    if console { settings::TopShape::Console.width() } else { shape.width() }
-}
-
 /// a game being played.
 struct Running {
     system: System,
@@ -374,14 +356,8 @@ struct Running {
     frames: u32,
     counting_since: Instant,
     fps: f32,
-    /// frames since a game override last said the title is in play.
-    out_of_play: u32,
-    /// how many video frames the decoder had converted at the last frame,
-    /// and the frame a new one came at, see VIDEO_HOLD.
-    conversions: u64,
-    video_at: Option<u64>,
-    /// the game override last said the player is flying, not on foot.
-    flying: bool,
+    /// what the game overrides say the game is doing.
+    play: kiu_play::PlayState,
     /// when the game started, in seconds since 1970, for Discord.
     started: u64,
     /// how evenly the frames came, for the log.
@@ -446,10 +422,7 @@ impl Running {
             frames: 0,
             counting_since: Instant::now(),
             fps: 0.0,
-            out_of_play: u32::MAX,
-            conversions: 0,
-            video_at: None,
-            flying: false,
+            play: kiu_play::PlayState::default(),
             started: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |since| since.as_secs()),
             pacing: Pacing::default(),
         }
@@ -497,7 +470,7 @@ struct App {
     layout: Screens,
     /// how wide the top screen shows.
     top_shape: settings::TopShape,
-    /// how wide the presenter shows it now, see top_width_shown.
+    /// how wide the presenter shows it now, see kiu_play::top_width_shown.
     shown_top_width: f32,
     /// the left button is down, and where the pointer is, in window pixels.
     mouse_down: bool,
@@ -595,24 +568,6 @@ const CATCH_UP_LIMIT: Duration = Duration::from_millis(200);
 /// frames that may go unshown in a row while catching up.
 const MAX_SKIPPED: u32 = 4;
 
-/// the window's rectangles no screen covers, beside, above and below each
-/// screen as far as the next screen or the window's edge, in window pixels, as
-/// [x0, y0, x1, y1].
-fn free_regions(width: f32, height: f32, screens: &[Viewport]) -> Vec<[f32; 4]> {
-    let mut free = Vec::new();
-    for s in screens {
-        let (x0, y0, x1, y1) = (s.x, s.y, s.x + s.width, s.y + s.height);
-        let in_rows = |o: &&Viewport| o.y < y1 && o.y + o.height > y0;
-        let in_columns = |o: &&Viewport| o.x < x1 && o.x + o.width > x0;
-        let left = screens.iter().filter(in_rows).map(|o| o.x + o.width).filter(|&e| e <= x0).fold(0.0, f32::max);
-        let right = screens.iter().filter(in_rows).map(|o| o.x).filter(|&e| e >= x1).fold(width, f32::min);
-        let above = screens.iter().filter(in_columns).map(|o| o.y + o.height).filter(|&e| e <= y0).fold(0.0, f32::max);
-        let below = screens.iter().filter(in_columns).map(|o| o.y).filter(|&e| e >= y1).fold(height, f32::min);
-        free.extend([[left, y0, x0, y1], [x1, y0, right, y1], [x0, above, x1, y0], [x0, y1, x1, below]]);
-    }
-    free.retain(|[x0, y0, x1, y1]| x1 - x0 >= 1.0 && y1 - y0 >= 1.0);
-    free
-}
 
 /// whether a frame goes unshown, the game running behind the schedule with
 /// a presenter that waits for the display, and fewer than MAX_SKIPPED
@@ -1239,15 +1194,14 @@ impl App {
         self.camera = Some(wanted);
     }
 
-    /// puts the screens' arrangement and the window scale to use, sizing
-    /// the window to them.
     /// the screens shown now, the automatic layout's by whether the game is
     /// in play; before a game runs, as in menus.
     fn screens(&self) -> zakuro_gpu::ScreenLayout {
-        let in_play = self.game.as_ref().is_some_and(|game| game.out_of_play <= IN_PLAY_QUIET);
-        self.layout.screens_in(in_play)
+        self.layout.screens_in(self.game.as_ref().is_some_and(|game| game.play.in_play()))
     }
 
+    /// puts the screens' arrangement and the window scale to use, sizing
+    /// the window to them.
     fn apply_layout(&mut self) {
         if let Some(backend) = &mut self.backend {
             backend.set_top_width(self.settings.top_shape.width());
@@ -1528,7 +1482,7 @@ impl App {
         }
         self.download_play();
         let activity = self.game.as_ref().filter(|_| self.settings.discord_presence).map(|game| discord::Activity {
-            doing: match (game.out_of_play <= IN_PLAY_QUIET, game.flying) {
+            doing: match (game.play.in_play(), game.play.flying()) {
                 (false, _) => discord::Doing::Menus,
                 (true, false) => discord::Doing::OnFoot,
                 (true, true) => discord::Doing::Flying,
@@ -1651,7 +1605,7 @@ impl App {
     /// runs one frame of the game.
     fn emulate(&mut self) {
         // what game overrides say the game is doing picks the mouse aim mode,
-        // see input::GAME_ON_FOOT; not while the window or a menu has it
+        // see kiu_play::GAME_ON_FOOT; not while the window or a menu has it
         let said = self.game.as_mut().map_or(0, |game| std::mem::take(&mut game.system.memory.host_mailbox[HOST_MAILBOX_GAME_MODE]));
         if self.focused && !self.menus.menu_open {
             if let Some(mode) = self.keyboard.game_mode(said) {
@@ -1659,20 +1613,15 @@ impl App {
             }
         }
         let Some(game) = &mut self.game else { return };
-        // in play while the overrides say so, see IN_PLAY_QUIET
-        let was_in_play = game.out_of_play <= IN_PLAY_QUIET;
-        game.out_of_play = if said != 0 { 0 } else { game.out_of_play.saturating_add(1) };
-        if said != 0 {
-            game.flying = said == input::GAME_FLYING;
-        }
-        let in_play = game.out_of_play <= IN_PLAY_QUIET;
+        let changed = game.play.update(said);
+        let in_play = game.play.in_play();
         game.system.gpu.set_in_play(in_play);
         // a screen the window does not show needs no picture in between
-        let (top, bottom) = shows(self.layout.screens_in(in_play));
+        let (top, bottom) = kiu_play::shows(self.layout.screens_in(in_play));
         game.system.gpu.set_shown(top, bottom);
         // the automatic layout shows the bottom screen over the top one in
         // menus, where the game is played on it
-        if in_play != was_in_play && self.layout == Screens::Auto {
+        if changed && self.layout == Screens::Auto {
             if let Some(backend) = &mut self.backend {
                 backend.set_layout(self.layout.screens_in(in_play));
             }
@@ -1692,13 +1641,8 @@ impl App {
         // how much wider than the console's the top screen shows, for a game
         // override to draw a wider scene into the same 400x240: the console's
         // own shape while a video plays and in 21:9 menus
-        let conversions = game.system.services.y2r.conversions;
-        if conversions != game.conversions {
-            game.conversions = conversions;
-            game.video_at = Some(game.frame);
-        }
-        let video = game.video_at.is_some_and(|at| game.frame.saturating_sub(at) <= VIDEO_HOLD);
-        let width = top_width_shown(self.settings.top_shape, video, in_play);
+        let video = game.play.video(game.system.services.y2r.conversions, game.frame);
+        let width = kiu_play::top_width_shown(self.settings.top_shape, video, in_play);
         if width != self.shown_top_width {
             log::debug!(target: "zakuro::screens", "the top screen shows {width} across, a video {video}, in play {in_play}");
             self.shown_top_width = width;
@@ -2024,13 +1968,16 @@ impl App {
         });
         // where the controls can go, the window's pixels no screen covers, while
         // a game runs without the 3D, which places the screens otherwise
-        let screens = self.layout.screens_in(self.game.as_ref().is_some_and(|game| game.out_of_play <= IN_PLAY_QUIET));
-        let free = (kiu_controls::CONTROLS_HINT_ENABLED && self.game.is_some() && self.settings.show_controls &&self.settings.stereo == settings::Stereo3d::Off)
+        let screens = self.layout.screens_in(self.game.as_ref().is_some_and(|game| game.play.in_play()));
+        let free = (kiu_controls::CONTROLS_HINT_ENABLED
+            && self.game.is_some()
+            && self.settings.show_controls
+            && self.settings.stereo == settings::Stereo3d::Off)
             .then(|| {
                 let size = window.inner_size();
                 let (top, bottom) =
                     layout(size.width, size.height, screens, self.top_shape.width(), self.settings.integer_scale);
-                free_regions(size.width as f32, size.height as f32, &[top, bottom].into_iter().flatten().collect::<Vec<_>>())
+                kiu_play::free_regions(size.width as f32, size.height as f32, &[top, bottom].into_iter().flatten().collect::<Vec<_>>())
             })
             .unwrap_or_default();
         let aim = match self.keyboard.aim_mode() {
@@ -2179,14 +2126,6 @@ fn download_play_view(guest: &zakuro_core::download_play::Guest, members: &[zaku
     menus::DlpView { offers, doing }
 }
 
-/// whether a layout shows the top screen and the bottom one.
-fn shows(layout: zakuro_gpu::ScreenLayout) -> (bool, bool) {
-    match layout {
-        zakuro_gpu::ScreenLayout::TopOnly => (true, false),
-        zakuro_gpu::ScreenLayout::BottomOnly => (false, true),
-        _ => (true, true),
-    }
-}
 
 /// a screen as the presenter takes it, straight from the GPU when it shares
 /// the renderer's device and the GPU drew what the screen shows, else its
@@ -2214,20 +2153,6 @@ const _: RendererKind = RendererKind::Software;
 
 #[cfg(test)]
 mod tests {
-    use zakuro_gpu::Viewport;
-
-    /// the layouts with one screen hide the other one, the rest show both,
-    /// the bottom screen over the top one's included.
-    #[test]
-    fn a_layout_with_one_screen_hides_the_other() {
-        use zakuro_gpu::ScreenLayout::*;
-        assert_eq!(super::shows(TopOnly), (true, false));
-        assert_eq!(super::shows(BottomOnly), (false, true));
-        for layout in [Stacked, SideBySide, LargeTop, BottomOverTop] {
-            assert_eq!(super::shows(layout), (true, true), "{layout:?}");
-        }
-    }
-
     #[test]
     fn pacing_counts_late_frames_once_a_window() {
         use super::Pacing;
@@ -2248,40 +2173,7 @@ mod tests {
         assert_eq!(pacing, Pacing::default());
     }
 
-    fn viewport(x: f32, y: f32, width: f32, height: f32) -> Viewport {
-        Viewport { x, y, width, height }
-    }
-
-    #[test]
-    fn free_regions_are_the_margins_and_gaps_beside_the_screens() {
-        // stacked in a wide window: margins left and right, wider beside the
-        // narrower bottom screen
-        let free = super::free_regions(1000.0, 960.0, &[viewport(100.0, 0.0, 800.0, 480.0), viewport(180.0, 480.0, 640.0, 480.0)]);
-        assert!(free.contains(&[0.0, 0.0, 100.0, 480.0]));
-        assert!(free.contains(&[0.0, 480.0, 180.0, 960.0]));
-        assert!(free.contains(&[820.0, 480.0, 1000.0, 960.0]));
-        // large top: the block above the small bottom screen, beside the top
-        let free = super::free_regions(1120.0, 480.0, &[viewport(0.0, 0.0, 800.0, 480.0), viewport(800.0, 240.0, 320.0, 240.0)]);
-        assert!(free.contains(&[800.0, 0.0, 1120.0, 240.0]));
-        assert!(!free.iter().any(|[x0, _, _, _]| *x0 < 800.0), "nothing over the top screen");
-    }
-
     use super::*;
-
-    /// the top screen takes its chosen shape, but the console's while a
-    /// video plays, which cannot be widened, and in menus on a 21:9 screen,
-    /// whose 3D shows what lies off the console's view there.
-    #[test]
-    fn the_top_screen_keeps_the_consoles_shape_for_videos_and_wide_menus() {
-        use settings::TopShape::*;
-        assert_eq!(top_width_shown(Wide16x9, false, true), Wide16x9.width(), "in play");
-        assert_eq!(top_width_shown(Wide16x9, true, true), 400.0, "a video");
-        assert_eq!(top_width_shown(Wide16x9, false, false), Wide16x9.width(), "16:9 menus stay wide");
-        assert_eq!(top_width_shown(Wide21x9, false, false), 400.0, "21:9 menus");
-        assert_eq!(top_width_shown(Wide21x9, true, false), 400.0, "a video in a 21:9 menu");
-        assert_eq!(top_width_shown(Wide21x9, false, true), Wide21x9.width(), "21:9 in play");
-        assert_eq!(top_width_shown(Console, false, true), 400.0, "the console's shape");
-    }
 
     /// a frame goes unshown only while the game runs behind with a
     /// presenter that waits for the display, a few in a row at most.

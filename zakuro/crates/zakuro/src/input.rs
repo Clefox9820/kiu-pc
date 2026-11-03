@@ -5,6 +5,7 @@ use zakuro_core::services::hid::{InputState, PadState};
 
 use zakuro_common::memory_map::{HOST_MAILBOX_LOOK, HOST_MAILBOX_LOOK_ACROSS, HOST_MAILBOX_LOOK_DOWN, HOST_MAILBOX_LOOK_MARK};
 
+use crate::kiu_play::{GAME_FLYING, GAME_ON_FOOT, IN_PLAY_QUIET};
 use crate::settings::Keys;
 
 /// accumulates key state between frames.
@@ -36,7 +37,7 @@ pub struct Keyboard {
     untaken: u8,
     /// the kind of play the game last said it was in, and frames since.
     game: Option<AimMode>,
-    quiet: u8,
+    quiet: u32,
     /// the left button, which fires (L) while aiming.
     fire: bool,
     /// Shift, which pushes the circle pad halfway, to walk.
@@ -85,15 +86,6 @@ pub const MOUSE_LOOK: u32 = u32::from_le_bytes(*b"MLK1");
 /// the same while flying with a game override that moves the reticle, "MAM1".
 pub const MOUSE_AIM: u32 = u32::from_le_bytes(*b"MAM1");
 
-/// the host mailbox's game mode word, HOST_MAILBOX_GAME_MODE, which game
-/// overrides set every tick to the kind of play going on, and the frontend
-/// reads and clears every frame.
-pub const GAME_ON_FOOT: u32 = 1;
-pub const GAME_FLYING: u32 = 2;
-
-/// frames with no word from the game before aim goes off, as in a menu. the
-/// overrides say it once per tick, every second frame for Kid Icarus.
-const QUIET_FRAMES: u8 = 10;
 
 /// the mouse moves the reticle or turns the camera straight, so slow movement
 /// is eased for small, precise corrections while a quick sweep still goes
@@ -171,7 +163,8 @@ impl Keyboard {
     }
 
     /// the aim mode to change to, when what the game says it is doing (a
-    /// GAME_ word, 0 for nothing this frame) has changed: on foot, flying,
+    /// kiu_play::GAME_ word, 0 for nothing this frame) has changed: on foot,
+    /// flying,
     /// or off once it has been quiet a while. a mode the player picked stands
     /// until the game changes.
     pub fn game_mode(&mut self, said: u32) -> Option<Option<AimMode>> {
@@ -187,8 +180,10 @@ impl Keyboard {
         if self.game.is_none() {
             return None;
         }
+        // no word from the game for as long as it takes to be out of play
+        // is a menu, where aim goes off
         self.quiet += 1;
-        (self.quiet > QUIET_FRAMES).then(|| {
+        (self.quiet > IN_PLAY_QUIET).then(|| {
             self.game = None;
             self.quiet = 0;
             None
@@ -565,7 +560,7 @@ mod tests {
         assert_eq!(keyboard.game_mode(0), None, "between ticks");
         assert_eq!(keyboard.game_mode(GAME_ON_FOOT), None, "already on foot, a key the player pressed stands");
         assert_eq!(keyboard.game_mode(GAME_FLYING), Some(Some(AimMode::Air)));
-        for _ in 0..QUIET_FRAMES {
+        for _ in 0..IN_PLAY_QUIET {
             assert_eq!(keyboard.game_mode(0), None);
         }
         assert_eq!(keyboard.game_mode(0), Some(None), "quiet for long, a menu: aim off");
