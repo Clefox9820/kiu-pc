@@ -350,4 +350,6 @@ Tools used to work on it:
 ## License
 
 MIT; see [LICENSE](LICENSE). `zakuro/` is Zakuro by fearkov, also MIT
-licensed (see `zakuro/LICENSE`), with changes made here.
+licensed (see `zakuro/LICENSE`), with changes made here. The work by others
+it carries (Zakuro, Anime4K, SMAA, AMD FSR 1) is credited in
+[NOTICE.md](NOTICE.md).
