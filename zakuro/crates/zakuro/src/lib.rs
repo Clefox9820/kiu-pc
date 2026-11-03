@@ -15,6 +15,7 @@ mod kiu_play;
 mod kiu_theme;
 mod library;
 mod menus;
+mod mouse_aim;
 mod present;
 mod recompile;
 mod report;
@@ -26,19 +27,19 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use winit::application::ApplicationHandler;
-use winit::event::{DeviceEvent, DeviceId, ElementState, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent};
+use winit::event::{DeviceEvent, DeviceId, ElementState, KeyEvent, MouseButton, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{KeyCode, PhysicalKey};
-use winit::window::{CursorGrabMode, Fullscreen, Window, WindowId};
+use winit::window::{Fullscreen, Window, WindowId};
 
 use zakuro_common::memory_map::{HOST_MAILBOX_GAME_MODE, HOST_MAILBOX_TOP_WIDENING};
 use zakuro_common::Screen;
-use zakuro_core::services::hid::PadState;
 use zakuro_core::{loader, Config, FrameOutcome, System};
 use zakuro_gpu::{layout, GpuScreen, Overlay, PresentError, RendererKind, ScreenImage};
 
 use gui::Gui;
-use input::{AimMode, Keyboard};
+use input::Keyboard;
+use mouse_aim::AimMode;
 use library::Library;
 use menus::{Action, Menus};
 use present::Backend;
@@ -538,12 +539,6 @@ fn window_title(port: bool, game: Option<(&str, &str)>) -> String {
     }
 }
 
-/// the mouse's raw movement as aim, at a speed, its vertical turned round
-/// when inverted.
-fn aim_delta(delta: (f64, f64), speed: f32, invert_y: bool) -> (f32, f32) {
-    let y = if invert_y { -delta.1 } else { delta.1 };
-    (delta.0 as f32 * speed, y as f32 * speed)
-}
 
 /// what the window losing the focus leaves to undo when it gets it back: a
 /// pause it made, and the mouse aim it let go of.
@@ -629,7 +624,7 @@ impl ApplicationHandler for App {
                 // a room's others keep playing, so it never pauses there
                 let pause = self.settings.pause_unfocused && self.game.is_some() && self.room.is_none();
                 // the aim in use, read before release() forgets it
-                self.away = leave(pause, self.paused, self.keyboard.aim_mode(), self.settings.recapture_mouse);
+                self.away = leave(pause, self.paused, self.keyboard.aim.mode(), self.settings.recapture_mouse);
                 self.paused |= self.away.paused;
                 self.fast_forward_key = false;
                 self.set_mouse_aim(None);
@@ -651,32 +646,18 @@ impl ApplicationHandler for App {
                 }
             }
             WindowEvent::KeyboardInput { event, .. } => self.key(event, consumed),
+            // mouse aim takes the buttons and the wheel while it has the pointer
+            ref aimed if self.mouse_aim_event(aimed) => {}
             WindowEvent::MouseInput { state, button, .. } => {
-                if button == MouseButton::Left && self.keyboard.aiming() {
-                    self.keyboard.fire(state == ElementState::Pressed);
-                } else if button == MouseButton::Left {
+                if button == MouseButton::Left {
                     self.mouse_down = state == ElementState::Pressed && !self.pointer_taken(consumed);
                     self.touch();
                 }
-                // while aiming the middle button uses the power, as the D-pad's down does
-                if button == MouseButton::Middle {
-                    self.keyboard.mouse_button(PadState::DOWN, state == ElementState::Pressed);
-                }
-                if button == MouseButton::Right && self.keyboard.aiming() {
-                    self.keyboard.stylus(state == ElementState::Pressed);
-                } else if button == MouseButton::Right {
+                if button == MouseButton::Right {
                     let pressed = state == ElementState::Pressed && !self.pointer_taken(consumed);
                     self.tilting_from = pressed.then_some(self.cursor);
                     self.tilt();
                 }
-            }
-            // while aiming the wheel steps through powers, the D-pad's left and right
-            WindowEvent::MouseWheel { delta, .. } => {
-                let up = match delta {
-                    MouseScrollDelta::LineDelta(_, y) => y > 0.0,
-                    MouseScrollDelta::PixelDelta(position) => position.y > 0.0,
-                };
-                self.keyboard.wheel(if up { PadState::LEFT } else { PadState::RIGHT });
             }
             WindowEvent::CursorMoved { position, .. } => {
                 self.cursor = (position.x as f32, position.y as f32);
@@ -689,15 +670,7 @@ impl ApplicationHandler for App {
     }
 
     fn device_event(&mut self, _event_loop: &ActiveEventLoop, _device: DeviceId, event: DeviceEvent) {
-        // raw movement, which keeps coming with the pointer locked in place
-        if let DeviceEvent::MouseMotion { delta } = event {
-            let speed = match self.keyboard.aim_mode() {
-                Some(AimMode::Air) => self.settings.air_aim_speed,
-                _ => self.settings.land_aim_speed,
-            };
-            let (x, y) = aim_delta(delta, speed, self.settings.invert_aim_y);
-            self.keyboard.aim_by(x, y);
-        }
+        self.mouse_aim_device_event(&event);
     }
 
     fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
@@ -863,7 +836,7 @@ impl App {
         self.link_room();
         self.menus.menu_open = false;
         self.keyboard.release();
-        self.keyboard.forget_game_mode();
+        self.keyboard.aim.forget_game_mode();
         self.paused = false;
         self.next_frame = Instant::now();
         // ZAKURO_LOAD_SLOT=<1-9> goes straight on from that slot's state, for
@@ -889,7 +862,7 @@ impl App {
         }
         self.menus.menu_open = false;
         self.keyboard.release();
-        self.keyboard.forget_game_mode();
+        self.keyboard.aim.forget_game_mode();
     }
 
     fn key(&mut self, event: KeyEvent, consumed: bool) {
@@ -941,16 +914,7 @@ impl App {
                 }
                 KeyCode::F11 => self.toggle_fullscreen(),
                 // mouse aim: 1 off, for menus, 2 for flying, 3 on foot
-                KeyCode::Digit1 | KeyCode::Digit2 | KeyCode::Digit3
-                    if self.game.is_some() && !self.menus.menu_open && !self.settings.keys.binds(code) =>
-                {
-                    let mode = match code {
-                        KeyCode::Digit2 => Some(AimMode::Air),
-                        KeyCode::Digit3 => Some(AimMode::Land),
-                        _ => None,
-                    };
-                    self.pick_aim(mode);
-                }
+                _ if self.mouse_aim_key(code) => {}
                 KeyCode::F5 if self.game.is_some() => self.save_state(),
                 KeyCode::F8 if self.game.is_some() => self.load_state(),
                 _ => {}
@@ -990,7 +954,7 @@ impl App {
         self.menus.settings_open = false;
         self.set_mouse_aim(None);
         self.keyboard.release();
-        self.keyboard.forget_game_mode();
+        self.keyboard.aim.forget_game_mode();
     }
 
     /// whether the pointer is busy with something other than the game.
@@ -998,31 +962,6 @@ impl App {
         consumed || self.game.is_none() || self.menus.menu_open || self.gui.as_ref().is_some_and(Gui::wants_pointer)
     }
 
-    /// changes the mouse aim mode and says so.
-    fn pick_aim(&mut self, mode: Option<AimMode>) {
-        self.set_mouse_aim(mode);
-        let said = match mode {
-            Some(AimMode::Air) => "Mouse aim: flying",
-            Some(AimMode::Land) => "Mouse aim: on foot",
-            None => "Mouse aim off",
-        };
-        self.menus.toast = Some((said.to_owned(), Instant::now()));
-    }
-
-    /// mouse aim: the mouse drags the stylus with the pointer hidden and held
-    /// in the window, the left button fires.
-    fn set_mouse_aim(&mut self, mode: Option<AimMode>) {
-        let on = mode.is_some();
-        self.keyboard.set_aim(mode);
-        if let Some(window) = &self.window {
-            let grab = if on { CursorGrabMode::Locked } else { CursorGrabMode::None };
-            // Windows has no locked mode, confined does there
-            if window.set_cursor_grab(grab).is_err() && on {
-                let _ = window.set_cursor_grab(CursorGrabMode::Confined);
-            }
-            window.set_cursor_visible(!on);
-        }
-    }
 
     /// touches the bottom screen while the button is down over it.
     fn touch(&mut self) {
@@ -1550,7 +1489,7 @@ impl App {
         // see kiu_play::GAME_ON_FOOT; not while the window or a menu has it
         let said = self.game.as_mut().map_or(0, |game| std::mem::take(&mut game.system.memory.host_mailbox[HOST_MAILBOX_GAME_MODE]));
         if self.focused && !self.menus.menu_open {
-            if let Some(mode) = self.keyboard.game_mode(said) {
+            if let Some(mode) = self.keyboard.aim.game_mode(said) {
                 self.pick_aim(mode);
             }
         }
@@ -1572,14 +1511,14 @@ impl App {
             Some(replay) => replay.input(game.frame),
             None => self.gamepads.apply(self.keyboard.state()),
         };
-        self.keyboard.frame_done();
+        self.keyboard.aim.frame_done();
         game.frame += 1;
         if let Some(recorder) = &mut game.recorder {
             recorder.record(input);
         }
         game.system.set_input(input);
         // mouse look on foot, for a game override to take, see input::MOUSE_LOOK
-        self.keyboard.feed_mailbox(&mut game.system.memory.host_mailbox);
+        self.keyboard.aim.feed_mailbox(&mut game.system.memory.host_mailbox);
         // how much wider than the console's the top screen shows, for a game
         // override to draw a wider scene into the same 400x240: the console's
         // own shape while a video plays and in 21:9 menus
@@ -1866,11 +1805,7 @@ impl App {
                 kiu_play::free_regions(size.width as f32, size.height as f32, &[top, bottom].into_iter().flatten().collect::<Vec<_>>())
             })
             .unwrap_or_default();
-        let aim = match self.keyboard.aim_mode() {
-            Some(AimMode::Air) => "2",
-            Some(AimMode::Land) => "3",
-            None => "1",
-        };
+        let aim = AimMode::digit(self.keyboard.aim.mode());
         let warming = self.game.as_ref().and(warm::progress());
         let corner = self.overlay_corner.clone().filter(|_| game.is_some());
         let (menus, library, settings, jobs) = (&mut self.menus, &self.library, &mut self.settings, &self.jobs);
@@ -2060,11 +1995,6 @@ mod tests {
         assert_eq!(window_title(false, None), "Zakuro");
     }
 
-    #[test]
-    fn inverted_aim_turns_only_the_vertical_round() {
-        assert_eq!(aim_delta((4.0, 2.0), 1.5, false), (6.0, 3.0));
-        assert_eq!(aim_delta((4.0, 2.0), 1.5, true), (6.0, -3.0));
-    }
 
     #[test]
     fn leaving_the_window_pauses_and_keeps_the_aim_as_the_settings_say() {

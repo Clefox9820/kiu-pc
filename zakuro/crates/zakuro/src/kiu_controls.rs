@@ -5,6 +5,7 @@ use egui::{Color32, Vec2};
 
 use crate::kiu_theme::{corner_vines, heavy_title, INK, ORANGE, PAPER, PAPER_LINE, PAPER_SHADOW, RED, SHADOW, SHADOW_OFFSET};
 use crate::menus::key_name;
+use crate::mouse_aim::AimMode;
 use crate::settings::Keys;
 
 /// a line of the controls: the keys, each drawn as a cap, and what they do.
@@ -31,7 +32,7 @@ fn controls_sections(k: &Keys) -> Vec<(&'static str, Vec<ControlRow>)> {
             row(vec![n(k.down), text("Middle click")], "Use it"),
         ]),
         ("AIM", vec![
-            row(vec![text("1"), text("2"), text("3")], "Off, air, land"),
+            row(AimMode::BY_DIGIT.map(|mode| text(AimMode::digit(mode))).to_vec(), "Off, air, land"),
             row(vec![text("Mouse")], "Turns the camera on land"),
             row(vec![text("Right click")], "Hold to drag the stylus on land"),
         ]),
