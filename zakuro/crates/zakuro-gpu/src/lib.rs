@@ -5,6 +5,7 @@ pub mod backend;
 pub mod blend;
 #[cfg(feature = "vulkan")]
 mod device;
+mod env;
 mod pattern;
 pub mod proctex;
 pub mod fog;
@@ -399,8 +400,8 @@ impl Gpu {
         // screen before it goes out, unless they went under its subtitles
         let top = [self.framebuffers[0].address_a_left, self.framebuffers[0].address_b_left].contains(&output_paddr);
         if raster::portraits_on() && top {
-            self.resources.portraits.top_source = Some(input_paddr);
-            if !std::mem::take(&mut self.resources.portraits.flushed) {
+            self.resources.kiu.top_source = Some(input_paddr);
+            if !std::mem::take(&mut self.resources.kiu.flushed) {
                 raster::flush_portraits(memory, &mut self.resources);
             }
         }
@@ -774,15 +775,16 @@ impl Gpu {
     /// portraits are dialogue that ZAKURO_PORTRAITS puts on the top screen;
     /// out of play, in menus, pictures of their kind are not taken.
     pub fn set_in_play(&mut self, on: bool) {
-        self.resources.portraits.in_play = on;
+        self.resources.kiu.in_play = on;
     }
 
     /// says how many times wider than the console's the top screen shows,
     /// so that its HUD's 2D draws keep their proportions; 1 for as it is.
+    /// the frontend says it before each of the title's frames, which then
+    /// starts its HUD's pieces afresh.
     pub fn set_top_widening(&mut self, factor: f32) {
-        self.resources.top_widening = factor;
-        // a new frame, whose pieces start afresh
-        self.resources.hud_edges.clear();
+        self.resources.kiu.widening = factor;
+        self.resources.kiu.start_frame();
     }
 
     /// says which screens the window shows now, the top one and the bottom
