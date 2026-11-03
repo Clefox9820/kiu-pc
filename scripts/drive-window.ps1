@@ -1,21 +1,41 @@
+<#
+.SYNOPSIS
+Drives a test game window for unattended checks.
+
+.DESCRIPTION
+Keys and clicks are posted to the window, so they work without the focus.
+The steps that send real input (rclick, mouse, lmb) first check that the
+window is what lies under that point: real input lands on whatever is on
+top, which could be a prompt the user must answer themselves. A shot copies
+the window's client area from the screen, and only when the window is
+whole on the screen and nothing covers it.
+
+.PARAMETER ProcessId
+The test game's process id; only its window is driven or captured.
+
+.PARAMETER Steps
+Steps separated by ';':
+  key:<Keys name or 0xVK> [ms]   holds a key (default 120 ms)
+  click:<x>,<y>                  touches at window client pixels
+  rclick:<x>,<y>                 real cursor click there, for the emulator's
+                                 menus, which ignore posted clicks
+  mouse:<dx>,<dy>,<count>        real relative mouse motion, for mouse aim
+  lmb:down | lmb:up              real left button, which fires while aiming
+  front                          brings the window in front, for mouse and lmb
+  shot:<file.png>                captures the window's client area; a
+                                 relative path is from the current folder
+  wait:<ms>
+
+.EXAMPLE
+scripts\drive-window.ps1 -ProcessId 1234 -Steps "click:200,380;wait:3000;shot:C:\tmp\menu.png"
+#>
 param(
-    # the test game's process id; only its window is driven or captured
     [Parameter(Mandatory)][int]$ProcessId,
-    # steps separated by ';':
-    #   key:<Keys name or 0xVK> [ms]   holds a key (default 120 ms)
-    #   click:<x>,<y>                  touches at window client pixels
-    #   rclick:<x>,<y>                 real cursor click there, for the emulator's
-    #                                  menus, which ignore posted clicks
-    #   mouse:<dx>,<dy>,<count>        real relative mouse motion, for mouse aim
-    #   lmb:down | lmb:up              real left button, which fires while aiming
-    #   front                          brings the window in front, for mouse and lmb
-    #   shot:<file.png>                captures the window's client area
-    #   wait:<ms>
     [Parameter(Mandatory)][string]$Steps
 )
-# Drives a test game window for unattended checks. Keys and clicks are
-# posted to the window, so they work without the focus. Example:
-#   scripts\drive-window.ps1 -ProcessId 1234 -Steps "click:200,380;wait:3000;shot:C:\tmp\menu.png"
+
+$ErrorActionPreference = 'Stop'
+
 Add-Type -AssemblyName System.Drawing, System.Windows.Forms
 Add-Type @"
 using System;
@@ -33,6 +53,7 @@ public static class Drv {
     [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr h, int cmd);
     [DllImport("user32.dll")] public static extern bool IsIconic(IntPtr h);
     [DllImport("user32.dll")] public static extern bool SetCursorPos(int x, int y);
+    [DllImport("user32.dll")] public static extern bool GetCursorPos(out POINT p);
     [DllImport("user32.dll")] public static extern void mouse_event(uint flags, int dx, int dy, uint data, UIntPtr extra);
     [DllImport("kernel32.dll")] public static extern uint SetThreadExecutionState(uint f);
 }
@@ -56,7 +77,24 @@ function Click([int]$x, [int]$y) {
     [void][Drv]::PostMessage($h, 0x202, [IntPtr]0, $at)
 }
 
+# Real input lands on whatever is on top at that screen point, which could
+# be a security prompt the user must answer themselves.
+function Assert-Uncovered($p, [string]$doing) {
+    if ([Drv]::GetAncestor([Drv]::WindowFromPoint($p), 2) -ne $h) {
+        throw "the window is covered at $($p.X),$($p.Y); not $doing"
+    }
+}
+
+function Assert-UnderCursor([string]$doing) {
+    $p = New-Object Drv+POINT
+    if (-not [Drv]::GetCursorPos([ref]$p)) { throw "cannot read the cursor position; not $doing" }
+    Assert-Uncovered $p $doing
+}
+
 function Shot([string]$out) {
+    # Bitmap.Save resolves a relative path against .NET's current folder,
+    # which is not PowerShell's
+    $out = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($out)
     # with the display asleep nothing is composed and every shot comes out
     # white; this resets the display's idle timer so it turns on
     [void][Drv]::SetThreadExecutionState(3)
@@ -80,14 +118,15 @@ function Shot([string]$out) {
         foreach ($fy in 0.02, 0.25, 0.5, 0.75, 0.98) {
             $pt = New-Object Drv+POINT
             $pt.X = $o.X + [int]($w * $fx); $pt.Y = $o.Y + [int]($hh * $fy)
-            if ([Drv]::GetAncestor([Drv]::WindowFromPoint($pt), 2) -ne $h) {
-                throw "the window is covered at $($pt.X),$($pt.Y); not capturing"
-            }
+            Assert-Uncovered $pt "capturing"
         }
     }
     $bmp = New-Object System.Drawing.Bitmap $w, $hh
-    [System.Drawing.Graphics]::FromImage($bmp).CopyFromScreen($o.X, $o.Y, 0, 0, $bmp.Size)
-    $bmp.Save($out, [System.Drawing.Imaging.ImageFormat]::Png)
+    try {
+        $g = [System.Drawing.Graphics]::FromImage($bmp)
+        try { $g.CopyFromScreen($o.X, $o.Y, 0, 0, $bmp.Size) } finally { $g.Dispose() }
+        $bmp.Save($out, [System.Drawing.Imaging.ImageFormat]::Png)
+    } finally { $bmp.Dispose() }
     "shot $out ${w}x${hh}"
 }
 
@@ -104,11 +143,7 @@ foreach ($step in $Steps -split ';') {
             $x, $y = $arg -split ','
             $p = New-Object Drv+POINT; $p.X = [int]$x; $p.Y = [int]$y
             [void][Drv]::ClientToScreen($h, [ref]$p)
-            # a real click lands on whatever is on top, which could be a
-            # security prompt the user must answer themselves
-            if ([Drv]::GetAncestor([Drv]::WindowFromPoint($p), 2) -ne $h) {
-                throw "the window is covered at $($p.X),$($p.Y); not clicking"
-            }
+            Assert-Uncovered $p "clicking"
             [void][Drv]::SetCursorPos($p.X, $p.Y); Start-Sleep -Milliseconds 80
             [Drv]::mouse_event(2, 0, 0, 0, [UIntPtr]::Zero); Start-Sleep -Milliseconds 80
             [Drv]::mouse_event(4, 0, 0, 0, [UIntPtr]::Zero)
@@ -116,9 +151,14 @@ foreach ($step in $Steps -split ';') {
         # raw input needs the window in front, which a shot step puts there
         'mouse' {
             $dx, $dy, $n = $arg -split ','
+            Assert-UnderCursor "moving the mouse"
             for ($i = 0; $i -lt [int]$n; $i++) { [Drv]::mouse_event(1, [int]$dx, [int]$dy, 0, [UIntPtr]::Zero); Start-Sleep -Milliseconds 16 }
         }
-        'lmb' { [Drv]::mouse_event($(if ($arg -eq 'down') { 2 } else { 4 }), 0, 0, 0, [UIntPtr]::Zero) }
+        'lmb' {
+            # a release is always sent, so a covered window never keeps it held
+            if ($arg -eq 'down') { Assert-UnderCursor "pressing the button" }
+            [Drv]::mouse_event($(if ($arg -eq 'down') { 2 } else { 4 }), 0, 0, 0, [UIntPtr]::Zero)
+        }
         'front' { [void][Drv]::SetThreadExecutionState(3); [void][Drv]::SetForegroundWindow($h); Start-Sleep -Milliseconds 300 }
         'shot' { Shot $arg }
         'wait' { Start-Sleep -Milliseconds ([int]$arg) }
