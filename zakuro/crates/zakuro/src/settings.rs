@@ -153,6 +153,11 @@ impl Latency {
     }
 }
 
+/// the speeds the settings offer for mouse aim, flying and on foot, see
+/// Settings::air_aim_speed.
+pub const AIR_AIM_SPEEDS: std::ops::RangeInclusive<f32> = 0.1..=3.0;
+pub const LAND_AIM_SPEEDS: std::ops::RangeInclusive<f32> = 0.1..=5.0;
+
 /// the top screen's shape. a game draws into 400x240 whatever this is, so
 /// anything but the console's own only looks right with a widescreen code
 /// on, which makes the game draw a wider scene into those pixels.

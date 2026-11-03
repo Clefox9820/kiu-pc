@@ -17,7 +17,7 @@ impl Gui {
     pub fn new(window: &Window) -> Gui {
         let ctx = egui::Context::default();
         ctx.set_fonts(fonts(system_fonts()));
-        crate::kiu_options::parchment(&ctx);
+        crate::kiu_theme::parchment(&ctx);
         let state = egui_winit::State::new(
             ctx.clone(),
             ViewportId::ROOT,

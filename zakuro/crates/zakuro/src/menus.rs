@@ -11,7 +11,7 @@ use zakuro_core::services::keyboard::Request;
 use crate::library::{Library, ICON_SIZE};
 use crate::recompile::{Job, Stage};
 use crate::gamepad::button_name;
-use crate::settings::{CameraSource, Filter, Keys, Language, Latency, PadButtons, Renderer, Screens, Settings, Stereo3d, TopShape};
+use crate::settings::{CameraSource, Filter, Keys, Language, Latency, PadButtons, Renderer, Screens, Settings, Stereo3d, TopShape, AIR_AIM_SPEEDS, LAND_AIM_SPEEDS};
 
 /// what the user asked for.
 #[derive(Debug, Clone, PartialEq)]
@@ -73,8 +73,6 @@ pub struct Menus {
     pub settings_open: bool,
     /// the sound output devices, looked up the first time settings show.
     sound_devices: Option<Vec<String>>,
-    /// Kid Icarus' own options, over the menu of the running game.
-    pub options_open: bool,
     /// the binding waiting for a key, by its place in Keys::all_mut.
     pub rebinding: Option<usize>,
     /// the controller binding waiting for a button, by its place in
@@ -406,8 +404,8 @@ impl Menus {
                 });
             });
         }
-        // the options take the menu's place while open
-        if !self.menu_open || self.options_open {
+        // the settings take the menu's place while open
+        if !self.menu_open || self.settings_open {
             return actions;
         }
         egui::Window::new("Paused")
@@ -418,7 +416,7 @@ impl Menus {
             .default_width(0.0)
             .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
             .show(&ctx, |ui| {
-                crate::kiu_options::title(ui, "PAUSED");
+                crate::kiu_theme::title(ui, "PAUSED");
                 ui.label(RichText::new(name).strong());
                 ui.label(RichText::new(if recompiled { "running its recompiled code" } else { "interpreted" }).weak());
                 ui.add_space(6.0);
@@ -427,7 +425,7 @@ impl Menus {
                     actions.push(Action::Resume);
                 }
                 if wide(ui, "Options") {
-                    self.options_open = true;
+                    self.settings_open = true;
                 }
                 if wide(ui, "Reset") {
                     actions.push(Action::Reset);
@@ -453,7 +451,7 @@ impl Menus {
                     }
                 });
                 ui.add_space(4.0);
-                // the settings are reached through the options, which hold the ones a player wants
+                // the settings are reached through the options above
                 if wide(ui, "Cheats") {
                     self.cheats_open = true;
                 }
@@ -802,8 +800,15 @@ impl Menus {
                 ui.separator();
                 ui.heading("Interface");
                 ui.checkbox(&mut settings.show_fps, "Show the frame rate");
-                if CONTROLS_HINT_ENABLED {
+                if crate::kiu_controls::CONTROLS_HINT_ENABLED {
                     ui.checkbox(&mut settings.show_controls, "Show the controls beside the screens");
+                }
+                ui.checkbox(&mut settings.pause_unfocused, "Pause in the background")
+                    .on_hover_text("The game stops while another window is in front, and goes on when this one is back. Never in a multiplayer room.");
+                ui.checkbox(&mut settings.discord_presence, "Discord status")
+                    .on_hover_text("Shows on your Discord profile whether you are in the menus, on foot or flying, the chapter, and for how long. Needs the Discord app open on this computer.");
+                if ui.button("Fullscreen").on_hover_text("F11 does it too.").clicked() {
+                    actions.push(Action::Fullscreen);
                 }
                 ui.horizontal(|ui| {
                     ui.label("Library background");
@@ -846,8 +851,14 @@ impl Menus {
                     self.rebinding = None;
                 }
                 ui.label(RichText::new("Drag with the right mouse button to tilt the console, for games that use the motion sensors.").weak());
-                ui.add(egui::Slider::new(&mut settings.air_aim_speed, 0.1..=3.0).text("Mouse aim speed, flying (2)"));
-                ui.add(egui::Slider::new(&mut settings.land_aim_speed, 0.1..=5.0).text("Mouse aim speed, on foot (3)"));
+                ui.add(egui::Slider::new(&mut settings.air_aim_speed, AIR_AIM_SPEEDS).text("Mouse aim speed, flying (2)"))
+                    .on_hover_text("How far the aim moves for the mouse's movement, with mouse aim 2.");
+                ui.add(egui::Slider::new(&mut settings.land_aim_speed, LAND_AIM_SPEEDS).text("Mouse aim speed, on foot (3)"))
+                    .on_hover_text("How fast the camera turns for the mouse's movement, with mouse aim 3.");
+                ui.checkbox(&mut settings.invert_aim_y, "Invert mouse aim up and down")
+                    .on_hover_text("The aim goes up when the mouse goes down, as in flight games.");
+                ui.checkbox(&mut settings.recapture_mouse, "Take the mouse back")
+                    .on_hover_text("Coming back to the window brings back the mouse aim it had, 2 or 3, without pressing it again.");
 
                 ui.separator();
                 ui.heading("Controller");
@@ -1004,336 +1015,6 @@ fn progress(ui: &mut egui::Ui, job: &Job) {
 }
 
 /// a key as a person would call it.
-/// a line of the controls: the keys, each drawn as a cap, and what they do.
-struct ControlRow {
-    keys: Vec<String>,
-    does: &'static str,
-}
-
-/// the keyboard and mouse controls in sections, for Kid Icarus Uprising,
-/// whose port this is, from the keys bound now.
-fn controls_sections(k: &Keys) -> Vec<(&'static str, Vec<ControlRow>)> {
-    let row = |keys: Vec<String>, does| ControlRow { keys, does };
-    let n = key_name;
-    let text = |name: &str| name.to_owned();
-    vec![
-        ("MOVE", vec![
-            row(vec![n(k.circle_up), n(k.circle_left), n(k.circle_down), n(k.circle_right)], "Move, twice to dash"),
-            row(vec![text("Shift")], "Walk"),
-            row(vec![n(k.r)], "Reset camera"),
-        ]),
-        ("ATTACK", vec![row(vec![n(k.l), text("Left click")], "Fire, hold for more")]),
-        ("POWERS", vec![
-            row(vec![n(k.left), n(k.right), text("Wheel")], "Pick a power"),
-            row(vec![n(k.down), text("Middle click")], "Use it"),
-        ]),
-        ("AIM", vec![
-            row(vec![text("1"), text("2"), text("3")], "Off, air, land"),
-            row(vec![text("Mouse")], "Turns the camera on land"),
-            row(vec![text("Right click")], "Hold to drag the stylus on land"),
-        ]),
-        ("MENUS", vec![
-            row(vec![n(k.a), n(k.b)], "A, B"),
-            row(vec![n(k.x), n(k.y)], "X, Y"),
-            row(vec![n(k.start), n(k.select)], "Start, Select"),
-            row(vec![n(k.up)], "D-pad up"),
-            row(vec![text("Esc")], "Emulator menu"),
-        ]),
-    ]
-}
-
-/// Kid Icarus' menu colours: black ink on parchment, a red banner for what
-/// matters most and a magenta to cyan flourish under titles.
-pub(crate) const PAPER: Color32 = Color32::from_rgb(243, 235, 221);
-pub(crate) const PAPER_LINE: Color32 = Color32::from_rgb(234, 224, 207);
-pub(crate) const PAPER_SHADOW: Color32 = Color32::from_rgb(196, 183, 162);
-pub(crate) const INK: Color32 = Color32::from_rgb(26, 20, 18);
-pub(crate) const RED: Color32 = Color32::from_rgb(222, 32, 36);
-pub(crate) const ORANGE: Color32 = Color32::from_rgb(250, 164, 40);
-const MAGENTA: Color32 = Color32::from_rgb(232, 64, 196);
-const BLUE: Color32 = Color32::from_rgb(84, 110, 240);
-const CYAN: Color32 = Color32::from_rgb(64, 216, 232);
-pub(crate) const SHADOW: Color32 = Color32::from_black_alpha(110);
-
-/// `a` turned toward `b` by `t`, from 0 to 1.
-fn mix(a: Color32, b: Color32, t: f32) -> Color32 {
-    let m = |x: u8, y: u8| (x as f32 + (y as f32 - x as f32) * t).round() as u8;
-    Color32::from_rgb(m(a.r(), b.r()), m(a.g(), b.g()), m(a.b(), b.b()))
-}
-
-/// the flourish's colour at `t` across it: magenta, then blue, then cyan.
-fn rainbow(t: f32) -> Color32 {
-    if t < 0.5 { mix(MAGENTA, BLUE, t * 2.0) } else { mix(BLUE, CYAN, t * 2.0 - 1.0) }
-}
-
-/// a leaf: a lozenge from `base`, `length` long toward `dir`.
-fn leaf(painter: &egui::Painter, base: egui::Pos2, dir: Vec2, length: f32) {
-    let side = Vec2::new(-dir.y, dir.x) * length * 0.28;
-    let middle = base + dir * length * 0.5;
-    painter.add(egui::Shape::convex_polygon(vec![base, middle + side, base + dir * length, middle - side], INK, egui::Stroke::NONE));
-}
-
-/// a black vine curling out of a corner, as on the game's parchment menus:
-/// it grows from `at` along `along` and curls toward `inward`.
-pub(crate) fn vine(painter: &egui::Painter, at: egui::Pos2, along: Vec2, inward: Vec2, size: f32) {
-    // turning from `along` to `inward` is clockwise on screen when this is 1
-    let turn = along.x * inward.y - along.y * inward.x;
-    let width = size * 0.06;
-    // a spiral round `centre`, starting `radius` out toward `from` and
-    // winding in by `turn`; gives where it starts
-    let spiral = |centre: egui::Pos2, from: Vec2, radius: f32, turn: f32, width: f32| {
-        let start = from.y.atan2(from.x);
-        let points: Vec<_> = (0..=40)
-            .map(|i| {
-                let t = i as f32 / 40.0;
-                let angle = start + turn * t * std::f32::consts::TAU * 1.3;
-                centre + Vec2::new(angle.cos(), angle.sin()) * radius * (1.0 - 0.75 * t)
-            })
-            .collect();
-        painter.add(egui::Shape::line(points, egui::Stroke::new(width, INK)));
-        centre + from * radius
-    };
-    let stem = |from: egui::Pos2, to: egui::Pos2, bow: Vec2, width: f32| {
-        let points = [from, from + (to - from) * 0.4 + bow, to - (to - from) * 0.2 + bow, to];
-        painter.add(egui::epaint::CubicBezierShape::from_points_stroke(points, false, Color32::TRANSPARENT, egui::Stroke::new(width, INK)));
-    };
-    // the long arm along the edge, ending in a curl that turns inward
-    let curl = spiral(at + along * size * 0.95 + inward * size * 0.26, -inward, size * 0.26, turn, width);
-    stem(at, curl, inward * size * 0.06, width);
-    // a shorter arm down the side, curling the other way
-    let side = spiral(at + inward * size * 0.7 + along * size * 0.2, -along, size * 0.18, -turn, width * 0.8);
-    stem(at, side, along * size * 0.05, width * 0.8);
-    for (k, a, i) in [(0.35, 0.6, 0.8), (0.6, 0.9, -0.2), (0.2, 0.3, 1.0)] {
-        leaf(painter, at + along * size * k + inward * size * 0.03, (along * a + inward * i).normalized(), size * 0.26);
-    }
-    leaf(painter, at + inward * size * 0.35, (along * 0.9 + inward * 0.4).normalized(), size * 0.22);
-}
-
-/// a small heart, the game's coin, centred on `at`.
-fn heart(painter: &egui::Painter, at: egui::Pos2, size: f32) {
-    use egui::pos2;
-    painter.circle_filled(pos2(at.x - size * 0.5, at.y - size * 0.25), size * 0.56, RED);
-    painter.circle_filled(pos2(at.x + size * 0.5, at.y - size * 0.25), size * 0.56, RED);
-    let points = vec![pos2(at.x - size * 1.04, at.y - size * 0.1), pos2(at.x + size * 1.04, at.y - size * 0.1), pos2(at.x, at.y + size * 1.1)];
-    painter.add(egui::Shape::convex_polygon(points, RED, egui::Stroke::NONE));
-}
-
-/// a title as the game's menus draw it, centred on `middle` from `top`: heavy
-/// ink with a white edge, over a ribbon thick in the middle and thin at the
-/// ends, magenta to cyan, curling at both ends round a heart. gives the
-/// ribbon's height.
-pub(crate) fn heavy_title(painter: &egui::Painter, text: &str, middle: f32, top: f32, scale: f32) -> f32 {
-    use egui::{pos2, vec2, FontId, Stroke};
-    let unit = |v: f32| v * scale;
-    let layout = |color| painter.layout_no_wrap(text.to_owned(), FontId::proportional(unit(19.0)), color);
-    let (title, edge) = (layout(INK), layout(Color32::WHITE));
-    // a white edge, then the ink twice a hair apart
-    let title_at = pos2(middle - title.size().x / 2.0, top);
-    for (dx, dy) in [(-1.0, -1.0), (0.0, -1.0), (1.0, -1.0), (-1.0, 0.0), (1.6, 0.0), (-1.0, 1.0), (0.0, 1.0), (1.6, 1.0)] {
-        painter.galley(title_at + vec2(unit(dx * 1.4), unit(dy * 1.4)), edge.clone(), Color32::WHITE);
-    }
-    painter.galley(title_at, title.clone(), INK);
-    painter.galley(title_at + vec2(unit(0.7), 0.0), title.clone(), INK);
-    let y = top + title.size().y + unit(7.0);
-
-    let half = title.size().x / 2.0 + unit(26.0);
-    let steps = 48;
-    for step in 0..steps {
-        let (t0, t1) = (step as f32 / steps as f32, (step + 1) as f32 / steps as f32);
-        let (x0, x1) = (middle - half + 2.0 * half * t0, middle - half + 2.0 * half * t1);
-        // a gap for the heart
-        if ((x0 + x1) / 2.0 - middle).abs() < unit(9.0) {
-            continue;
-        }
-        let swell = 1.0 - (t0 + t1 - 1.0).abs();
-        painter.line_segment([pos2(x0, y), pos2(x1, y)], Stroke::new(unit(0.8 + 2.4 * swell), rainbow((t0 + t1) / 2.0)));
-    }
-    for (end, side, color) in [(middle - half, -1.0, MAGENTA), (middle + half, 1.0, CYAN)] {
-        let up = [pos2(end, y), pos2(end + side * unit(9.0), y), pos2(end + side * unit(9.0), y - unit(7.0)), pos2(end + side * unit(3.0), y - unit(6.0))];
-        let down = [pos2(end, y), pos2(end + side * unit(6.0), y), pos2(end + side * unit(6.0), y + unit(5.0)), pos2(end + side * unit(2.0), y + unit(4.0))];
-        for points in [up, down] {
-            painter.add(egui::epaint::CubicBezierShape::from_points_stroke(points, false, Color32::TRANSPARENT, Stroke::new(unit(1.2), color)));
-        }
-    }
-    heart(painter, pos2(middle, y), unit(4.5));
-    y
-}
-
-/// lays the controls panel out at a scale, its sections in columns, painting
-/// it at `at` when given, and says how big it is. it is drawn as the game's
-/// own menus are: ink on parchment with vines in the corners, a heavy title
-/// over a rainbow flourish, headings on slanted black plates, keys as white
-/// pills and a black strip of advice at the foot.
-fn controls_panel(
-    painter: &egui::Painter,
-    columns: &[&[(&str, Vec<ControlRow>)]],
-    scale: f32,
-    at: Option<egui::Pos2>,
-    active: &str,
-) -> Vec2 {
-    use egui::{pos2, vec2, CornerRadius, FontId, Rect, Shape, Stroke, StrokeKind};
-    const TIP: &str = "The aim in use is lit in red";
-    let unit = |v: f32| v * scale;
-    let (pad, cap_h, cap_pad, gap, row_gap, section_gap, column_gap) =
-        (unit(14.0), unit(19.0), unit(7.0), unit(4.0), unit(5.0), unit(10.0), unit(22.0));
-    let (plate_pad, slant, footer_h) = (unit(7.0), unit(4.0), unit(20.0));
-    let layout = |text: &str, size: f32, color| painter.layout_no_wrap(text.to_owned(), FontId::proportional(unit(size)), color);
-    let title = layout("CONTROLS", 19.0, INK);
-    let tip = layout(TIP, 11.0, Color32::WHITE);
-    let plate = |name: &str| layout(name, 10.0, Color32::WHITE).size() + vec2(2.0 * plate_pad + slant, unit(4.0));
-    let plate_h = plate("MOVE").y;
-    let row_width = |row: &ControlRow| {
-        let caps: f32 = row.keys.iter().map(|key| layout(key, 11.0, INK).size().x + 2.0 * cap_pad + gap).sum();
-        caps + unit(6.0) + layout(row.does, 12.0, INK).size().x
-    };
-    let column_size = |sections: &[(&str, Vec<ControlRow>)]| {
-        let rows_width = sections.iter().flat_map(|(_, rows)| rows).map(row_width).fold(0.0, f32::max);
-        let width = sections.iter().map(|(name, _)| plate(name).x).fold(rows_width, f32::max);
-        let rows = sections.iter().map(|(_, rows)| rows.len()).sum::<usize>() as f32;
-        let height = sections.len() as f32 * (plate_h + unit(5.0))
-            + rows * (cap_h + row_gap)
-            + (sections.len() as f32 - 1.0).max(0.0) * section_gap;
-        vec2(width, height)
-    };
-    let sizes: Vec<Vec2> = columns.iter().map(|column| column_size(column)).collect();
-    let body = vec2(
-        sizes.iter().map(|size| size.x).sum::<f32>() + column_gap * (sizes.len() as f32 - 1.0),
-        sizes.iter().map(|size| size.y).fold(0.0, f32::max),
-    );
-    // room beside the title for the vines in the corners
-    let inner_width = body.x.max(title.size().x + unit(100.0)).max(tip.size().x + unit(16.0));
-    let width = inner_width + 2.0 * pad;
-    let height = pad + title.size().y + unit(17.0) + body.y + unit(10.0) + footer_h;
-    let Some(at) = at else { return vec2(width, height) };
-
-    let panel = Rect::from_min_size(at, vec2(width, height));
-    let corner = unit(8.0);
-    painter.rect_filled(panel.translate(vec2(unit(3.0), unit(4.0))), corner, SHADOW);
-    painter.rect_filled(panel, corner, PAPER);
-    // the faint ruled lines of the game's parchment
-    let mut line = panel.min.y + corner;
-    while line < panel.max.y - footer_h {
-        painter.line_segment([pos2(panel.min.x + unit(2.0), line), pos2(panel.max.x - unit(2.0), line)], Stroke::new(unit(1.0), PAPER_LINE));
-        line += unit(5.0);
-    }
-    let vine_at = unit(7.0);
-    vine(painter, panel.min + vec2(vine_at, vine_at), vec2(1.0, 0.0), vec2(0.0, 1.0), unit(40.0));
-    vine(painter, pos2(panel.max.x - vine_at, panel.min.y + vine_at), vec2(-1.0, 0.0), vec2(0.0, 1.0), unit(40.0));
-
-    let middle = panel.center().x;
-    let top = heavy_title(painter, "CONTROLS", middle, panel.min.y + pad, scale) + unit(10.0);
-
-    let mut left = panel.min.x + pad + (inner_width - body.x) / 2.0;
-    for (column, size) in columns.iter().zip(&sizes) {
-        let mut y = top;
-        for (index, (name, rows)) in column.iter().enumerate() {
-            if index > 0 {
-                y += section_gap;
-            }
-            // the heading on a slanted plate, black, or a red banner for the attack
-            let label = layout(name, 10.0, Color32::WHITE);
-            let size = plate(name);
-            let points = vec![pos2(left + slant, y), pos2(left + size.x, y), pos2(left + size.x - slant, y + size.y), pos2(left, y + size.y)];
-            let (fill, edge) = if *name == "ATTACK" { (RED, Stroke::new(unit(1.4), ORANGE)) } else { (INK, Stroke::NONE) };
-            painter.add(Shape::convex_polygon(points, fill, edge));
-            painter.galley(pos2(left + plate_pad + slant / 2.0, y + (size.y - label.size().y) / 2.0), label, Color32::WHITE);
-            y += plate_h + unit(5.0);
-            for row in rows {
-                let mut x = left;
-                for key in &row.keys {
-                    // a key: a white pill on its shadow, red for the aim in use
-                    let lit = *name == "AIM" && key == active;
-                    let label = layout(key, 11.0, if lit { Color32::WHITE } else { INK });
-                    let cap = Rect::from_min_size(pos2(x, y), vec2(label.size().x + 2.0 * cap_pad, cap_h));
-                    let round = CornerRadius::same((cap_h / 2.0).round() as u8);
-                    painter.rect_filled(cap.translate(vec2(0.0, unit(1.8))), round, PAPER_SHADOW);
-                    painter.rect_filled(cap, round, if lit { RED } else { Color32::WHITE });
-                    let stroke = if lit { Stroke::new(unit(1.8), ORANGE) } else { Stroke::new(unit(1.1), INK) };
-                    painter.rect_stroke(cap, round, stroke, StrokeKind::Inside);
-                    painter.galley(cap.center() - label.size() / 2.0, label, INK);
-                    x = cap.max.x + gap;
-                }
-                let does = layout(row.does, 12.0, INK);
-                painter.galley(pos2(x + unit(6.0), y + (cap_h - does.size().y) / 2.0), does, INK);
-                y += cap_h + row_gap;
-            }
-        }
-        left += size.x + column_gap;
-    }
-
-    // the black strip at the foot, as the game explains its menus
-    let c = corner.round() as u8;
-    let footer = Rect::from_min_max(pos2(panel.min.x, panel.max.y - footer_h), panel.max);
-    painter.rect_filled(footer, CornerRadius { nw: 0, ne: 0, sw: c, se: c }, INK);
-    painter.galley(footer.center() - tip.size() / 2.0, tip, Color32::WHITE);
-    painter.rect_stroke(panel, corner, Stroke::new(unit(1.5), INK), StrokeKind::Inside);
-    vec2(width, height)
-}
-
-/// the sections split, in order, into this many columns of about as many rows.
-fn split_columns<'a>(sections: &'a [(&'a str, Vec<ControlRow>)], count: usize) -> Vec<&'a [(&'a str, Vec<ControlRow>)]> {
-    let weight = |(_, rows): &(&str, Vec<ControlRow>)| rows.len() + 1;
-    let total: usize = sections.iter().map(weight).sum();
-    let mut columns = Vec::new();
-    let (mut start, mut taken) = (0, 0);
-    for (index, section) in sections.iter().enumerate() {
-        taken += weight(section);
-        let target = total * (columns.len() + 1) / count;
-        if taken >= target && columns.len() + 1 < count && index + 1 < sections.len() {
-            columns.push(&sections[start..=index]);
-            start = index + 1;
-        }
-    }
-    columns.push(&sections[start..]);
-    columns
-}
-
-/// draws the controls panel where it shows biggest, in whichever free
-/// rectangle, in points, and however many columns suit it, up to its full
-/// size, and nowhere when it would be too small to read. it only paints, so
-/// clicks go through to the screens.
-// ponytail: a switch for the panel and its setting; set false to hide both.
-pub const CONTROLS_HINT_ENABLED: bool = true;
-
-pub fn controls_hint(ctx: &egui::Context, free: &[egui::Rect], keys: &Keys, active: &str) {
-    const SMALLEST: f32 = 0.6;
-    const MARGIN: f32 = 8.0;
-    let sections = controls_sections(keys);
-    let painter = ctx.layer_painter(egui::LayerId::background());
-    let layouts: Vec<_> = (1..=3).map(|count| split_columns(&sections, count)).collect();
-    let best = free
-        .iter()
-        .flat_map(|rect| layouts.iter().map(move |columns| (rect, columns)))
-        .map(|(rect, columns)| {
-            let full = controls_panel(&painter, columns, 1.0, None, active);
-            let scale = ((rect.width() - MARGIN) / full.x).min((rect.height() - MARGIN) / full.y).min(1.0);
-            (rect, columns, scale)
-        })
-        .max_by(|a, b| a.2.total_cmp(&b.2));
-    let Some((rect, columns, scale)) = best else { return };
-    if scale < SMALLEST {
-        return;
-    }
-    let size = controls_panel(&painter, columns, scale, None, active);
-    controls_panel(&painter, columns, scale, Some(rect.center() - size / 2.0), active);
-}
-
-#[cfg(test)]
-mod controls_tests {
-    use super::*;
-
-    #[test]
-    fn controls_split_into_columns_in_order_without_losing_any() {
-        let sections = controls_sections(&Keys::default());
-        for count in 1..=3 {
-            let columns = split_columns(&sections, count);
-            assert_eq!(columns.len(), count);
-            let names: Vec<_> = columns.iter().flat_map(|column| column.iter().map(|(name, _)| *name)).collect();
-            assert_eq!(names, ["MOVE", "ATTACK", "POWERS", "AIM", "MENUS"]);
-        }
-    }
-}
-
 pub fn key_name(key: KeyCode) -> String {
     let name = format!("{key:?}");
     for prefix in ["Key", "Digit", "Arrow"] {

@@ -9,7 +9,8 @@ mod discord;
 mod gamepad;
 mod gui;
 mod input;
-mod kiu_options;
+mod kiu_controls;
+mod kiu_theme;
 mod library;
 mod menus;
 mod present;
@@ -978,7 +979,6 @@ impl App {
             audio.clear();
         }
         self.menus.menu_open = false;
-        self.menus.options_open = false;
         self.keyboard.release();
     }
 
@@ -1006,9 +1006,9 @@ impl App {
         }
         if pressed && !event.repeat {
             match code {
-                // the options go back to the menu they came from
-                KeyCode::Escape if self.menus.options_open => {
-                    self.menus.options_open = false;
+                // the settings, opened from the menu as its options, go back to it
+                KeyCode::Escape if self.game.is_some() && self.menus.settings_open => {
+                    self.menus.settings_open = false;
                     return;
                 }
                 KeyCode::Escape if self.game.is_some() => {
@@ -1070,7 +1070,7 @@ impl App {
                 self.apply_settings();
             } else if button == gilrs::Button::Mode && self.game.is_some() {
                 self.menus.menu_open = !self.menus.menu_open;
-                self.menus.options_open = false;
+                self.menus.settings_open = false;
                 self.keyboard.release();
             }
         }
@@ -2015,7 +2015,7 @@ impl App {
         // where the controls can go, the window's pixels no screen covers, while
         // a game runs without the 3D, which places the screens otherwise
         let screens = self.layout.screens_in(self.game.as_ref().is_some_and(|game| game.out_of_play <= IN_PLAY_QUIET));
-        let free = (menus::CONTROLS_HINT_ENABLED && self.game.is_some() && self.settings.show_controls &&self.settings.stereo == settings::Stereo3d::Off)
+        let free = (kiu_controls::CONTROLS_HINT_ENABLED && self.game.is_some() && self.settings.show_controls &&self.settings.stereo == settings::Stereo3d::Off)
             .then(|| {
                 let size = window.inner_size();
                 let (top, bottom) =
@@ -2051,7 +2051,7 @@ impl App {
                     .iter()
                     .map(|[x0, y0, x1, y1]| egui::Rect::from_min_max(egui::pos2(x0 / points, y0 / points), egui::pos2(x1 / points, y1 / points)))
                     .collect();
-                menus::controls_hint(ui.ctx(), &rects, &settings.keys, aim);
+                kiu_controls::controls_hint(ui.ctx(), &rects, &settings.keys, aim);
             }
             match &game {
                 Some((name, fps, recompiled)) => {
@@ -2062,7 +2062,6 @@ impl App {
                 }
                 None => actions.extend(menus.library(ui, library, settings, jobs)),
             }
-            actions.extend(menus.options(ui.ctx(), settings));
             actions.extend(menus.settings(ui.ctx(), settings));
             if menus.multiplayer_open {
                 actions.extend(menus.multiplayer(ui.ctx(), settings, room.as_ref()));
