@@ -40,7 +40,12 @@ Import-Module (Join-Path $PSScriptRoot "lib\Overrides.psm1") -Force
 $RecompRepo = "https://github.com/fearkov/3dsrecomp"
 $RecompCommit = "c3f21f94ba50d688025febc8974ff348d471b587"
 $WinLibsUrl = "https://github.com/brechtsanders/winlibs_mingw/releases/download/16.2.0posix-23.1.3-14.0.0-ucrt-r3/winlibs-x86_64-posix-seh-gcc-16.2.0-mingw-w64ucrt-14.0.0-r3.zip"
+# the SHA-256 GitHub gives for that file
+$WinLibsSha256 = "3c69305081e4a647144339a936244fcf7d3d9e558319e1ad7be2cd2886d4b6a1"
 $RustupUrl = "https://static.rust-lang.org/rustup/dist/x86_64-pc-windows-gnu/rustup-init.exe"
+# the Rust a new install gets, the one the port was last built with, so a
+# build made later does not change with whatever is stable that day
+$RustVersion = "1.99.1"
 
 $Root = Split-Path -Parent $PSScriptRoot
 $Tools = Join-Path $Root "tools"
@@ -52,6 +57,16 @@ $RecompExe = Join-Path $Recomp "target\release\3dsrecomp.exe"
 
 function Step($text) { Write-Host "`n== $text" -ForegroundColor Cyan }
 function Fail($text) { Write-Host "error: $text" -ForegroundColor Red; exit 1 }
+
+# Deletes a download whose SHA-256 is not the one expected and stops: a
+# file cut short or changed on the way must never be unpacked or run.
+function Assert-Sha256([string]$path, [string]$expected) {
+    $actual = (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash
+    if ($actual -ne $expected.ToUpperInvariant()) {
+        Remove-Item -LiteralPath $path -Force
+        Fail "$(Split-Path -Leaf $path) is not the file expected (SHA-256 $actual, wanted $($expected.ToUpperInvariant())); run setup again"
+    }
+}
 
 function Run($exe, [string[]]$arguments, $where) {
     Push-Location $where
@@ -89,6 +104,7 @@ function Install-Gcc {
         $unpack = Join-Path $Tools "winlibs.unpack"
         Write-Host "Downloading WinLibs gcc (about 280 MB)..."
         Invoke-WebRequest -UseBasicParsing -Uri $WinLibsUrl -OutFile $zip
+        Assert-Sha256 $zip $WinLibsSha256
         Write-Host "Unpacking..."
         # into a folder of its own, renamed once whole: an interrupted unpack
         # must not leave a mingw64 that a later run takes for a complete one
@@ -108,7 +124,11 @@ function Install-Rust {
     if (-not (Test-Path (Join-Path $Tools "cargo\bin\cargo.exe"))) {
         $installer = Join-Path $Tools "rustup-init.exe"
         Invoke-WebRequest -UseBasicParsing -Uri $RustupUrl -OutFile $installer
-        Run $installer @("-y", "--no-modify-path", "--default-host", "x86_64-pc-windows-gnu", "--default-toolchain", "stable", "--profile", "minimal") $Tools
+        # rustup publishes each installer's SHA-256 next to it
+        $published = (Invoke-WebRequest -UseBasicParsing -Uri "$RustupUrl.sha256").Content
+        if ($published -is [byte[]]) { $published = [System.Text.Encoding]::ASCII.GetString($published) }
+        Assert-Sha256 $installer ($published.Trim() -split '\s+')[0]
+        Run $installer @("-y", "--no-modify-path", "--default-host", "x86_64-pc-windows-gnu", "--default-toolchain", $RustVersion, "--profile", "minimal") $Tools
         Remove-Item $installer
     }
     & cargo --version
