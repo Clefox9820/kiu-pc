@@ -753,10 +753,64 @@ mod tests {
     /// textures' hd_textures among them, is passed over, the rest kept.
     #[test]
     fn a_setting_since_removed_keeps_the_others() {
-        let settings: Settings = toml::from_str("hd_textures = true
-show_fps = true
-").unwrap();
+        let settings: Settings = toml::from_str("hd_textures = true\nshow_fps = true\n").unwrap();
         assert!(settings.show_fps);
+    }
+
+    /// what this port adds to the settings comes back as it was saved, under
+    /// the names the file has always had.
+    #[test]
+    fn the_kid_icarus_settings_come_back_as_they_were_saved() {
+        let settings = Settings {
+            air_aim_speed: 1.25,
+            land_aim_speed: 4.0,
+            invert_aim_y: true,
+            pause_unfocused: false,
+            recapture_mouse: false,
+            discord_presence: true,
+            show_controls: false,
+            upscale_textures: true,
+            filter: Filter::Anime4kRestore,
+            ..Settings::default()
+        };
+        let text = toml::to_string_pretty(&settings).unwrap();
+        for key in [
+            "air_aim_speed = 1.25",
+            "land_aim_speed = 4.0",
+            "invert_aim_y = true",
+            "pause_unfocused = false",
+            "recapture_mouse = false",
+            "discord_presence = true",
+            "show_controls = false",
+            "upscale_textures = true",
+            "filter = \"anime4k_restore\"",
+        ] {
+            assert!(text.contains(key), "{key} in {text}");
+        }
+        assert_eq!(toml::from_str::<Settings>(&text).unwrap(), settings);
+        let anime4k = Settings { filter: Filter::Anime4k, ..Settings::default() };
+        let text = toml::to_string_pretty(&anime4k).unwrap();
+        assert!(text.contains("filter = \"anime4k\""), "{text}");
+        assert_eq!(toml::from_str::<Settings>(&text).unwrap(), anime4k);
+    }
+
+    /// Auto shows the top screen alone in play and the bottom one over it in
+    /// menus; the other layouts are the same in both.
+    #[test]
+    fn auto_screens_change_with_play_and_the_rest_stay() {
+        assert_eq!(Screens::Auto.screens_in(true), ScreenLayout::TopOnly);
+        assert_eq!(Screens::Auto.screens_in(false), ScreenLayout::BottomOverTop);
+        for layout in Screens::ALL.into_iter().filter(|&layout| layout != Screens::Auto) {
+            assert_eq!(layout.screens_in(true), layout.screens(), "{layout:?} in play");
+            assert_eq!(layout.screens_in(false), layout.screens(), "{layout:?} in a menu");
+        }
+    }
+
+    #[test]
+    fn lower_latency_keeps_less_sound_waiting() {
+        assert_eq!(Latency::Low.samples(), 2048);
+        assert_eq!(Latency::High.samples(), 8192);
+        assert!(Latency::ALL.windows(2).all(|pair| pair[0].samples() < pair[1].samples()));
     }
 
     #[test]

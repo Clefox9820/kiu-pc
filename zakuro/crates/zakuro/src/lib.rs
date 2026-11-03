@@ -554,6 +554,7 @@ struct Away {
 fn leave(pause: bool, already_paused: bool, aim: Option<AimMode>, recapture: bool) -> Away {
     Away { paused: pause && !already_paused, aim: aim.filter(|_| recapture) }
 }
+
 /// what the player is told when the 3D can't be drawn on the GPU.
 const GPU_FALLBACK: &str = "The 3D can't be drawn on the GPU, as Vulkan isn't working on this computer, so it's drawn in software. \
 Games run much slower that way, and texture packs are left out. Updating the graphics driver usually fixes it; the log says \
