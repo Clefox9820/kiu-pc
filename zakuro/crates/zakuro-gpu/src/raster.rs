@@ -2683,17 +2683,32 @@ pub struct TextureCache {
     /// whether small pictures no pack replaces are made twice as big by
     /// Anime4K, see crate::anime4k.
     upscale: bool,
-    /// the physical addresses of the textures portraits were drawn with, and
-    /// the addresses those were found at, so that they are taken for small
-    /// pictures though compressed as models' textures are.
+    /// the physical addresses of the textures portraits were drawn with,
+    /// see note_portrait.
     portrait_sources: std::collections::HashSet<u32>,
-    portraits: std::collections::HashSet<u32>,
+    /// the addresses the cache found those textures at, see bound, so that
+    /// they are taken for small pictures though compressed as models'
+    /// textures are.
+    portrait_keys: std::collections::HashSet<u32>,
 }
 
 /// the largest texture, across and down, Anime4K makes bigger: the size of
 /// a HUD's or a menu's sheet of pictures. bigger ones are most often a
 /// model's, which draws no sharper this way.
 const UPSCALED_SIZE: u32 = 256;
+
+/// the fewest texels a texture Anime4K makes bigger has: one of a few
+/// texels gains nothing.
+const UPSCALED_TEXELS: u32 = 256;
+
+/// what Anime4K takes a texture for, with upscaling on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Upscale {
+    /// a small picture, unless it is compressed as models' textures are.
+    Picture,
+    /// a portrait's, a small picture though compressed.
+    Portrait,
+}
 
 /// address, format, width, height and how many sizes.
 type TextureKey = (u32, TextureFormat, u32, u32, u32);
@@ -2731,31 +2746,42 @@ impl TextureCache {
     /// made twice as big by Anime4K from now on, or not.
     pub fn set_upscale(&mut self, upscale: bool) {
         self.upscale = upscale;
-        self.entries.clear();
-        self.texels = 0;
+        self.forget();
     }
 
-    /// a portrait was drawn with the texture at the physical address.
+    /// a portrait was drawn with the texture at the physical address, noted
+    /// while upscaling is on.
     pub fn note_portrait(&mut self, physical: u32) {
-        self.portrait_sources.insert(physical);
-    }
-
-    /// a texture at the physical address is about to be looked up by key: one
-    /// a portrait was drawn with is a small picture from now on, decoded
-    /// again to be one.
-    fn bound(&mut self, physical: u32, key: TextureKey) {
-        if self.portrait_sources.contains(&physical) && self.portraits.insert(key.0) {
-            if let Some(old) = self.entries.remove(&key) {
-                self.texels -= old.texels.len();
-            }
+        if self.upscale {
+            self.portrait_sources.insert(physical);
         }
     }
 
-    /// lets go of every texture, memory having been put back as a saved
-    /// state had it.
+    /// a texture at the physical address is about to be looked up by key: a
+    /// compressed one a portrait was drawn with is a small picture from now
+    /// on, decoded again to be one.
+    fn bound(&mut self, physical: u32, key: TextureKey) {
+        let compressed = matches!(key.1, TextureFormat::Etc1 | TextureFormat::Etc1A4);
+        if !self.upscale || !compressed || !self.portrait_sources.contains(&physical) || !self.portrait_keys.insert(key.0) {
+            return;
+        }
+        if let Some(old) = self.entries.remove(&key) {
+            self.texels -= old.texels.len();
+        }
+    }
+
+    /// what Anime4K takes the texture for, none with upscaling off.
+    fn upscale_for(&self, key: TextureKey) -> Option<Upscale> {
+        self.upscale.then(|| if self.portrait_keys.contains(&key.0) { Upscale::Portrait } else { Upscale::Picture })
+    }
+
+    /// lets go of every texture, and of what portraits were drawn with,
+    /// memory having been put back as a saved state had it.
     pub fn forget(&mut self) {
         self.entries.clear();
         self.texels = 0;
+        self.portrait_sources.clear();
+        self.portrait_keys.clear();
     }
 
     /// a new command list starts, and memory may have changed since the last.
@@ -2807,6 +2833,7 @@ impl TextureCache {
         let (_, format, width, height, levels) = key;
         let hash = fingerprint(data);
         let checked = (self.list, self.written.len());
+        let upscale = self.upscale_for(key);
         if let Some(decoded) = self.entries.get_mut(&key) {
             if decoded.hash != hash && decoded.bytes.len() == data.len() && width % 8 == 0 && height % 8 == 0 {
                 // a title changing a few sprites of an atlas rewrites a
@@ -2833,8 +2860,8 @@ impl TextureCache {
                 decoded.bytes.copy_from_slice(data);
                 decoded.texels = copy;
                 decoded.hash = hash;
-                let upscale = self.upscale.then(|| self.portraits.contains(&key.0));
-                decoded.replacement = picture_for(self.pack.as_deref(), upscale, data, &decoded.texels, key, &mut self.rows);
+                decoded.replacement = picture_for(self.pack.as_deref(), data, &decoded.texels, key, &mut self.rows)
+                    .or_else(|| anime4k_picture(upscale, data, &decoded.texels, key));
             }
             if decoded.hash == hash {
                 decoded.checked = checked;
@@ -2854,8 +2881,8 @@ impl TextureCache {
             self.entries.clear();
             self.texels = 0;
         }
-        let upscale = self.upscale.then(|| self.portraits.contains(&key.0));
-        let replacement = picture_for(self.pack.as_deref(), upscale, data, &texels, key, &mut self.rows);
+        let replacement =
+            picture_for(self.pack.as_deref(), data, &texels, key, &mut self.rows).or_else(|| anime4k_picture(upscale, data, &texels, key));
         let decoded = Decoded { hash, bytes: data.to_vec(), texels: texels.clone(), checked, replacement: replacement.clone(), watch: None };
         if let Some(old) = self.entries.insert(key, decoded) {
             self.texels -= old.texels.len();
@@ -2865,52 +2892,57 @@ impl TextureCache {
     }
 }
 
-/// the pack's picture for a texture of these bytes, whenever they change,
-/// or else, with upscale on, for a small picture rather than a model's
-/// texture, Anime4K's of it twice as big. upscale holds whether the texture
-/// is a portrait's.
+/// the pack's picture for a texture of these bytes, whenever they change.
 fn picture_for(
     pack: Option<&crate::pack::Pack>,
-    upscale: Option<bool>,
     data: &[u8],
-    texels: &Arc<[[u8; 4]]>,
+    texels: &[[u8; 4]],
     key: TextureKey,
     rows: &mut Vec<u8>,
 ) -> Option<Arc<crate::pack::Material>> {
-    // packs and Anime4K's pictures know textures by their largest size alone
+    // packs know textures by their largest size alone
     let (_, format, width, height, _) = key;
-    let (data, largest) = (&data[..texture_bytes(format, width, height, 1)], &texels[..(width * height) as usize]);
+    let (data, texels) = (&data[..texture_bytes(format, width, height, 1)], &texels[..(width * height) as usize]);
     if crate::pack::recording() {
-        crate::pack::record(data, largest, format, width, height);
+        crate::pack::record(data, texels, format, width, height);
     }
-    if let Some(found) = pack.and_then(|pack| pack.find(data, format, width, height, rows)) {
-        return Some(found);
-    }
-    let portrait = upscale?;
-    let small = width <= UPSCALED_SIZE && height <= UPSCALED_SIZE;
-    // compressed ones are models' but for portraits, and hilo8 holds
-    // normals, not colors
-    let picture = match format {
-        TextureFormat::Etc1 => portrait,
-        TextureFormat::Hilo8 => false,
-        _ => true,
-    };
-    // a texture of a few texels gains nothing
-    if !small || !picture || width * height < 256 {
+    pack?.find(data, format, width, height, rows)
+}
+
+/// Anime4K's picture of a texture twice as big, made from its largest size
+/// as a pack's pictures are, with upscaling on and when it is a small
+/// picture rather than a model's texture, see upscales.
+fn anime4k_picture(upscale: Option<Upscale>, data: &[u8], texels: &Arc<[[u8; 4]]>, key: TextureKey) -> Option<Arc<crate::pack::Material>> {
+    let (_, format, width, height, _) = key;
+    if !upscales(upscale?, format, width, height) {
         return None;
     }
-    let largest = if largest.len() == texels.len() { texels.clone() } else { Arc::from(largest) };
+    let (data, count) = (&data[..texture_bytes(format, width, height, 1)], (width * height) as usize);
+    let largest = if count == texels.len() { texels.clone() } else { Arc::from(&texels[..count]) };
     Some(Arc::new(crate::pack::Material::upscaled(upscaled_hash(data, key), largest, width, height)))
 }
 
+/// whether Anime4K makes a texture taken as upscale is bigger: a small
+/// picture, neither tiny nor a model's.
+fn upscales(upscale: Upscale, format: TextureFormat, width: u32, height: u32) -> bool {
+    // compressed ones are models' but for portraits, hilo8 holds normals,
+    // not colors, and a format not known is left as it is
+    let picture = match format {
+        TextureFormat::Etc1 | TextureFormat::Etc1A4 => upscale == Upscale::Portrait,
+        TextureFormat::Hilo8 | TextureFormat::Unknown(_) => false,
+        _ => true,
+    };
+    picture && width <= UPSCALED_SIZE && height <= UPSCALED_SIZE && width * height >= UPSCALED_TEXELS
+}
+
 /// what Anime4K's picture of a texture is told apart by: the texture's
-/// bytes, format and size, never one of a pack's hashes.
+/// bytes, seeded with its format and size, never one of a pack's hashes.
 fn upscaled_hash(data: &[u8], key: TextureKey) -> u64 {
+    use std::hash::{Hash, Hasher};
     let (_, format, width, height, _) = key;
-    let mut bytes = Vec::with_capacity(data.len() + 40);
-    bytes.extend_from_slice(data);
-    bytes.extend_from_slice(format!("anime4k {format:?} {width}x{height}").as_bytes());
-    cityhasher::hash::<u64>(&bytes)
+    let mut shape = std::hash::DefaultHasher::new();
+    ("anime4k", format, width, height).hash(&mut shape);
+    cityhasher::hash_with_seed::<u64>(data, shape.finish())
 }
 
 /// a quick hash of a texture's bytes, to notice when they change. four
@@ -3134,9 +3166,7 @@ fn bind_texture<M: GpuMemory>(
     let size = texture_bytes(format, width, height, levels);
 
     let key = (addr, format, width, height, levels);
-    if format == TextureFormat::Etc1 {
-        cache.bound(address, key);
-    }
+    cache.bound(address, key);
     let (texels, replacement) = match drawn {
         Some(_) if !past => (Arc::default(), None),
         _ => texture_at(memory, cache, key, size),
@@ -5902,6 +5932,58 @@ mod tests {
         assert!(cache.decoded(tiny, &[0; 128]).1.is_none(), "too small to be worth it");
         let letters = (0x4000, TextureFormat::La4, 16, 16, 1);
         assert!(cache.decoded(letters, &[0x5A; 256]).1.is_some(), "letters are made bigger");
+    }
+
+    /// both compressed formats are models' textures but for portraits, and
+    /// a format the cache does not know is left as it is.
+    #[test]
+    fn compressed_textures_are_made_bigger_only_for_portraits() {
+        let mut cache = TextureCache::default();
+        cache.set_upscale(true);
+        let etc1a4 = (0x2000, TextureFormat::Etc1A4, 16, 16, 1);
+        assert!(cache.decoded(etc1a4, &[0; 256]).1.is_none(), "a model's");
+        let unknown = (0x3000, TextureFormat::Unknown(15), 16, 16, 1);
+        assert!(cache.decoded(unknown, &[0; 1024]).1.is_none(), "an unknown format's");
+        cache.note_portrait(0x2000);
+        cache.bound(0x2000, etc1a4);
+        assert!(cache.decoded(etc1a4, &[0; 256]).1.is_some(), "a portrait's");
+        // a picture's own format needs no portrait to be one
+        let rgba4 = (0x4000, TextureFormat::Rgba4, 16, 16, 1);
+        cache.decoded(rgba4, &[0x5A; 512]);
+        cache.note_portrait(0x4000);
+        cache.bound(0x4000, rgba4);
+        assert!(cache.entries.contains_key(&rgba4), "kept, not decoded again");
+    }
+
+    /// while upscaling is off a portrait's texture is not noted, nor
+    /// decoded again for it.
+    #[test]
+    fn portraits_are_not_noted_while_upscaling_is_off() {
+        let etc1 = (0x2000, TextureFormat::Etc1, 16, 16, 1);
+        let mut cache = TextureCache::default();
+        cache.decoded(etc1, &[0; 128]);
+        cache.note_portrait(0x2000);
+        cache.bound(0x2000, etc1);
+        assert!(cache.entries.contains_key(&etc1), "nothing to decode again");
+        cache.set_upscale(true);
+        cache.bound(0x2000, etc1);
+        assert!(cache.decoded(etc1, &[0; 128]).1.is_none(), "noted while off, not a portrait");
+    }
+
+    /// what portraits were drawn with goes with the textures when memory is
+    /// put back or upscaling changes.
+    #[test]
+    fn portraits_are_forgotten_with_the_textures() {
+        let etc1 = (0x2000, TextureFormat::Etc1, 16, 16, 1);
+        let mut cache = TextureCache::default();
+        cache.set_upscale(true);
+        for forget in [TextureCache::forget as fn(&mut TextureCache), |cache| cache.set_upscale(true)] {
+            cache.note_portrait(0x2000);
+            cache.bound(0x2000, etc1);
+            assert!(cache.decoded(etc1, &[0; 128]).1.is_some(), "a portrait's");
+            forget(&mut cache);
+            assert!(cache.decoded(etc1, &[0; 128]).1.is_none(), "no longer known as a portrait's");
+        }
     }
 
     /// a pixel centered on an edge goes to the triangle on its right, or
