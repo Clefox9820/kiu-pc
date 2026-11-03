@@ -4,11 +4,11 @@ Finds the USA release's address for every address the overrides name.
 
 .DESCRIPTION
 For maintainers. The overrides in overrides\ are written with the European
-release's addresses, and setup.ps1 moves them to the USA release with its
-$UsaAddresses table. This script reads the code of both ROMs, finds each
-European function in the USA code by matching its instructions (branch
-offsets are ignored, since they change when code moves), and compares the
-result with that table.
+release's addresses, and setup.ps1 moves them to the USA release with the
+table in overrides\usa-addresses.psd1. This script reads the code of both
+ROMs, finds each European function in the USA code by matching its
+instructions (branch offsets are ignored, since they change when code
+moves), and compares the result with that table.
 
 It prints only addresses, never game bytes. It exits with 1 when an address
 is missing from the table, differs from it, or cannot be found.
@@ -29,51 +29,25 @@ param(
 
 $ErrorActionPreference = "Stop"
 $Root = Split-Path -Parent $PSScriptRoot
+$Overrides = Join-Path $Root "overrides"
+
+Import-Module (Join-Path $PSScriptRoot "lib\Rom.psm1") -Force
+Import-Module (Join-Path $PSScriptRoot "lib\Overrides.psm1") -Force
 
 function Fail($text) { Write-Host "error: $text" -ForegroundColor Red; exit 1 }
 
-# the .code of a decrypted cartridge dump, as one byte per char, and its
-# segments: text, read-only data and data, each padded to whole pages
-function Read-Code($path, $title) {
-    if (-not (Test-Path -LiteralPath $path)) { Fail "there is no file at $path" }
-    $stream = [System.IO.File]::OpenRead((Resolve-Path -LiteralPath $path).Path)
+# the .code of a decrypted cartridge dump of that release, as bytes and as
+# one byte per char, and its segments
+function Read-Code($path, $region) {
     try {
-        $reader = New-Object System.IO.BinaryReader $stream
-        $stream.Position = 0x120
-        $ncch = [int64]$reader.ReadUInt32() * 0x200
-        $stream.Position = $ncch
-        $header = $reader.ReadBytes(0x600) # NCCH header, then the exheader
-        $id = [BitConverter]::ToUInt64($header, 0x118).ToString("X16")
-        if ($id -ne $title) { Fail "$path is $id, not $title" }
-        # ponytail: the KIU dumps seen so far keep .code uncompressed
-        if ($header[0x20D] -band 1) { Fail "$path has compressed code, which this script does not unpack" }
-        if ([BitConverter]::ToUInt32($header, 0x210) -ne 0x00100000) { Fail "$path looks encrypted" }
-        $exefs = $ncch + [int64][BitConverter]::ToUInt32($header, 0x1A0) * 0x200
-        $stream.Position = $exefs
-        $files = $reader.ReadBytes(0x200)
-        $code = $null
-        for ($k = 0; $k -lt 10; $k++) {
-            if ([Text.Encoding]::ASCII.GetString($files, $k * 16, 6) -eq ".code`0") {
-                $stream.Position = $exefs + 0x200 + [BitConverter]::ToUInt32($files, $k * 16 + 8)
-                $code = $reader.ReadBytes([BitConverter]::ToUInt32($files, $k * 16 + 12))
-            }
-        }
-    } finally { $stream.Close() }
-    if (-not $code) { Fail "$path has no .code" }
-    $segments = @()
-    $offset = 0
-    foreach ($at in 0x210, 0x220, 0x230) {
-        $segments += [pscustomobject]@{
-            Address = [BitConverter]::ToUInt32($header, $at)
-            File = $offset
-            Size = [BitConverter]::ToUInt32($header, $at + 8)
-        }
-        $offset += [BitConverter]::ToUInt32($header, $at + 4) * 0x1000
-    }
+        $rom = Read-RomHeader $path
+        Assert-KiuRom $rom $region
+        $code = Read-RomCode $rom
+    } catch { Fail $_.Exception.Message }
     [pscustomobject]@{
         Bytes = $code
         Chars = [Text.Encoding]::GetEncoding(28591).GetString($code)
-        Segments = $segments
+        Segments = @(Get-CodeSegment $rom)
     }
 }
 
@@ -127,26 +101,15 @@ function Find-Usa($eur, $usa, [uint32]$address) {
 }
 
 # not $usa: PowerShell names ignore case, so it would be the -Usa string
-$eurCode = Read-Code $Europe "0004000000030200"
-$usaCode = Read-Code $Usa "0004000000030100"
+$eurCode = Read-Code $Europe "Europe"
+$usaCode = Read-Code $Usa "USA"
 $text = $eurCode.Segments[0]
 
 # the addresses the overrides name in the game's code, comments included,
-# since setup.ps1 moves those too; Zakuro's mailbox and constants fall outside
-$addresses = @()
-foreach ($file in Get-ChildItem -Path (Join-Path $Root "overrides") -Filter *.c) {
-    foreach ($m in [regex]::Matches((Get-Content -Raw $file.FullName), '0x[0-9A-Fa-f]{8}')) {
-        $value = [Convert]::ToUInt32($m.Value.Substring(2), 16)
-        if ($value -ge $text.Address -and $value -lt $text.Address + $text.Size) { $addresses += $value }
-    }
-}
-$addresses = $addresses | Sort-Object -Unique
-
-$table = @{}
-$setup = Get-Content -Raw (Join-Path $PSScriptRoot "setup.ps1")
-foreach ($m in [regex]::Matches($setup, '"(0x[0-9A-Fa-f]{8})" = "(0x[0-9A-Fa-f]{8})"')) {
-    $table[[Convert]::ToUInt32($m.Groups[1].Value.Substring(2), 16)] = [Convert]::ToUInt32($m.Groups[2].Value.Substring(2), 16)
-}
+# since setup.ps1 moves those too and stops on any it cannot move; Zakuro's
+# mailbox and constants fall outside
+$addresses = @(Get-OverrideAddress $Overrides $text.Address ([uint64]$text.Address + $text.Size) | ForEach-Object { $_.Address } | Sort-Object -Unique)
+$table = Get-UsaAddressTable (Join-Path $Overrides "usa-addresses.psd1")
 
 $problems = 0
 foreach ($address in $addresses) {
@@ -157,16 +120,16 @@ foreach ($address in $addresses) {
         Write-Host ($line + '?           not found, find it by hand') -ForegroundColor Red
     } elseif (-not $table.ContainsKey($address)) {
         $problems++
-        Write-Host ($line + '"0x{0:X8}"  missing from setup.ps1' -f $found) -ForegroundColor Yellow
+        Write-Host ($line + '"0x{0:X8}"  missing from the table' -f $found) -ForegroundColor Yellow
     } elseif ($table[$address] -ne $found) {
         $problems++
-        Write-Host ($line + '"0x{0:X8}"  setup.ps1 has 0x{1:X8}' -f $found, $table[$address]) -ForegroundColor Yellow
+        Write-Host ($line + '"0x{0:X8}"  the table has 0x{1:X8}' -f $found, $table[$address]) -ForegroundColor Yellow
     } else {
         Write-Host ($line + '"0x{0:X8}"  ok' -f $found)
     }
 }
 if ($problems) {
-    Write-Host "`n$problems to fix in `$UsaAddresses in scripts\setup.ps1" -ForegroundColor Yellow
+    Write-Host "`n$problems to fix in overrides\usa-addresses.psd1" -ForegroundColor Yellow
     exit 1
 }
-Write-Host "`nsetup.ps1 has every USA address"
+Write-Host "`noverrides\usa-addresses.psd1 has every USA address"

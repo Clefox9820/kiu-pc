@@ -41,13 +41,21 @@ reintroduce upstream's game screenshots.
 ## Building and testing
 
 Run `scripts/setup.ps1` once to get the toolchain in `tools/`. To use it from
-a shell (Git Bash shown):
+PowerShell, dot-source the same settings setup.ps1 uses, from the repository
+root:
+
+```powershell
+. scripts\env.ps1
+```
+
+From Git Bash, the same settings are:
 
 ```sh
 export RUSTUP_HOME="$PWD/tools/rustup"
 export CARGO_HOME="$PWD/tools/cargo"
-export PATH="$PWD/tools/mingw64/bin:$CARGO_HOME/bin:$PATH"
+export PATH="$CARGO_HOME/bin:$PWD/tools/mingw64/bin:$PATH"
 export CC=gcc
+export AR=ar
 ```
 
 Then:

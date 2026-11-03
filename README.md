@@ -280,9 +280,10 @@ Tools used to work on it:
   (`0004000000030200`) and not yet confirmed in real play. Builds made
   before it was added need `scripts\setup.ps1 -Force` to get it.
 - For the USA release, `scripts\setup.ps1` writes a copy of the overrides to
-  `build/overrides-usa` with that release's addresses, listed in the script.
-  The functions were matched by their code but have not been tried in play.
-  A new override needs its USA address added there too:
+  `build/overrides-usa` with that release's addresses, listed in
+  `overrides/usa-addresses.psd1`. The functions were matched by their code
+  but have not been tried in play. A new override needs its USA addresses
+  added there too, or the USA build stops and names them:
   `scripts\find-usa-addresses.ps1 -Europe <eur rom> -Usa <usa rom>` finds
   them from both ROMs and checks the table. It prints only addresses.
 - Widescreen: **Top screen shape** (16:9 or 21:9) makes the game draw a
