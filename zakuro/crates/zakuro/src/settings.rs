@@ -144,7 +144,7 @@ impl Latency {
     }
 
     /// how much sound the output keeps waiting, in the console's samples.
-    pub fn samples(self) -> usize {
+    pub const fn samples(self) -> usize {
         match self {
             Latency::Low => 2048,
             Latency::Normal => 4096,
