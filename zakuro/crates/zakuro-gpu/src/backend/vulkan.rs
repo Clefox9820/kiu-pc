@@ -2298,7 +2298,8 @@ impl Anime4k {
             for ((inputs, output), spirv) in restorer.graph().zip(RESTORE_SPIRV) {
                 graph.push((inputs.to_vec(), output, spirv));
             }
-            picture = restorer.residuals()[0];
+            let crate::anime4k::Ending::Restores(restored) = *restorer.ending() else { return Err(fail("its Restore network does not restore")) };
+            picture = restored;
             targets.extend((1..restorer.tensors()).map(|tensor| if tensor == picture { COLOUR_FORMAT } else { TENSOR_FORMAT }));
         }
         // the upscaler's tensors come after Restore's, its picture before them
@@ -2311,7 +2312,8 @@ impl Anime4k {
         }
         targets.extend((1..upscaler.tensors()).map(|_| TENSOR_FORMAT));
         // the last puts the residuals on the picture
-        let last = std::iter::once(picture).chain(upscaler.residuals().iter().map(|&tensor| global(tensor))).collect();
+        let crate::anime4k::Ending::DepthToSpace(residuals) = upscaler.ending() else { return Err(fail("its network does not double")) };
+        let last = std::iter::once(picture).chain(residuals.iter().map(|&tensor| global(tensor))).collect();
         graph.push((last, DOUBLED, ANIME4K_SPIRV[ANIME4K_SPIRV.len() - 1]));
 
         let tensor_pass = create_target_pass(device, TENSOR_FORMAT)?;
@@ -2931,14 +2933,14 @@ mod tests {
             let gpu = read_back(&shared, &memory_properties, pool, screen.result.texture.image, (width * 2, height * 2));
             // on the CPU: Restore's picture kept as a colour, as on the GPU, then doubled
             let source = match restore {
-                true => crate::anime4k::restore(crate::anime4k::restore_network().unwrap(), &texels, width, height),
+                true => crate::anime4k::reference::restore(crate::anime4k::restore_network().unwrap(), &texels, width, height),
                 false => texels.clone(),
             };
             let cpu = crate::anime4k::upscale(crate::anime4k::screen_network().unwrap(), &source, width, height);
             let worst = gpu.iter().zip(&cpu).map(|(gpu, cpu)| gpu.abs_diff(*cpu)).max().unwrap();
             assert!(worst <= 4, "restore {restore}: a channel {worst} off the CPU's");
             // and the networks did more than filter
-            let filtered = crate::anime4k::upscale_filtered(&texels, width, height);
+            let filtered = crate::anime4k::reference::upscale_filtered(&texels, width, height);
             assert!(gpu.iter().zip(&filtered).any(|(gpu, filtered)| gpu.abs_diff(*filtered) > 8), "restore {restore}: no different from filtering");
             anime4k.screens[0] = Some(screen);
             anime4k.destroy(device);

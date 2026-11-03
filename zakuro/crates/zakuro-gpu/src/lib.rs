@@ -1,6 +1,6 @@
 //! PICA200 GPU emulation.
 
-pub mod anime4k;
+mod anime4k;
 pub mod backend;
 pub mod blend;
 #[cfg(feature = "vulkan")]
@@ -717,7 +717,7 @@ impl Gpu {
     /// anime4k, or not. only the host's GPU draws them, so it waits for
     /// enable_hardware_renderer, and says whether they are drawn.
     pub fn set_texture_upscale(&mut self, upscale: bool) -> bool {
-        let upscale = upscale && self.draws_on_gpu() && anime4k::network().is_some();
+        let upscale = upscale && self.draws_on_gpu() && anime4k::texture_network().is_some();
         self.resources.textures.set_upscale(upscale);
         upscale
     }
