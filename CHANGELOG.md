@@ -40,6 +40,13 @@
 - Fixed: once the game had made more than 128 cameras, widescreen could
   widen a camera's view again each time it came back, so the scene kept
   getting wider; a camera it can no longer tell about keeps its width.
+- A saved state from another Zakuro version loads only when that version is
+  known to save states the same way (0.2.29 for this 0.2.31); any other is
+  turned down, naming its version, instead of possibly loading into the
+  wrong place.
+- `svcGetHandleInfo` answers only for the game's own process, and returns
+  the console's invalid-handle and invalid-type errors for anything else,
+  instead of success.
 
 ## v0.1.0 — first release
 
