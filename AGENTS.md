@@ -5,7 +5,9 @@ the game's CPU code is recompiled with 3dsrecomp and linked into the Zakuro
 runtime in `zakuro/`. Nothing from the game may ever be committed.
 
 Before working, load the skill that matches the task. Skills live in
-`.claude/skills/<name>/SKILL.md`.
+`.claude/skills/<name>/SKILL.md`. A skill may have a `LOCAL.md` next to it,
+not tracked by git: one machine's own folders, scripts and permissions.
+Read it too when it is there; never commit one.
 
 | Skill | Load when |
 |---|---|

@@ -49,3 +49,4 @@ target/
 /.atl/
 /odd/
 /.claude/settings.local.json
+/.claude/skills/*/LOCAL.md
