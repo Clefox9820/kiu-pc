@@ -8,9 +8,10 @@ this repository. Nothing from the game is in the repository: the ROM you
 give is read here, on your machine, and what is made from it stays in
 build\, which git ignores.
 
-Needs Windows 10 or newer, about 6 GB of free disk and, for the first build,
-around an hour. Close heavy programs first: 3dsrecomp runs as many
-compilers at once as the free memory allows, measured once at the start.
+Needs Windows 10 or newer, about 6 GB of free disk and about 75 minutes per
+release to translate, plus about 10 the first time for the tools. Close
+heavy programs first: 3dsrecomp runs as many compilers at once as the free
+memory allows, measured once at the start.
 
 .PARAMETER Rom
 Your decrypted dump of the game, a .3ds or .cci file.
@@ -33,23 +34,9 @@ param(
 $ErrorActionPreference = "Stop"
 $ProgressPreference = "SilentlyContinue"
 
-# the versions this port was made and tested with
-$Europe = "0004000000030200"
-$Usa = "0004000000030100"
-# the overrides in overrides\ name the European release's addresses; these are
-# the same functions in the USA one, found by matching their code
-$UsaAddresses = @{
-    "0x006EA18C" = "0x006EA040"
-    "0x00A3F050" = "0x00A3EDCC"
-    "0x0074643C" = "0x007462A4"
-    "0x006D27E8" = "0x006D269C"
-    "0x006D2C08" = "0x006D2ABC"
-    "0x00A426AC" = "0x00A42428"
-    "0x0070419C" = "0x00704004"
-    "0x00606534" = "0x006063E8"
-    "0x0039025C" = "0x003901C4"
-    "0x003902B0" = "0x00390218"
-}
+Import-Module (Join-Path $PSScriptRoot "lib\Rom.psm1") -Force
+Import-Module (Join-Path $PSScriptRoot "lib\Overrides.psm1") -Force
+
 $RecompRepo = "https://github.com/fearkov/3dsrecomp"
 $RecompCommit = "c3f21f94ba50d688025febc8974ff348d471b587"
 $WinLibsUrl = "https://github.com/brechtsanders/winlibs_mingw/releases/download/16.2.0posix-23.1.3-14.0.0-ucrt-r3/winlibs-x86_64-posix-seh-gcc-16.2.0-mingw-w64ucrt-14.0.0-r3.zip"
@@ -58,7 +45,10 @@ $RustupUrl = "https://static.rust-lang.org/rustup/dist/x86_64-pc-windows-gnu/rus
 $Root = Split-Path -Parent $PSScriptRoot
 $Tools = Join-Path $Root "tools"
 $Build = Join-Path $Root "build"
-$Port = Join-Path $Build "port"
+$Overrides = Join-Path $Root "overrides"
+$UsaTable = Join-Path $Overrides "usa-addresses.psd1"
+$Recomp = Join-Path $Tools "3dsrecomp"
+$RecompExe = Join-Path $Recomp "target\release\3dsrecomp.exe"
 
 function Step($text) { Write-Host "`n== $text" -ForegroundColor Cyan }
 function Fail($text) { Write-Host "error: $text" -ForegroundColor Red; exit 1 }
@@ -71,97 +61,101 @@ function Run($exe, [string[]]$arguments, $where) {
     } finally { Pop-Location }
 }
 
-# --- the ROM: Kid Icarus Uprising, decrypted -------------------------------
-Step "Checking the ROM"
-if (-not (Test-Path -LiteralPath $Rom)) { Fail "there is no file at $Rom" }
-$Rom = (Resolve-Path -LiteralPath $Rom).Path
-$stream = [System.IO.File]::OpenRead($Rom)
-try {
-    $header = New-Object byte[] 0x200
-    [void]$stream.Read($header, 0, 0x200)
-    if ([System.Text.Encoding]::ASCII.GetString($header, 0x100, 4) -ne "NCSD") {
-        Fail "this is not a 3DS cartridge dump (.3ds/.cci)"
-    }
-    $offset = [BitConverter]::ToUInt32($header, 0x120) * 0x200
-    [void]$stream.Seek($offset, "Begin")
-    $ncch = New-Object byte[] 0x200
-    [void]$stream.Read($ncch, 0, 0x200)
-} finally { $stream.Close() }
-$programId = ([BitConverter]::ToUInt64($ncch, 0x118)).ToString("X16")
-if ($programId -ne $Europe -and $programId -ne $Usa) {
-    Fail "this ROM is $programId, not Kid Icarus Uprising (Europe $Europe or USA $Usa)"
+# Windows PowerShell's Set-Content writes the ANSI code page, which mangles
+# a path such as C:\Users\Jose with an accent; cargo and rustc read UTF-8.
+function Write-Utf8NoBom([string]$path, [string]$text) {
+    [System.IO.File]::WriteAllText($path, $text, (New-Object System.Text.UTF8Encoding $false))
 }
-$Region = if ($programId -eq $Usa) { "USA" } else { "Europe" }
-# each release in its own folder, so building one keeps the other
-if ($programId -eq $Usa) { $Port = Join-Path $Build "port-usa" }
-# NCCH flags byte 7, bit 2: no encryption
-if (($ncch[0x18F] -band 4) -eq 0) { Fail "the ROM is encrypted; dump it decrypted from your own console" }
-Write-Host "Kid Icarus Uprising ($Region), decrypted: OK"
-if ($CheckOnly) { exit 0 }
+
+function Read-Text([string]$path) { [System.IO.File]::ReadAllText($path) }
+
+# --- the ROM: Kid Icarus Uprising, decrypted -------------------------------
+function Test-Rom([string]$path) {
+    Step "Checking the ROM"
+    try {
+        $info = Read-RomHeader $path
+        Assert-KiuRom $info
+    } catch { Fail $_.Exception.Message }
+    Write-Host "Kid Icarus Uprising ($($info.Region)), decrypted: OK"
+    $info
+}
 
 # --- tools, inside the repository so nothing else on the system changes ----
-New-Item -ItemType Directory -Force -Path $Tools, $Build | Out-Null
-$env:RUSTUP_HOME = Join-Path $Tools "rustup"
-$env:CARGO_HOME = Join-Path $Tools "cargo"
-$env:PATH = "$(Join-Path $Tools 'cargo\bin');$(Join-Path $Tools 'mingw64\bin');$env:PATH"
-$env:CC = "gcc"
-$env:AR = "ar"
-
-Step "C compiler (MinGW-w64 gcc)"
-if (-not (Test-Path (Join-Path $Tools "mingw64\bin\gcc.exe"))) {
-    $zip = Join-Path $Tools "winlibs.zip"
-    Write-Host "Downloading WinLibs gcc (about 280 MB)..."
-    Invoke-WebRequest -UseBasicParsing -Uri $WinLibsUrl -OutFile $zip
-    Write-Host "Unpacking..."
-    Expand-Archive -LiteralPath $zip -DestinationPath $Tools -Force
-    Remove-Item $zip
+function Install-Gcc {
+    Step "C compiler (MinGW-w64 gcc)"
+    $mingw = Join-Path $Tools "mingw64"
+    if (-not (Test-Path (Join-Path $mingw "bin\gcc.exe"))) {
+        $zip = Join-Path $Tools "winlibs.zip"
+        $unpack = Join-Path $Tools "winlibs.unpack"
+        Write-Host "Downloading WinLibs gcc (about 280 MB)..."
+        Invoke-WebRequest -UseBasicParsing -Uri $WinLibsUrl -OutFile $zip
+        Write-Host "Unpacking..."
+        # into a folder of its own, renamed once whole: an interrupted unpack
+        # must not leave a mingw64 that a later run takes for a complete one
+        foreach ($stale in $unpack, $mingw) {
+            if (Test-Path $stale) { Remove-Item -Recurse -Force $stale }
+        }
+        Expand-Archive -LiteralPath $zip -DestinationPath $unpack -Force
+        Move-Item -LiteralPath (Join-Path $unpack "mingw64") -Destination $mingw
+        Remove-Item -Recurse -Force $unpack
+        Remove-Item $zip
+    }
+    & gcc --version | Select-Object -First 1
 }
-& gcc --version | Select-Object -First 1
 
-Step "Rust (GNU toolchain)"
-if (-not (Test-Path (Join-Path $Tools "cargo\bin\cargo.exe"))) {
-    $installer = Join-Path $Tools "rustup-init.exe"
-    Invoke-WebRequest -UseBasicParsing -Uri $RustupUrl -OutFile $installer
-    Run $installer @("-y", "--no-modify-path", "--default-host", "x86_64-pc-windows-gnu", "--default-toolchain", "stable", "--profile", "minimal") $Tools
-    Remove-Item $installer
+function Install-Rust {
+    Step "Rust (GNU toolchain)"
+    if (-not (Test-Path (Join-Path $Tools "cargo\bin\cargo.exe"))) {
+        $installer = Join-Path $Tools "rustup-init.exe"
+        Invoke-WebRequest -UseBasicParsing -Uri $RustupUrl -OutFile $installer
+        Run $installer @("-y", "--no-modify-path", "--default-host", "x86_64-pc-windows-gnu", "--default-toolchain", "stable", "--profile", "minimal") $Tools
+        Remove-Item $installer
+    }
+    & cargo --version
 }
-& cargo --version
 
 # --- 3dsrecomp, at the version the port was made with -----------------------
-Step "3dsrecomp"
-$Recomp = Join-Path $Tools "3dsrecomp"
-if (-not (Test-Path (Join-Path $Recomp ".git"))) {
-    Run git @("clone", "--quiet", $RecompRepo, $Recomp) $Tools
-}
-Run git @("checkout", "--quiet", $RecompCommit) $Recomp
-Run cargo @("build", "--release", "--quiet") $Recomp
-$RecompExe = Join-Path $Recomp "target\release\3dsrecomp.exe"
-
-# --- the game's code, translated from your ROM (an hour the first time) -----
-Step "Translating the game's code (the first time takes about an hour)"
-if ($Force -and (Test-Path $Port)) { Remove-Item -Recurse -Force $Port }
-if (-not (Test-Path (Join-Path $Port "code\librecomp.a"))) {
-    $Overrides = Join-Path $Root "overrides"
-    if ($programId -eq $Usa) {
-        # a copy of the overrides with the USA release's addresses
-        $moved = Join-Path $Build "overrides-usa"
-        New-Item -ItemType Directory -Force -Path $moved | Out-Null
-        Get-ChildItem -Path $moved -Filter *.c | Remove-Item
-        foreach ($file in Get-ChildItem -Path $Overrides -Filter *.c) {
-            $source = Get-Content -Raw $file.FullName
-            foreach ($mark in [regex]::Matches($source, 'RECOMP_(?:OVERRIDE|ORIGINAL)\((0x[0-9A-Fa-f]+)\)')) {
-                $address = $mark.Groups[1].Value
-                if (-not $UsaAddresses.ContainsKey($address)) {
-                    Fail "$($file.Name) overrides $address, which has no USA address in setup.ps1 yet"
-                }
-            }
-            $source = [regex]::Replace($source, '0x[0-9A-Fa-f]{8}', {
-                param($m) if ($UsaAddresses.ContainsKey($m.Value)) { $UsaAddresses[$m.Value] } else { $m.Value }
-            })
-            Set-Content -NoNewline -Path (Join-Path $moved $file.Name) -Value $source
-        }
-        $Overrides = $moved
+function Install-Recomp {
+    Step "3dsrecomp"
+    if (-not (Test-Path (Join-Path $Recomp ".git"))) {
+        Run git @("clone", "--quiet", $RecompRepo, $Recomp) $Tools
     }
+    Run git @("checkout", "--quiet", $RecompCommit) $Recomp
+    Run cargo @("build", "--release", "--quiet") $Recomp
+}
+
+# --- the overrides, moved to the USA release's addresses --------------------
+# A copy in build\overrides-usa. Stops when an override names an address in
+# the game's code that the table does not move: it would stay European.
+function Copy-UsaOverride($info) {
+    $table = Get-UsaAddressTable $UsaTable
+    $text = @(Get-CodeSegment $info)[0]
+    $missing = @(Find-UnmappedAddress $Overrides $table $text.Address ([uint64]$text.Address + $text.Size))
+    if ($missing.Count -gt 0) {
+        foreach ($m in $missing) {
+            Write-Host ("error: {0} names 0x{1:X8}, which has no USA address in overrides\usa-addresses.psd1 yet" -f $m.File, $m.Address) -ForegroundColor Red
+        }
+        Fail "find them with scripts\find-usa-addresses.ps1"
+    }
+    $moved = Join-Path $Build "overrides-usa"
+    New-Item -ItemType Directory -Force -Path $moved | Out-Null
+    Get-ChildItem -LiteralPath $moved -Filter *.c | Remove-Item
+    foreach ($file in Get-OverrideFile $Overrides) {
+        $source = Convert-ToUsaAddress (Read-Text $file.FullName) $table
+        Write-Utf8NoBom (Join-Path $moved $file.Name) $source
+    }
+    $moved
+}
+
+# --- the game's code, translated from your ROM (75 minutes the first time) --
+function Invoke-Translation($info, [string]$port) {
+    Step "Translating the game's code (the first time takes about 75 minutes)"
+    if ($Force -and (Test-Path $port)) { Remove-Item -Recurse -Force $port }
+    if (Test-Path (Join-Path $port "code\librecomp.a")) {
+        Write-Host "already translated, in $port (-Force translates again)"
+        return
+    }
+    $from = if ($info.Region -eq "USA") { Copy-UsaOverride $info } else { $Overrides }
     # 3dsrecomp archives the ~810 objects with their whole paths when the
     # overrides' objects sit in a folder of their own, and from a deep enough
     # folder that command line passes Windows' 32767 characters. A drive
@@ -171,46 +165,49 @@ if (-not (Test-Path (Join-Path $Port "code\librecomp.a"))) {
     & subst "${letter}:" $Build
     if ($LASTEXITCODE -ne 0) { Fail "subst ${letter}: $Build failed ($LASTEXITCODE)" }
     try {
-        Run $RecompExe @("port", $Rom, "${letter}:\$(Split-Path -Leaf $Port)", "--name", "kid-icarus", "--overrides", $Overrides) "${letter}:\"
+        Run $RecompExe @("port", $info.Path, "${letter}:\$(Split-Path -Leaf $port)", "--name", "kid-icarus", "--overrides", $from) "${letter}:\"
     } finally {
         & subst "${letter}:" /D | Out-Null
     }
-} else {
-    Write-Host "already translated, in $Port (-Force translates again)"
 }
 
 # --- the program, against this repository's Zakuro --------------------------
-Step "Building the program"
-$manifest = Join-Path $Port "Cargo.toml"
-$zakuro = (Join-Path $Root "zakuro\crates\zakuro") -replace '\\', '/'
-$text = Get-Content -Raw $manifest
-$text = $text -replace 'zakuro = \{[^}]*\}', "zakuro = { path = `"$zakuro`" }"
-if ($text -notmatch '\[profile\.release\]') {
-    # what Zakuro builds itself with, which a dependency doesn't pass on
-    $text += "`n[profile.release]`nopt-level = 3`nlto = `"thin`"`ncodegen-units = 4`npanic = `"unwind`"`n"
+function Build-Program([string]$port) {
+    Step "Building the program"
+    $manifest = Join-Path $port "Cargo.toml"
+    $zakuro = (Join-Path $Root "zakuro\crates\zakuro") -replace '\\', '/'
+    $text = Read-Text $manifest
+    $text = $text -replace 'zakuro = \{[^}]*\}', "zakuro = { path = `"$zakuro`" }"
+    if ($text -notmatch '\[profile\.release\]') {
+        # what Zakuro builds itself with, which a dependency doesn't pass on
+        $text += "`n[profile.release]`nopt-level = 3`nlto = `"thin`"`ncodegen-units = 4`npanic = `"unwind`"`n"
+    }
+    Write-Utf8NoBom $manifest $text
+    New-Item -ItemType Directory -Force -Path (Join-Path $port ".cargo") | Out-Null
+    # built for this machine's processor only
+    Write-Utf8NoBom (Join-Path $port ".cargo\config.toml") "[build]`nrustflags = [`"-C`", `"target-cpu=native`"]`r`n"
+    # the crate versions Zakuro is tested with, and 3dsrecomp's runtime at the
+    # commit that translated the code; left alone, cargo takes 3dsrecomp's main
+    # of the day, which the translated code was not made for
+    Copy-Item -Force (Join-Path $Root "zakuro\Cargo.lock") (Join-Path $port "Cargo.lock")
+    Run cargo @("update", "--quiet", "-p", "recomp3ds", "-p", "recomp-abi", "--precise", $RecompCommit) $port
+    Run cargo @("build", "--release") $port
 }
-Set-Content -NoNewline -Path $manifest -Value $text
-New-Item -ItemType Directory -Force -Path (Join-Path $Port ".cargo") | Out-Null
-# built for this machine's processor only
-Set-Content -Path (Join-Path $Port ".cargo\config.toml") -Value "[build]`nrustflags = [`"-C`", `"target-cpu=native`"]"
-# the crate versions Zakuro is tested with, and 3dsrecomp's runtime at the
-# commit that translated the code; left alone, cargo takes 3dsrecomp's main
-# of the day, which the translated code was not made for
-Copy-Item -Force (Join-Path $Root "zakuro\Cargo.lock") (Join-Path $Port "Cargo.lock")
-Run cargo @("update", "--quiet", "-p", "recomp3ds", "-p", "recomp-abi", "--precise", $RecompCommit) $Port
-Run cargo @("build", "--release") $Port
-$Exe = Join-Path $Port "target\release\kid-icarus.exe"
 
 # --- the program's icon and name, the icon taken from your ROM ---------------
-Step "Giving the program the game's icon and name"
-$Resource = Join-Path $Port "program.res"
-$buildScript = Join-Path $Port "build.rs"
-# done only once the build script links what windres made
-$done = (Test-Path $Resource) -and (Get-Content -Raw $buildScript).Contains("program.res")
-if ($Force -or -not $done) {
-    Run $Exe @("--save-icon", (Join-Path $Port "icon.ico"), $Rom) $Port
+function Set-ProgramIcon([string]$port, [string]$exe, [string]$rom) {
+    Step "Giving the program the game's icon and name"
+    $resource = Join-Path $port "program.res"
+    $buildScript = Join-Path $port "build.rs"
+    # done only once the build script links what windres made
+    $done = (Test-Path $resource) -and (Read-Text $buildScript).Contains("program.res")
+    if (-not $Force -and $done) {
+        Write-Host "already done (-Force does it again)"
+        return
+    }
+    Run $exe @("--save-icon", (Join-Path $port "icon.ico"), $rom) $port
     # an unofficial build, so it names no company
-    Set-Content -Path (Join-Path $Port "program.rc") -Value @'
+    Write-Utf8NoBom (Join-Path $port "program.rc") (@'
 1 ICON "icon.ico"
 1 VERSIONINFO
 FILEVERSION 0,1,0,0
@@ -234,20 +231,44 @@ BEGIN
     VALUE "Translation", 0x409, 1200
   END
 END
-'@
-    Run windres @("program.rc", "-O", "coff", "-o", "program.res") $Port
+'@ + "`r`n")
+    Run windres @("program.rc", "-O", "coff", "-o", "program.res") $port
     # the build script 3dsrecomp wrote links it into the program
-    $text = Get-Content -Raw $buildScript
+    $text = Read-Text $buildScript
     if (-not $text.Contains("program.res")) {
         $link = 'println!("cargo:rerun-if-changed=program.res"); println!("cargo:rustc-link-arg-bins={}/program.res", var("CARGO_MANIFEST_DIR").unwrap());'
-        Set-Content -NoNewline -Path $buildScript -Value $text.Replace("fn main() {", "fn main() {`n    $link")
+        Write-Utf8NoBom $buildScript $text.Replace("fn main() {", "fn main() {`n    $link")
     }
-    Run cargo @("build", "--release") $Port
-} else {
-    Write-Host "already done (-Force does it again)"
+    Run cargo @("build", "--release") $port
 }
 
-$Play = Join-Path $Root "Play.bat"
-Set-Content -Path $Play -Value "@echo off`r`n`"$Exe`" `"$Rom`""
+# --- Play.bat, in the repository root ----------------------------------------
+# cmd reads a batch file in the console's code page: 65001 makes it read this
+# one as the UTF-8 it is written in. The program is found next to the batch
+# file; % in the ROM's path is doubled so cmd does not take it for a variable.
+function Write-PlayBat([string]$exe, [string]$rom) {
+    $play = Join-Path $Root "Play.bat"
+    $program = $exe.Substring($Root.Length).TrimStart('\')
+    $romArg = $rom -replace '%', '%%'
+    Write-Utf8NoBom $play "@echo off`r`nchcp 65001>nul`r`n`"%~dp0$program`" `"$romArg`"`r`n"
+    $play
+}
+
+# --- main ---------------------------------------------------------------------
+$info = Test-Rom $Rom
+if ($CheckOnly) { exit 0 }
+# each release in its own folder, so building one keeps the other
+$Port = Join-Path $Build $(if ($info.Region -eq "USA") { "port-usa" } else { "port" })
+$Exe = Join-Path $Port "target\release\kid-icarus.exe"
+
+New-Item -ItemType Directory -Force -Path $Tools, $Build | Out-Null
+. (Join-Path $PSScriptRoot "env.ps1")
+Install-Gcc
+Install-Rust
+Install-Recomp
+Invoke-Translation $info $Port
+Build-Program $Port
+Set-ProgramIcon $Port $Exe $info.Path
+$Play = Write-PlayBat $Exe $info.Path
 Step "Done"
 Write-Host "Play with $Play"

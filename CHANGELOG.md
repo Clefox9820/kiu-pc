@@ -13,6 +13,21 @@
   `ZAKURO_UPSCALER`. A `cache\hd` folder an earlier build left in the data
   folder is no longer read and can be deleted. Settings files that still
   name the option load as before.
+- Widescreen keeps the top screen's HUD in proportion instead of
+  stretching it (a known issue of v0.1.0): each 2D piece along an edge is
+  squeezed back toward that edge and the rest, such as markers, around its
+  own middle. Portraits and badge figures stay in place, subtitles are
+  squeezed once, and text and lines the game draws in pieces keep their
+  spacing.
+- The USA build stops when an override names an address in the game's code
+  that has no USA address yet, instead of leaving it European. The table
+  moved from `scripts\setup.ps1` to `overrides\usa-addresses.psd1`.
+- `scripts\setup.ps1` writes `Cargo.toml`, `build.rs` and `Play.bat` as
+  UTF-8, so paths with accents are no longer mangled in them; `Play.bat`
+  finds the program next to itself and takes a ROM path with `%`. An
+  interrupted unpack of gcc no longer leaves half a toolchain behind.
+- The `no game files` check reads every commit a push adds, and also
+  blocks `tools/`, `build/`, `Play.bat`, game audio and icons.
 
 ## v0.1.0 — first release
 
@@ -28,10 +43,11 @@ game on your machine from your ROM. See the README for requirements (Windows
 10+, Vulkan 1.3, about 6 GB of disk and 75 minutes per release).
 
 To get later updates with `git pull`, clone the repository instead of
-downloading the source archive:
+downloading the source archive (the `v0.1.0` tag has not been pushed yet,
+so the clone gets the latest code):
 
 ```powershell
-git clone --branch v0.1.0 https://github.com/Clefox9820/kiu-pc.git
+git clone https://github.com/Clefox9820/kiu-pc.git
 cd kiu-pc
 powershell -ExecutionPolicy Bypass -File scripts\setup.ps1 -Rom "D:\path\to\your\dump.cci"
 ```

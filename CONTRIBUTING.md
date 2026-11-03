@@ -15,8 +15,15 @@ link to:
 - saves, save states, `.hints` or `.keys` files;
 - screenshots or videos of the game, or Nintendo logos and art.
 
-The `no game files` workflow in `.github/workflows/` blocks dump and binary
-extensions, generated `code/*.c`, files over 2 MB, and images or videos.
+Diagrams you made yourself are welcome, as SVG: the workflow below blocks
+every raster image, since it cannot tell a diagram from a screenshot.
+
+The `no game files` workflow in `.github/workflows/` reads every commit a
+push or pull request adds, not only the last one, and blocks dump, binary,
+game audio and icon extensions, generated `code/*.c`, anything under
+`tools/` or `build/`, `Play.bat`, files over 2 MB, and images or videos.
+`.github/scripts/no-game-files.sh` runs the same check locally, for example
+`git rev-list origin/main..HEAD | bash .github/scripts/no-game-files.sh`.
 Issues and pull requests asking for ROMs or game files are closed without
 discussion.
 
@@ -25,8 +32,14 @@ discussion.
 | Path | Contents |
 | --- | --- |
 | `zakuro/` | Zakuro, imported with `git subtree --squash` from fearkov/zakuro at `70b56de`, plus this project's changes |
+| `overrides/` | Hand-written C that replaces game functions by their European address, and `usa-addresses.psd1`, the same addresses in the USA release |
 | `scripts/setup.ps1` | Windows setup: checks the ROM, installs tools, builds 3dsrecomp, translates and builds the game |
-| `.github/` | CI guard and issue templates |
+| `scripts/env.ps1` | The toolchain environment setup.ps1 uses, to dot-source in your own shell |
+| `scripts/lib/` | PowerShell modules the scripts share: ROM header reading, the USA address table |
+| `scripts/find-usa-addresses.ps1` | For maintainers: finds the USA address of each override address from both ROMs and checks the table |
+| `scripts/drive-window.ps1` | For maintainers: drives and captures a test game window for unattended checks |
+| `.github/` | CI guard (`workflows/`, `scripts/`) and issue templates |
+| `.claude/`, `AGENTS.md` | Instructions and skills for AI coding agents working on this repository |
 | `tools/`, `build/`, `Play.bat` | Created by the setup script; ignored by git |
 
 ## Updating Zakuro from upstream
@@ -41,13 +54,21 @@ reintroduce upstream's game screenshots.
 ## Building and testing
 
 Run `scripts/setup.ps1` once to get the toolchain in `tools/`. To use it from
-a shell (Git Bash shown):
+PowerShell, dot-source the same settings setup.ps1 uses, from the repository
+root:
+
+```powershell
+. scripts\env.ps1
+```
+
+From Git Bash, the same settings are:
 
 ```sh
 export RUSTUP_HOME="$PWD/tools/rustup"
 export CARGO_HOME="$PWD/tools/cargo"
-export PATH="$PWD/tools/mingw64/bin:$CARGO_HOME/bin:$PATH"
+export PATH="$CARGO_HOME/bin:$PWD/tools/mingw64/bin:$PATH"
 export CC=gcc
+export AR=ar
 ```
 
 Then:
@@ -84,10 +105,14 @@ not be committed.
 - **Land aim feedback.** Mouse aim mode 3 (on foot) is new and has not been
   confirmed in real play. Reports on how it feels, and when it misbehaves,
   are very useful.
-- **Overrides.** A true mouse-controlled camera, or a HUD laid out for
-  widescreen instead of stretched, would need more 3dsrecomp overrides: hand-written C replacing specific game functions by
-  address. Overrides are human-written and may be committed; the generated
-  code around them may not.
+- **Overrides.** Mouse look on foot, mouse aim while flying, the automatic
+  aim mode and the widescreen camera come from 3dsrecomp overrides:
+  hand-written C replacing specific game functions by address. They have
+  not been confirmed in long real play, and the USA release's were matched
+  by code but not tried in play; reports and fixes are welcome. Overrides
+  are human-written and may be committed; the generated code around them
+  may not. A new override address needs its USA one in
+  `overrides/usa-addresses.psd1`, or the USA build stops.
 - **Upstreaming.** Several changes in `zakuro/` are general fixes (for
   example, geometry shader mode 2 and the pipeline key list) that could
   benefit Zakuro itself.

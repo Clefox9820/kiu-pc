@@ -27,5 +27,5 @@ Always:
   the skill it belongs to before you finish, so the next agent does not pay
   for it again.
 - Keep both releases working: Europe (`build/port`) and USA (`build/port-usa`).
-  A change to `overrides/` needs its USA addresses (`scripts/find-usa-addresses.ps1`)
-  and a rebuild of both; see `kiu-build`.
+  A change to `overrides/` needs its USA addresses in `overrides/usa-addresses.psd1`
+  (`scripts/find-usa-addresses.ps1`) and a rebuild of both; see `kiu-build`.
