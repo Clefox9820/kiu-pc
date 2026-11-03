@@ -22,9 +22,23 @@
  */
 #include "overrides.h"
 
-#define WIDENING 0x07000010u    /* Zakuro's HOST_MAILBOX_VADDR + 16 */
-#define WORKED_OUT 0x4u          /* the camera's matrix is cached */
-#define MINUS_ONE 0xBF800000u    /* -1.0f, a perspective matrix's w row */
+/* Zakuro's host mailbox, words of 4 bytes from its start, named and
+   numbered as in zakuro/crates/zakuro-common/src/memory_map.rs */
+#define HOST_MAILBOX_VADDR 0x07000000u
+#define HOST_MAILBOX_TOP_WIDENING 4
+#define HOST_MAILBOX_WORD(index) (HOST_MAILBOX_VADDR + 4u * (index))
+
+/* the camera, by byte offset */
+#define CAMERA_FLAGS 0x8u        /* WORKED_OUT says the matrix is cached */
+#define CAMERA_PROJECTION 0x6Cu  /* the 4x4 projection matrix, as floats */
+#define WORKED_OUT 0x4u
+
+/* the projection matrix, by byte offset */
+#define MATRIX_ACROSS_ROW 0x10u  /* the second row, across the top screen */
+#define MATRIX_ROW_SIZE 0x10u
+#define MATRIX_W_ROW_Z 0x38u     /* MINUS_ONE in a perspective matrix */
+#define MINUS_ONE 0xBF800000u    /* -1.0f */
+
 #define CAMERAS 128
 
 static struct {
@@ -72,14 +86,14 @@ static int slot_of(uint32_t camera, int fresh) {
 
 RECOMP_OVERRIDE(0x0039025C) {
     uint32_t camera = ctx->r[0];
-    int fresh = !(mem_read32(ctx, camera + 0x8) & WORKED_OUT);
+    int fresh = !(mem_read32(ctx, camera + CAMERA_FLAGS) & WORKED_OUT);
     CALL(RECOMP_ORIGINAL(0x0039025C));
 
-    uint32_t matrix = camera + 0x6C;
+    uint32_t matrix = camera + CAMERA_PROJECTION;
     /* an orthographic matrix, for 2D, keeps its shape */
-    if (mem_read32(ctx, matrix + 0x38) != MINUS_ONE) return;
+    if (mem_read32(ctx, matrix + MATRIX_W_ROW_Z) != MINUS_ONE) return;
 
-    float widening = as_float(mem_read32(ctx, WIDENING));
+    float widening = as_float(mem_read32(ctx, HOST_MAILBOX_WORD(HOST_MAILBOX_TOP_WIDENING)));
     float scale = widening > 0.0f ? 1.0f / widening : 1.0f;
     int slot = slot_of(camera, fresh);
     if (slot < 0) return;
@@ -87,7 +101,8 @@ RECOMP_OVERRIDE(0x0039025C) {
     if (applied[slot].scale == scale) return;
 
     float by = scale / applied[slot].scale;
-    for (uint32_t at = matrix + 0x10; at < matrix + 0x20; at += 4) {
+    uint32_t row = matrix + MATRIX_ACROSS_ROW;
+    for (uint32_t at = row; at < row + MATRIX_ROW_SIZE; at += 4) {
         mem_write32(ctx, at, as_bits(as_float(mem_read32(ctx, at)) * by));
     }
     applied[slot].scale = scale;

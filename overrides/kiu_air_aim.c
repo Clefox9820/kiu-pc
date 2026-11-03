@@ -22,8 +22,19 @@
  */
 #include "overrides.h"
 
-#define MAILBOX 0x07000000u   /* Zakuro's HOST_MAILBOX_VADDR */
+/* Zakuro's host mailbox, words of 4 bytes from its start, named and
+   numbered as in zakuro/crates/zakuro-common/src/memory_map.rs */
+#define HOST_MAILBOX_VADDR 0x07000000u
+#define HOST_MAILBOX_LOOK_MARK 0
+#define HOST_MAILBOX_LOOK_ACROSS 1
+#define HOST_MAILBOX_LOOK_DOWN 2
+#define HOST_MAILBOX_WORD(index) (HOST_MAILBOX_VADDR + 4u * (index))
+
 #define MOUSE_AIM 0x314D414Du /* "MAM1" read as a little-endian word */
+
+/* the reticle's position, in top screen pixels, as floats */
+#define RETICLE_X 0xA4u
+#define RETICLE_Y 0xA8u
 
 /* top screen pixels per bottom screen pixel, 400 wide over 320 */
 #define TOP_PER_BOTTOM 1.25f
@@ -41,31 +52,31 @@ static uint32_t as_bits(float value) {
 }
 
 RECOMP_OVERRIDE(0x006D27E8) {
-    if (mem_read32(ctx, MAILBOX) != MOUSE_AIM) {
+    if (mem_read32(ctx, HOST_MAILBOX_WORD(HOST_MAILBOX_LOOK_MARK)) != MOUSE_AIM) {
         CALL(RECOMP_ORIGINAL(0x006D27E8));
         return;
     }
     uint32_t reticle = ctx->r[0];
-    uint32_t x = mem_read32(ctx, reticle + 0xA4);
-    uint32_t y = mem_read32(ctx, reticle + 0xA8);
-    /* ponytail: when the original yields partway (budget or svc), the rest
-       runs as generated code and this tick's drift is kept */
+    uint32_t x = mem_read32(ctx, reticle + RETICLE_X);
+    uint32_t y = mem_read32(ctx, reticle + RETICLE_Y);
+    /* When the original yields partway (budget or svc), the rest runs as
+       generated code and this tick's drift is kept. */
     CALL(RECOMP_ORIGINAL(0x006D27E8));
-    mem_write32(ctx, reticle + 0xA4, x);
-    mem_write32(ctx, reticle + 0xA8, y);
+    mem_write32(ctx, reticle + RETICLE_X, x);
+    mem_write32(ctx, reticle + RETICLE_Y, y);
 }
 
 RECOMP_OVERRIDE(0x006D2C08) {
-    if (mem_read32(ctx, MAILBOX) == MOUSE_AIM) {
+    if (mem_read32(ctx, HOST_MAILBOX_WORD(HOST_MAILBOX_LOOK_MARK)) == MOUSE_AIM) {
         uint32_t reticle = ctx->r[0];
-        float across = as_float(mem_read32(ctx, MAILBOX + 4));
-        float down = as_float(mem_read32(ctx, MAILBOX + 8));
-        mem_write32(ctx, MAILBOX + 4, 0);
-        mem_write32(ctx, MAILBOX + 8, 0);
-        float x = as_float(mem_read32(ctx, reticle + 0xA4)) + across * TOP_PER_BOTTOM;
-        float y = as_float(mem_read32(ctx, reticle + 0xA8)) + down * TOP_PER_BOTTOM;
-        mem_write32(ctx, reticle + 0xA4, as_bits(x));
-        mem_write32(ctx, reticle + 0xA8, as_bits(y));
+        float across = as_float(mem_read32(ctx, HOST_MAILBOX_WORD(HOST_MAILBOX_LOOK_ACROSS)));
+        float down = as_float(mem_read32(ctx, HOST_MAILBOX_WORD(HOST_MAILBOX_LOOK_DOWN)));
+        mem_write32(ctx, HOST_MAILBOX_WORD(HOST_MAILBOX_LOOK_ACROSS), 0);
+        mem_write32(ctx, HOST_MAILBOX_WORD(HOST_MAILBOX_LOOK_DOWN), 0);
+        float x = as_float(mem_read32(ctx, reticle + RETICLE_X)) + across * TOP_PER_BOTTOM;
+        float y = as_float(mem_read32(ctx, reticle + RETICLE_Y)) + down * TOP_PER_BOTTOM;
+        mem_write32(ctx, reticle + RETICLE_X, as_bits(x));
+        mem_write32(ctx, reticle + RETICLE_Y, as_bits(y));
     }
     CALL(RECOMP_ORIGINAL(0x006D2C08));
 }

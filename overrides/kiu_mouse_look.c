@@ -18,7 +18,14 @@
  */
 #include "overrides.h"
 
-#define MAILBOX 0x07000000u    /* Zakuro's HOST_MAILBOX_VADDR */
+/* Zakuro's host mailbox, words of 4 bytes from its start, named and
+   numbered as in zakuro/crates/zakuro-common/src/memory_map.rs */
+#define HOST_MAILBOX_VADDR 0x07000000u
+#define HOST_MAILBOX_LOOK_MARK 0
+#define HOST_MAILBOX_LOOK_ACROSS 1
+#define HOST_MAILBOX_LOOK_DOWN 2
+#define HOST_MAILBOX_WORD(index) (HOST_MAILBOX_VADDR + 4u * (index))
+
 #define MOUSE_LOOK 0x314B4C4Du /* "MLK1" read as a little-endian word */
 
 /* radians per bottom screen pixel of stylus drag, measured in game:
@@ -33,11 +40,11 @@ static float as_float(uint32_t bits) {
 }
 
 RECOMP_OVERRIDE(0x0074643C) {
-    if (mem_read32(ctx, MAILBOX) == MOUSE_LOOK) {
-        float across = as_float(mem_read32(ctx, MAILBOX + 4));
-        float down = as_float(mem_read32(ctx, MAILBOX + 8));
-        mem_write32(ctx, MAILBOX + 4, 0);
-        mem_write32(ctx, MAILBOX + 8, 0);
+    if (mem_read32(ctx, HOST_MAILBOX_WORD(HOST_MAILBOX_LOOK_MARK)) == MOUSE_LOOK) {
+        float across = as_float(mem_read32(ctx, HOST_MAILBOX_WORD(HOST_MAILBOX_LOOK_ACROSS)));
+        float down = as_float(mem_read32(ctx, HOST_MAILBOX_WORD(HOST_MAILBOX_LOOK_DOWN)));
+        mem_write32(ctx, HOST_MAILBOX_WORD(HOST_MAILBOX_LOOK_ACROSS), 0);
+        mem_write32(ctx, HOST_MAILBOX_WORD(HOST_MAILBOX_LOOK_DOWN), 0);
         vfp_set_s(ctx, 0, vfp_s(ctx, 0) + across * YAW_PER_PIXEL);
         vfp_set_s(ctx, 1, vfp_s(ctx, 1) + down * PITCH_PER_PIXEL);
     }
