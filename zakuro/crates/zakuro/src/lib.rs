@@ -1786,17 +1786,17 @@ impl App {
         // where the controls can go, the window's pixels no screen covers, while
         // a game runs without the 3D, which places the screens otherwise
         let screens = self.layout.screens_in(self.game.as_ref().is_some_and(|game| game.play.in_play()));
-        let free = (kiu_controls::CONTROLS_HINT_ENABLED
+        let shows_controls = kiu_controls::CONTROLS_HINT_ENABLED
             && self.game.is_some()
             && self.settings.show_controls
-            && self.settings.stereo == settings::Stereo3d::Off)
-            .then(|| {
-                let size = window.inner_size();
-                let (top, bottom) =
-                    layout(size.width, size.height, screens, self.top_shape.width(), self.settings.integer_scale);
-                kiu_play::free_regions(size.width as f32, size.height as f32, &[top, bottom].into_iter().flatten().collect::<Vec<_>>())
-            })
-            .unwrap_or_default();
+            && self.settings.stereo == settings::Stereo3d::Off;
+        let free = if shows_controls {
+            let size = window.inner_size();
+            let (top, bottom) = layout(size.width, size.height, screens, self.top_shape.width(), self.settings.integer_scale);
+            kiu_play::free_regions(size.width as f32, size.height as f32, &[top, bottom].into_iter().flatten().collect::<Vec<_>>())
+        } else {
+            Vec::new()
+        };
         let aim = AimMode::digit(self.keyboard.aim.mode());
         let warming = self.game.as_ref().and(warm::progress());
         let corner = self.overlay_corner.clone().filter(|_| game.is_some());

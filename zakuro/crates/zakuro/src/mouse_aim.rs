@@ -189,9 +189,8 @@ impl MouseAim {
             self.quiet = 0;
             return (self.game.replace(mode) != Some(mode)).then_some(Some(mode));
         }
-        if self.game.is_none() {
-            return None;
-        }
+        // nothing to turn off while the game has said nothing
+        self.game?;
         // no word from the game for as long as it takes to be out of play
         // is a menu, where aim goes off
         self.quiet += 1;
