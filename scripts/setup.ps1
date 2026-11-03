@@ -8,9 +8,10 @@ this repository. Nothing from the game is in the repository: the ROM you
 give is read here, on your machine, and what is made from it stays in
 build\, which git ignores.
 
-Needs Windows 10 or newer, about 6 GB of free disk and, for the first build,
-about 75 minutes. Close heavy programs first: 3dsrecomp runs as many
-compilers at once as the free memory allows, measured once at the start.
+Needs Windows 10 or newer, about 6 GB of free disk and about 75 minutes per
+release to translate, plus about 10 the first time for the tools. Close
+heavy programs first: 3dsrecomp runs as many compilers at once as the free
+memory allows, measured once at the start.
 
 .PARAMETER Rom
 Your decrypted dump of the game, a .3ds or .cci file.

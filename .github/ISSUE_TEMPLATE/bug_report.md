@@ -22,6 +22,8 @@ Issues that do are closed.
 
 **System**
 
+- Release of the game: Europe / USA
+- kiu-pc commit (`git rev-parse --short HEAD` in the repository folder):
 - Windows version:
 - GPU (model and driver version):
 - Game and build on: HDD / SSD

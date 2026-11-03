@@ -144,7 +144,6 @@ The mouse aim speeds are in **Options**.
 | P / M | Start / Select |
 | N / B | ZL / ZR |
 | Numpad | C-Stick |
-| 1, 2, 3 | Mouse aim, which also switches by itself: on foot, flying, or off in menus (a key picks one until the game changes mode) |
 | 1 | Mouse aim off |
 | 2 | Mouse aim for flying: the mouse moves the reticle directly (with the overrides; otherwise the stylus follows the mouse) |
 | 3 | Mouse aim on foot: the mouse turns the camera directly (mouse look); hold right click to drag the stylus instead |
@@ -162,9 +161,10 @@ you are in the menus, on foot or flying, the story's chapter you are
 playing, and for how long, when the Discord app is open on the same
 computer. Everything else is under **All settings**.
 
-A short notice is shown when the aim mode changes. Mode 3 recenters the
-stylus instead of letting it reach the screen edge, which avoids the game's
-quick "flick" camera spin.
+Mouse aim also switches by itself: on foot, flying, or off in menus; 1, 2
+or 3 picks one until the game changes mode. A short notice is shown when
+the aim mode changes. Mode 3 recenters the stylus instead of letting it
+reach the screen edge, which avoids the game's quick "flick" camera spin.
 
 ## Performance
 
