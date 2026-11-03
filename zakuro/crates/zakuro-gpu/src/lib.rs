@@ -215,6 +215,24 @@ const EXTERNAL_REGISTER_WORDS: usize = 0x1000;
 /// PICA internal register file size.
 const INTERNAL_REGISTER_WORDS: usize = 0x300;
 
+/// why a title's small textures can't be drawn from Anime4K's pictures.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UpscaleUnavailable {
+    /// the 3D is drawn in software, and only the host's GPU draws them.
+    SoftwareRenderer,
+    /// Anime4K's network could not be read from its shader.
+    NetworkUnreadable,
+}
+
+impl std::fmt::Display for UpscaleUnavailable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            UpscaleUnavailable::SoftwareRenderer => "they take the 3D drawn on the GPU",
+            UpscaleUnavailable::NetworkUnreadable => "Anime4K's network could not be read",
+        })
+    }
+}
+
 impl Default for Gpu {
     fn default() -> Self {
         Self::new()
@@ -716,11 +734,20 @@ impl Gpu {
     /// has the small textures no pack replaces, a HUD's, menus' and
     /// portraits', drawn from Anime4K's pictures of them twice as big, see
     /// anime4k, or not. only the host's GPU draws them, so it waits for
-    /// enable_hardware_renderer, and says whether they are drawn.
-    pub fn set_texture_upscale(&mut self, upscale: bool) -> bool {
-        let upscale = upscale && self.draws_on_gpu() && anime4k::texture_network().is_some();
-        self.resources.textures.set_upscale(upscale);
-        upscale
+    /// enable_hardware_renderer; asked for when they can't be drawn, they
+    /// stay off and it says why.
+    pub fn set_texture_upscale(&mut self, upscale: bool) -> Result<(), UpscaleUnavailable> {
+        let unavailable = if !upscale {
+            None
+        } else if !self.draws_on_gpu() {
+            Some(UpscaleUnavailable::SoftwareRenderer)
+        } else if anime4k::texture_network().is_none() {
+            Some(UpscaleUnavailable::NetworkUnreadable)
+        } else {
+            None
+        };
+        self.resources.textures.set_upscale(upscale && unavailable.is_none());
+        unavailable.map_or(Ok(()), Err)
     }
 
     /// whether the 3D is drawn on the host's GPU, enable_hardware_renderer
@@ -1548,6 +1575,16 @@ mod tests {
 
     /// a display transfer to a framebuffer of a screen the window does not
     /// show goes to a hidden screen, unless a shown one uses that buffer too.
+    /// asked for while the 3D is drawn in software, Anime4K's textures stay
+    /// off and say why; not asked for, there is nothing to say.
+    #[test]
+    fn upscaled_textures_say_why_they_are_left_out() {
+        let mut gpu = Gpu::new();
+        assert_eq!(gpu.set_texture_upscale(true), Err(UpscaleUnavailable::SoftwareRenderer));
+        assert_eq!(gpu.set_texture_upscale(false), Ok(()));
+        assert_eq!(UpscaleUnavailable::SoftwareRenderer.to_string(), "they take the 3D drawn on the GPU");
+    }
+
     #[test]
     fn transfers_to_a_screen_not_shown_go_to_a_hidden_one() {
         let mut gpu = Gpu::new();

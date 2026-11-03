@@ -238,8 +238,8 @@ pub fn load(path: impl AsRef<std::path::Path>, mut config: Config) -> Result<Sys
     }
     if system.config.upscale_textures {
         match system.gpu.set_texture_upscale(true) {
-            true => log::info!("small textures drawn twice as big by Anime4K"),
-            false => log::warn!("Anime4K's textures take the 3D drawn on the GPU, they are left out"),
+            Ok(()) => log::info!("small textures drawn twice as big by Anime4K"),
+            Err(reason) => log::warn!("Anime4K's textures are left out, {reason}"),
         }
     }
 
