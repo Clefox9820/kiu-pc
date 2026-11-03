@@ -35,9 +35,15 @@ pub const CONSOLE_HASH: u64 = 0x0000_5255_3341_5A55;
 /// and the title's salt, as the console hashes its unique id. local
 /// wireless games tell players apart by it, Kid Icarus: Uprising keeps a
 /// joining console waiting forever when it gives the host's own.
+///
+/// the answer depends on the install's console id, which the frontend picks
+/// once per install, and no longer is CONSOLE_HASH for every salt. a title
+/// that binds its saves or StreetPass data to this hash sees another console
+/// after the change from the fixed answer, and on another PC.
 fn console_hash(console_id: u64, salt: u32) -> u64 {
-    // splitmix64's finalizer, any good mix of the two does
-    let mut x = console_id ^ (salt as u64).rotate_left(32) ^ CONSOLE_HASH;
+    // splitmix64's finalizer, any good mix of the two does; the salt has 32
+    // bits, so shifting it up is the rotation it was written as
+    let mut x = console_id ^ ((salt as u64) << 32) ^ CONSOLE_HASH;
     x = (x ^ (x >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
     x = (x ^ (x >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
     x ^ (x >> 31)
@@ -204,5 +210,18 @@ mod tests {
         assert_ne!(console_hash_of(1, 0x1000), console_hash_of(2, 0x1000));
         assert_eq!(console_hash_of(1, 0x1000), console_hash_of(1, 0x1000));
         assert_ne!(console_hash_of(1, 0x1000), console_hash_of(1, 0x2000));
+    }
+
+    /// the hash is the one the salt's rotation gave, a console keeps its
+    /// answers: shifting a 32-bit salt up is rotating it.
+    #[test]
+    fn the_console_hash_mixes_the_salt_in_its_high_half() {
+        for (console_id, salt) in [(1, 0), (0x5A4B_0000_0000_0001, 0x1000), (u64::MAX, u32::MAX)] {
+            let rotated = console_id ^ (salt as u64).rotate_left(32) ^ CONSOLE_HASH;
+            let mut x = rotated;
+            x = (x ^ (x >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            x = (x ^ (x >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            assert_eq!(console_hash(console_id, salt), x ^ (x >> 31), "console {console_id:X}, salt {salt:X}");
+        }
     }
 }

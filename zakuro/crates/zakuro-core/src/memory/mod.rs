@@ -986,7 +986,7 @@ mod tests {
         let mut memory = Memory::new(false, 0);
         memory.host_mailbox = [1, 2, 3, 4, 5];
         assert_eq!(memory.read32(HOST_MAILBOX_VADDR + 4), 2);
-        assert_eq!(memory.read32(HOST_MAILBOX_VADDR + 0x10), 5, "the fifth word, the top screen's widening");
+        assert_eq!(memory.read32(HOST_MAILBOX_VADDR + 0x10), 5, "the fifth word, the last one");
         memory.write32(HOST_MAILBOX_VADDR + 8, 0);
         assert_eq!(memory.host_mailbox, [1, 2, 0, 4, 5]);
         assert!(memory.fault_summary().is_empty(), "the mailbox is no fault");
