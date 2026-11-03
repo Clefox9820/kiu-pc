@@ -1372,8 +1372,8 @@ fn fixed_primitives(
     }
     let attributes: Vec<Vec4> = vertex_outputs.flat_map(|outputs| outputs.into_iter().take(per_vertex)).collect();
     let primitives: Vec<&[Vec4]> = attributes.chunks_exact(per_primitive).collect();
-    // ponytail: one run a primitive, as the uniforms differ for each; uniforms
-    // a lane in the batched runner would take eight at once if this shows
+    // one run a primitive, as the uniforms differ for each; with uniforms
+    // a lane, the batched runner would take eight at once, should this show
     let run = |chunk: &[&[Vec4]]| {
         let mut patched = unit.clone();
         chunk
