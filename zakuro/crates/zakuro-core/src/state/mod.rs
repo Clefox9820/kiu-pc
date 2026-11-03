@@ -164,18 +164,7 @@ impl System {
             return Err("it was saved from another game".into());
         }
         let state = reader.section()?;
-        let saved: Saved = match version == VERSION {
-            true => postcard::from_bytes(&state).map_err(|error| format!("the state could not be read, {error}"))?,
-            // another version's state is taken only when it reads to the last
-            // byte as this one's does: what it saves has the same shape
-            false => match postcard::take_from_bytes::<Saved>(&state) {
-                Ok((saved, [])) => {
-                    log::warn!("a state saved by Zakuro {version}, read as this {VERSION} saves them");
-                    saved
-                }
-                _ => return Err(format!("it was saved by Zakuro {version}, and this is {VERSION}")),
-            },
-        };
+        let saved = read_saved(&version, &state)?;
         let memories = [reader.section()?, reader.section()?, reader.section()?, reader.section()?];
         let phys = &self.memory.phys;
         let sizes = [phys.fcram.len(), phys.vram.len(), phys.dsp_ram.len(), phys.axi_wram.len()];
@@ -279,6 +268,28 @@ impl<'a> Reader<'a> {
         let length = self.u64()?;
         let compressed = self.take(usize::try_from(length).map_err(|_| "a part of the state is too long")?)?;
         lz4_flex::decompress_size_prepended(compressed).map_err(|error| format!("a part of the state is damaged, {error}"))
+    }
+}
+
+/// reads what a state saves, `bytes`, which Zakuro `version` wrote.
+///
+/// a state of this version is read as it is. another version's is taken
+/// when it reads to the last byte as this one's does, and turned down
+/// otherwise. reading to the last byte does not prove the layout is the
+/// same: two versions whose fields moved or changed meaning, with the same
+/// lengths, read without an error into the wrong fields.
+// ponytail: a list of the versions known to save the same layout would be
+// stricter, and would turn down states this takes now
+fn read_saved(version: &str, bytes: &[u8]) -> Result<Saved, String> {
+    if version == VERSION {
+        return postcard::from_bytes(bytes).map_err(|error| format!("the state could not be read, {error}"));
+    }
+    match postcard::take_from_bytes::<Saved>(bytes) {
+        Ok((saved, [])) => {
+            log::warn!("a state saved by Zakuro {version}, read as this {VERSION} saves them");
+            Ok(saved)
+        }
+        _ => Err(format!("it was saved by Zakuro {version}, and this is {VERSION}")),
     }
 }
 
