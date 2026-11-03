@@ -20,6 +20,7 @@ Load when pulling newer Zakuro into `zakuro/`, resolving conflicts with upstream
 - Only general fixes go upstream (warm preload, GS mode 2, pipeline keys, diagnostics). KIU-specific parts (mouse aim modes, controls panel, KIU default keymap) stay in this repo.
 - When upstream already did something we also did, redo the conflicted files with `git merge-file --diff3` against our tip without those commits (base = the previous upstream split, theirs = the new upstream commit): ours drops out by itself and the conflicts shrink (0.2.31: raster.rs from 39 to 9).
 - Git Bash `sed -i` turns these CRLF files into LF; convert them back before committing, or diffs fill with line-ending noise.
+- A pull can move `recomp-abi` in `zakuro/Cargo.lock` past setup's `$RecompCommit`; setup keeps Zakuro's runtime (a newer host runs older code), so never pin it back to the translator's commit: 0.2.31 then failed to build on every fresh install (`Host` has no field `svc`). Only a fresh-clone setup catches it, since your own `build/` keeps an older lock.
 - Never copy code from GPL projects (for example TriAevum) into this MIT repo without the user deciding to relicense.
 
 ## Decision Gates

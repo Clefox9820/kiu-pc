@@ -44,6 +44,9 @@
   known to save states the same way (0.2.29 for this 0.2.31); any other is
   turned down, naming its version, instead of possibly loading into the
   wrong place.
+- Fixed: a new install stopped with "struct `Host` has no field named
+  `svc`" since Zakuro 0.2.31, because `scripts\setup.ps1` built it against an
+  older 3dsrecomp runtime than the one Zakuro needs.
 - `svcGetHandleInfo` answers only for the game's own process, and returns
   the console's invalid-handle and invalid-type errors for anything else,
   instead of success.

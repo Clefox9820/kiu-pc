@@ -213,11 +213,11 @@ function Build-Program([string]$port) {
     New-Item -ItemType Directory -Force -Path (Join-Path $port ".cargo") | Out-Null
     # built for this machine's processor only
     Write-Utf8NoBom (Join-Path $port ".cargo\config.toml") "[build]`nrustflags = [`"-C`", `"target-cpu=native`"]`r`n"
-    # the crate versions Zakuro is tested with, and 3dsrecomp's runtime at the
-    # commit that translated the code; left alone, cargo takes 3dsrecomp's main
-    # of the day, which the translated code was not made for
+    # the crate versions Zakuro is tested with, 3dsrecomp's runtime included;
+    # left alone, cargo takes 3dsrecomp's main of the day. That runtime may be
+    # newer than $RecompCommit: a host runs code made for an older interface
+    # (3dsrecomp docs/interface.md), and Zakuro's code needs its own runtime.
     Copy-Item -Force (Join-Path $Root "zakuro\Cargo.lock") (Join-Path $port "Cargo.lock")
-    Run cargo @("update", "--quiet", "-p", "recomp3ds", "-p", "recomp-abi", "--precise", $RecompCommit) $port
     Run cargo @("build", "--release") $port
 }
 
