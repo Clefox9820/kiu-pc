@@ -29,6 +29,7 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{CursorGrabMode, Fullscreen, Window, WindowId};
 
+use zakuro_common::memory_map::{HOST_MAILBOX_GAME_MODE, HOST_MAILBOX_TOP_WIDENING};
 use zakuro_common::Screen;
 use zakuro_core::services::hid::PadState;
 use zakuro_core::{loader, Config, FrameOutcome, System};
@@ -1651,7 +1652,7 @@ impl App {
     fn emulate(&mut self) {
         // what game overrides say the game is doing picks the mouse aim mode,
         // see input::GAME_ON_FOOT; not while the window or a menu has it
-        let said = self.game.as_mut().map_or(0, |game| std::mem::take(&mut game.system.memory.host_mailbox[3]));
+        let said = self.game.as_mut().map_or(0, |game| std::mem::take(&mut game.system.memory.host_mailbox[HOST_MAILBOX_GAME_MODE]));
         if self.focused && !self.menus.menu_open {
             if let Some(mode) = self.keyboard.game_mode(said) {
                 self.pick_aim(mode);
@@ -1706,7 +1707,7 @@ impl App {
             }
         }
         let widening = width / 400.0;
-        game.system.memory.host_mailbox[4] = widening.to_bits();
+        game.system.memory.host_mailbox[HOST_MAILBOX_TOP_WIDENING] = widening.to_bits();
         // and its HUD's 2D draws squeezed back into proportion
         game.system.gpu.set_top_widening(widening);
         let interpreted =|system: &System| system.interpreted_instructions + system.recompiled.as_ref().map_or(0, |library| library.fallbacks());

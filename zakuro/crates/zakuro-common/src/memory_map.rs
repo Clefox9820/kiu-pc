@@ -68,6 +68,20 @@ pub const SHARED_PAGE_SIZE: u32 = 0x1000;
 /// the heap. see Memory::host_mailbox.
 pub const HOST_MAILBOX_VADDR: VAddr = 0x0700_0000;
 pub const HOST_MAILBOX_WORDS: usize = 5;
+/// the mailbox's words, by index. only aligned 32-bit reads and writes
+/// (read32, write32) reach them. the first three are the mouse's look or
+/// aim: a mark saying which, then the movement across and down not yet
+/// taken, as f32 bottom screen pixels.
+pub const HOST_MAILBOX_LOOK: std::ops::Range<usize> = 0..3;
+pub const HOST_MAILBOX_LOOK_MARK: usize = 0;
+pub const HOST_MAILBOX_LOOK_ACROSS: usize = 1;
+pub const HOST_MAILBOX_LOOK_DOWN: usize = 2;
+/// the kind of play going on, which overrides set every tick and the host
+/// takes every frame.
+pub const HOST_MAILBOX_GAME_MODE: usize = 3;
+/// how much wider than the console's the top screen shows, as an f32, for
+/// an override to draw a wider scene.
+pub const HOST_MAILBOX_TOP_WIDENING: usize = 4;
 
 /// per-thread local storage. Thread N gets TLS_AREA_VADDR + N * TLS_ENTRY_SIZE.
 pub const TLS_AREA_VADDR: VAddr = 0x1FF8_2000;

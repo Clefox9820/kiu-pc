@@ -3,6 +3,8 @@
 use winit::keyboard::{KeyCode, PhysicalKey};
 use zakuro_core::services::hid::{InputState, PadState};
 
+use zakuro_common::memory_map::{HOST_MAILBOX_LOOK, HOST_MAILBOX_LOOK_ACROSS, HOST_MAILBOX_LOOK_DOWN, HOST_MAILBOX_LOOK_MARK};
+
 use crate::settings::Keys;
 
 /// accumulates key state between frames.
@@ -75,15 +77,17 @@ enum Wrap {
     Lifted(u8),
 }
 
-/// the host mailbox's first word while mouse look is on foot, "MLK1"; the
-/// next two are the movement not yet taken, across and down, as f32 bottom
-/// screen pixels. a game override takes them and writes zeros back.
+/// the host mailbox's look mark, HOST_MAILBOX_LOOK_MARK, while mouse look is
+/// on foot, "MLK1"; the next two words are the movement not yet taken,
+/// across and down, as f32 bottom screen pixels. a game override takes them
+/// and writes zeros back.
 pub const MOUSE_LOOK: u32 = u32::from_le_bytes(*b"MLK1");
 /// the same while flying with a game override that moves the reticle, "MAM1".
 pub const MOUSE_AIM: u32 = u32::from_le_bytes(*b"MAM1");
 
-/// the host mailbox's fourth word, which game overrides set every tick to the
-/// kind of play going on, and the frontend reads and clears every frame.
+/// the host mailbox's game mode word, HOST_MAILBOX_GAME_MODE, which game
+/// overrides set every tick to the kind of play going on, and the frontend
+/// reads and clears every frame.
 pub const GAME_ON_FOOT: u32 = 1;
 pub const GAME_FLYING: u32 = 2;
 
@@ -199,19 +203,20 @@ impl Keyboard {
             Some(AimMode::Land) => MOUSE_LOOK,
             Some(AimMode::Air) if self.flying() => MOUSE_AIM,
             _ => {
-                mailbox[..3].fill(0);
+                mailbox[HOST_MAILBOX_LOOK].fill(0);
                 return;
             }
         };
         let (dx, dy) = self.take_look();
         let (dx, dy) = eased(dx, dy);
-        let waiting = mailbox[0] == mark && (mailbox[1] != 0 || mailbox[2] != 0);
+        let [mark_word, across_word, down_word] = [HOST_MAILBOX_LOOK_MARK, HOST_MAILBOX_LOOK_ACROSS, HOST_MAILBOX_LOOK_DOWN].map(|index| mailbox[index]);
+        let waiting = mark_word == mark && (across_word != 0 || down_word != 0);
         self.untaken = if waiting { self.untaken.saturating_add(1) } else { 0 };
         let keep = waiting && self.untaken <= STALE_FRAMES;
         let carried = |word: u32| if keep { f32::from_bits(word) } else { 0.0 };
-        let across = carried(mailbox[1]) + dx;
-        let down = carried(mailbox[2]) + dy;
-        mailbox[..3].copy_from_slice(&[mark, across.to_bits(), down.to_bits()]);
+        let across = carried(across_word) + dx;
+        let down = carried(down_word) + dy;
+        mailbox[HOST_MAILBOX_LOOK].copy_from_slice(&[mark, across.to_bits(), down.to_bits()]);
     }
 
     /// flying, as the game itself said, so an override moves the reticle and
