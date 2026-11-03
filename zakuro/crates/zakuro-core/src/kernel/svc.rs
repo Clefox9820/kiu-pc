@@ -1018,8 +1018,8 @@ const SYSTEM_TICK_COST: u64 = 150;
 /// own process, whose ticks are the CPU's, and every object here answers a
 /// reference count of 1. a handle that names nothing, or another process,
 /// still gets success, and so does an unknown type, with 0.
-// ponytail: the console answers an invalid handle and an unknown type with
-// an error; checking them waits for a title that needs it
+// the console answers an invalid handle and an unknown type with an error;
+// checking them waits for a title that needs it.
 fn get_handle_info(system: &mut System) {
     let kind = system.cpu.regs[2];
     let value: u64 = match kind {

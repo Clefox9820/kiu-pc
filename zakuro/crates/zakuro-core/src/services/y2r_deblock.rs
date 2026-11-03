@@ -26,8 +26,8 @@ pub(super) fn deblock_planes(planes: &mut [Vec<u8>; 3], width: usize, lines: usi
 /// whose step is small is a block's edge, not the picture's, and becomes a
 /// ramp over the four samples on each side, half a block; any other is
 /// left alone.
-// ponytail: one fixed strength, where a decoder's loop filter would follow
-// the stream's quantiser, which Y2R does not see
+// one fixed strength, where a decoder's loop filter would follow the
+// stream's quantiser, which Y2R does not see.
 pub(super) fn deblock(plane: &mut [u8], width: usize, lines: usize) {
     if plane.len() < width * lines {
         return;

@@ -278,8 +278,8 @@ impl<'a> Reader<'a> {
 /// otherwise. reading to the last byte does not prove the layout is the
 /// same: two versions whose fields moved or changed meaning, with the same
 /// lengths, read without an error into the wrong fields.
-// ponytail: a list of the versions known to save the same layout would be
-// stricter, and would turn down states this takes now
+// a list of the versions known to save the same layout would be stricter,
+// and would turn down states this takes now.
 fn read_saved(version: &str, bytes: &[u8]) -> Result<Saved, String> {
     if version == VERSION {
         return postcard::from_bytes(bytes).map_err(|error| format!("the state could not be read, {error}"));

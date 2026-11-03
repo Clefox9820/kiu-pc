@@ -217,7 +217,7 @@ pub struct FsState {
     pub busy_until: [u64; 2],
     /// the file of the game's RomFS each of its folders last had read, by
     /// folder: which level or scene a game loads shows in what it reads.
-    // ponytail: not in saved states, a loaded state knows it again at the next read
+    // not kept in saved states: a loaded state knows it again at the next read.
     #[serde(skip)]
     pub last_read: HashMap<String, String>,
 }

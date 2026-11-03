@@ -9,7 +9,7 @@ pub(super) const ROMFS: &str = "romfs:/";
 pub(super) const PATCH: &str = "patch:/";
 
 /// keeps which file of the game's own RomFS a read was in, by its folder.
-// ponytail: a RomFS with mods over it is read through its layers and not followed
+// a RomFS with mods over it is read through its layers, which this does not follow.
 pub(super) fn note_romfs_read(system: &mut System, path: &str, offset: u64) {
     let Some(title) = system.title.as_ref() else { return };
     let title = match path {
