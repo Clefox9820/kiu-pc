@@ -4,7 +4,7 @@
 use crate::registers::*;
 
 /// register holding the constant color the Constant* factors read.
-const REG_BLEND_COLOR: usize = 0x0103;
+pub(crate) const REG_BLEND_COLOR: usize = 0x0103;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Equation {

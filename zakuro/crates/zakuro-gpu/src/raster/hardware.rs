@@ -36,8 +36,14 @@ use crate::shader::glsl::{self, SEMANTICS};
 use crate::shader::{Program, ShaderUnit, Vec4, DESCRIPTOR_SIZE, INPUT_REGISTERS, PROGRAM_SIZE};
 use crate::GpuMemory;
 use hasher::{QuickMap, QuickSet};
+use keys::UsedKeys;
+use stale::Stale;
+use twins::{TwinLog, TwinWork};
 
 mod hasher;
+mod keys;
+mod stale;
+mod twins;
 
 const SHADE_SPIRV: &[u8] = include_bytes!("../../shaders/shade.vert.spv");
 const VERTEX_SPIRV: &[u8] = include_bytes!("../../shaders/raster.vert.spv");
@@ -300,93 +306,6 @@ impl Kind {
     }
 }
 
-/// the most spans apart a surface keeps stale, past which what it drew comes
-/// down instead. Kid Icarus Uprising's scene depth has two, under its two
-/// bloom buffers.
-const MOST_STALE_SPANS: usize = 8;
-
-/// spans of a surface's bytes, from its start, apart and in order, joined
-/// where they meet. nothing is allocated while there are none.
-#[derive(Clone, Default, PartialEq, Eq)]
-struct Stale(Vec<(u32, u32)>);
-
-impl std::fmt::Debug for Stale {
-    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        f.debug_list().entries(&self.0).finish()
-    }
-}
-
-impl Stale {
-    fn is_empty(&self) -> bool {
-        self.0.is_empty()
-    }
-
-    fn clear(&mut self) {
-        self.0.clear();
-    }
-
-    fn spans(&self) -> &[(u32, u32)] {
-        &self.0
-    }
-
-    /// the spans once another joins them, none when that leaves more apart
-    /// than MOST_STALE_SPANS.
-    fn with(&self, (start, end): (u32, u32)) -> Option<Stale> {
-        if start >= end {
-            return Some(self.clone());
-        }
-        let (mut start, mut end) = (start, end);
-        let mut spans = Vec::with_capacity(self.0.len() + 1);
-        for &(from, to) in &self.0 {
-            if to < start || end < from {
-                spans.push((from, to));
-            } else {
-                (start, end) = (start.min(from), end.max(to));
-            }
-        }
-        let at = spans.partition_point(|&(from, _)| from < start);
-        spans.insert(at, (start, end));
-        (spans.len() <= MOST_STALE_SPANS).then_some(Stale(spans))
-    }
-
-    /// whether any of them overlaps the bytes from start to end.
-    fn overlaps(&self, start: u32, end: u32) -> bool {
-        self.0.iter().any(|&(from, to)| from < end && start < to)
-    }
-
-    /// the bytes from start to end outside them, a piece at a time, until
-    /// each says true, and whether one did.
-    fn any_outside(&self, start: u32, end: u32, mut each: impl FnMut(u32, u32) -> bool) -> bool {
-        let mut at = start;
-        for &(from, to) in &self.0 {
-            if to <= at {
-                continue;
-            }
-            if from >= end {
-                break;
-            }
-            if from > at && each(at, from) {
-                return true;
-            }
-            at = at.max(to);
-            if at >= end {
-                return false;
-            }
-        }
-        at < end && each(at, end)
-    }
-
-    /// those pieces.
-    fn outside(&self, start: u32, end: u32) -> Vec<(u32, u32)> {
-        let mut pieces = Vec::new();
-        self.any_outside(start, end, |from, to| {
-            pieces.push((from, to));
-            false
-        });
-        pieces
-    }
-}
-
 /// a color or depth buffer of the guest's, kept on the GPU with its rows
 /// bottom first, the other way from memory, see draw.
 struct Surface {
@@ -555,6 +474,24 @@ impl Surface {
             self.checked = false;
         }
         superseded
+    }
+
+    /// whether it is the tiled buffer at addr of this size and kind.
+    fn is_tiled(&self, addr: u32, (width, height): (u32, u32), kind: Kind) -> bool {
+        self.addr == addr && self.width == width && self.height == height && self.kind == kind && self.tiled
+    }
+
+    /// lets go of what it drew, which another surface holds now: its image
+    /// is not what memory holds, and it takes memory's bytes at its next use.
+    fn forget_drawing(&mut self) {
+        self.shadow.clear();
+        self.pixel = None;
+        self.dirty = None;
+        self.guarded = None;
+        self.write_guarded = None;
+        self.cleared = None;
+        self.stale.clear();
+        self.checked = false;
     }
 
     /// the bytes stale once some more of them go stale, from the buffer's
@@ -786,22 +723,6 @@ struct Handover {
     /// the rows of memory of the surface looked up they come to.
     rows: (u32, u32),
 }
-
-/// what frame interpolation does for a surface, counted for the log.
-#[derive(Clone, Copy)]
-enum TwinWork {
-    /// a draw into its twin.
-    Draw,
-    /// a display transfer into its twin.
-    Transfer,
-    /// its twin turned upright for showing.
-    Upright,
-    /// its image copied into its twin.
-    Copy,
-}
-
-/// frames of the title's the log of what frame interpolation did covers.
-const TWIN_FRAMES: u32 = 600;
 
 /// display transfers into a screen's buffer that turn its twin upright after
 /// its picture in between was last asked for, two seconds of frames.
@@ -1126,66 +1047,6 @@ pub(crate) struct Dynamic {
 
 /// every generic pipeline a draw can need when the blend state is dynamic,
 /// with the vertex stages that draws have.
-/// pipelines noted before the list on disk grows by them.
-const KEYS_WRITTEN_TOGETHER: usize = 16;
-/// a key on disk: the blend register and whether it blends, the logic op
-/// as one more than its number or none, depth, the vertex stage, the write
-/// mask, then the fragment constants, all little endian.
-const KEY_BYTES: usize = 12 + 4 * FRAGMENT_CONSTANTS;
-
-/// where the pipelines a title used are listed, beside its cache.
-fn keys_path(cache: &std::path::Path) -> std::path::PathBuf {
-    cache.with_extension("keys")
-}
-
-/// a key as it is kept, none for a translated program's, whose module is
-/// made anew each run.
-fn key_bytes(key: &PipelineKey) -> Option<[u8; KEY_BYTES]> {
-    let vertex = match key.vertex {
-        VertexStage::Placed => 0,
-        VertexStage::Interpreted => 1,
-        VertexStage::Translated(_) => return None,
-    };
-    let mut bytes = [0; KEY_BYTES];
-    bytes[..4].copy_from_slice(&key.blend.unwrap_or(0).to_le_bytes());
-    bytes[4] = key.blend.is_some() as u8;
-    bytes[5] = key.logic_op.and_then(|op| LogicOp::ALL.iter().position(|&each| each == op)).map_or(0, |index| index as u8 + 1);
-    bytes[6] = key.depth as u8;
-    bytes[7] = vertex;
-    bytes[8..12].copy_from_slice(&key.mask.to_le_bytes());
-    for (at, constant) in bytes[12..].chunks_exact_mut(4).zip(key.fragment) {
-        at.copy_from_slice(&constant.to_le_bytes());
-    }
-    Some(bytes)
-}
-
-fn key_from_bytes(bytes: &[u8]) -> Option<PipelineKey> {
-    let word = |at: usize| u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap());
-    let vertex = match bytes[7] {
-        0 => VertexStage::Placed,
-        1 => VertexStage::Interpreted,
-        _ => return None,
-    };
-    let logic_op = match bytes[5] {
-        0 => None,
-        n => Some(*LogicOp::ALL.get(n as usize - 1)?),
-    };
-    let mut fragment = [0; FRAGMENT_CONSTANTS];
-    for (constant, at) in fragment.iter_mut().zip((12..KEY_BYTES).step_by(4)) {
-        *constant = word(at);
-    }
-    let blend = (bytes[4] != 0).then(|| word(0));
-    Some(PipelineKey { blend, logic_op, mask: word(8), depth: bytes[6] != 0, vertex, fragment })
-}
-
-/// the pipelines a title used before, from the list beside its cache, each
-/// once, none when there is no list or it is unreadable.
-fn read_keys(cache: &std::path::Path) -> Vec<PipelineKey> {
-    let bytes = std::fs::read(keys_path(cache)).unwrap_or_default();
-    let mut seen = std::collections::HashSet::new();
-    bytes.chunks_exact(KEY_BYTES).filter_map(key_from_bytes).filter(|key| seen.insert(*key)).collect()
-}
-
 fn generic_keys(shades: bool) -> Vec<PipelineKey> {
     let vertices: &[VertexStage] = if shades { &[VertexStage::Interpreted, VertexStage::Placed] } else { &[VertexStage::Placed] };
     let mut keys = Vec::new();
@@ -1297,6 +1158,21 @@ struct Queue {
     /// that was, which a thread with nothing else to do sees to.
     compiled: usize,
     saved: std::time::Instant,
+}
+
+/// sends the compiler the pipelines a title used before, with their vertex
+/// shaders' modules, so that one first seen in an earlier run is ready
+/// before it is drawn again, until it gives one back, having no threads.
+fn prewarm(compiler: &mut Compiler, jobs: Vec<(PipelineKey, vk::ShaderModule)>) {
+    for (key, module) in jobs {
+        if compiler.asked.contains(&key) {
+            continue;
+        }
+        if compiler.send(Job::Compile(key, module)).is_some() {
+            break;
+        }
+        compiler.asked.insert(key);
+    }
 }
 
 /// threads translating programs and compiling pipelines, which takes the
@@ -1801,10 +1677,8 @@ pub struct Hardware {
     /// the file they are kept in, none for nowhere.
     kept_pipelines: Option<Arc<std::path::Path>>,
     /// the keys of the pipelines the title used, kept beside them so the
-    /// next run makes them all while it starts rather than as it plays,
-    /// and those not written there yet.
-    known_keys: std::collections::HashSet<PipelineKey>,
-    new_keys: Vec<PipelineKey>,
+    /// next run makes them all while it starts rather than as it plays.
+    used_keys: UsedKeys,
     /// how many times the host waited for work done, for the tests to tell
     /// what waits without timing it.
     #[cfg(test)]
@@ -1819,10 +1693,8 @@ pub struct Hardware {
     /// whether the next display transfer goes to the framebuffer of a
     /// screen the window does not show.
     hidden_output: bool,
-    /// what frame interpolation did for each surface, by its shape, see
-    /// TwinWork, and the frames since the log last told.
-    twin_work: HashMap<(u32, u32, u32, Kind), [u32; 4]>,
-    twin_frames: u32,
+    /// what frame interpolation did for each surface, for the log.
+    twin_log: TwinLog,
 }
 
 /// whether the GPU runs the vertex shaders rather than the CPU: a dedicated
@@ -1831,7 +1703,7 @@ pub struct Hardware {
 /// the resolution with frame interpolation the GPU's shading took two thirds
 /// of its time and left up to a sixth of a flight's frames late, the CPU's
 /// one in a hundred at most, on foot about the same either way.
-// ponytail: one integrated GPU measured, the switches for one that does worse
+// one integrated GPU was measured; the switches are for one that does worse
 fn shades_on_gpu(integrated: bool, cpu: bool, gpu: bool) -> bool {
     !cpu && (gpu || !integrated)
 }
@@ -2080,16 +1952,14 @@ impl Hardware {
                 draws: 0,
                 pipeline_cache,
                 kept_pipelines,
-                known_keys: std::collections::HashSet::new(),
-                new_keys: Vec::new(),
+                used_keys: UsedKeys::default(),
                 #[cfg(test)]
                 waited_done: 0,
                 #[cfg(test)]
                 through_memory: false,
                 twin_cuts: !crate::raster::twin_all(),
                 hidden_output: false,
-                twin_work: HashMap::new(),
-                twin_frames: 0,
+                twin_log: TwinLog::default(),
             };
             let ring_usage = vk::BufferUsageFlags::VERTEX_BUFFER
                 | vk::BufferUsageFlags::INDEX_BUFFER
@@ -2128,18 +1998,14 @@ impl Hardware {
             }
             // then every pipeline the title used before, so that one first
             // seen in an earlier run is ready before it is drawn again
-            let used = hardware.kept_pipelines.as_deref().map(read_keys).unwrap_or_default();
+            let (used_keys, used) = UsedKeys::read(hardware.kept_pipelines.as_deref());
+            hardware.used_keys = used_keys;
             if !hardware.waits && !used.is_empty() {
                 log::info!(target: "zakuro_gpu::pipelines", "making the {} pipelines the title used before", used.len());
             }
-            for key in used {
-                if hardware.waits || !hardware.known_keys.insert(key) || !hardware.compiler.asked.insert(key) {
-                    continue;
-                }
-                let module = hardware.vertex_module(key.vertex);
-                if hardware.compiler.send(Job::Compile(key, module)).is_some() {
-                    break;
-                }
+            if !hardware.waits {
+                let jobs = used.into_iter().map(|key| (key, hardware.vertex_module(key.vertex))).collect();
+                prewarm(&mut hardware.compiler, jobs);
             }
             Ok(hardware)
         }
@@ -2814,7 +2680,7 @@ impl Hardware {
         // making an image and taking memory's bytes record into the batch,
         // which a transfer, a sync or a write back may have run already
         self.begin()?;
-        let found = self.surfaces.iter().position(|s| s.addr == texture.addr && s.width == width && s.height == height && s.kind == kind && s.tiled);
+        let found = self.find_surface(texture.addr, (width, height), kind);
         let index = match found {
             Some(index) => index,
             None => self.make_surface(texture.addr, (width, height), kind, true)?,
@@ -2847,8 +2713,12 @@ impl Hardware {
     pub(crate) fn drawn_over(&self, addr: u32, (width, height): (u32, u32), format: ColorFormat) -> bool {
         let kind = Kind::Color(format);
         let len = width * height * kind.bytes();
-        let shape = |s: &Surface| s.addr == addr && s.width == width && s.height == height && s.kind == kind && s.tiled;
-        self.surfaces.iter().any(|s| !shape(s) && s.dirty_overlaps(addr, len))
+        self.surfaces.iter().any(|s| !s.is_tiled(addr, (width, height), kind) && s.dirty_overlaps(addr, len))
+    }
+
+    /// the tiled surface at addr of this size and kind, when there is one.
+    fn find_surface(&self, addr: u32, size: (u32, u32), kind: Kind) -> Option<usize> {
+        self.surfaces.iter().position(|s| s.is_tiled(addr, size, kind))
     }
 
     /// the surface for a tiled color buffer a draw is about to cover whole
@@ -2864,7 +2734,7 @@ impl Hardware {
         if self.through_memory {
             return Ok(None);
         }
-        let found = self.surfaces.iter().position(|s| s.addr == addr && s.width == width && s.height == height && s.kind == kind && s.tiled);
+        let found = self.find_surface(addr, (width, height), kind);
         let len = width * height * kind.bytes();
         let others: Vec<usize> = (0..self.surfaces.len()).filter(|&i| Some(i) != found && self.surfaces[i].dirty_overlaps(addr, len)).collect();
         // each one's bytes there, as it last matched memory, which memory
@@ -2917,14 +2787,7 @@ impl Hardware {
             // all it drew is under the draw, its image is not what memory
             // will hold, and takes memory's bytes at its next use
             if o.dirty.is_some_and(|(first, last)| !o.stale.any_outside(first * o.row_bytes(), last * o.row_bytes(), |_, _| true)) {
-                o.shadow.clear();
-                o.pixel = None;
-                o.dirty = None;
-                o.guarded = None;
-                o.write_guarded = None;
-                o.cleared = None;
-                o.stale.clear();
-                o.checked = false;
+                o.forget_drawing();
             }
         }
         // the shadow is memory as the draw finds it, which tells what the
@@ -3197,18 +3060,8 @@ impl Hardware {
                     let joined = o.supersede(addr, len);
                     debug_assert!(joined, "handover checked the stale bytes join");
                 }
-                None => {
-                    // all it drew is this one's now. its image is not what
-                    // memory holds, and takes memory's bytes at its next use
-                    o.shadow.clear();
-                    o.pixel = None;
-                    o.dirty = None;
-                    o.guarded = None;
-                    o.write_guarded = None;
-                    o.cleared = None;
-                    o.stale.clear();
-                    o.checked = false;
-                }
+                // all it drew is this one's now
+                None => o.forget_drawing(),
             }
         }
         let s = &mut self.surfaces[index];
@@ -3265,55 +3118,22 @@ impl Hardware {
     }
 
     /// counts work frame interpolation did for a surface, for the log, see
-    /// twin_frame. nothing is counted while the log does not tell.
+    /// twin_frame.
     fn count_twin(&mut self, index: usize, work: TwinWork) {
-        if !cfg!(test) && !log::log_enabled!(target: "zakuro_gpu::twins", log::Level::Debug) {
-            return;
-        }
         let s = &self.surfaces[index];
-        self.twin_work.entry((s.addr, s.width, s.height, s.kind)).or_default()[work as usize] += 1;
+        self.twin_log.count((s.addr, s.width, s.height, s.kind), work);
     }
 
-    /// a frame of the title's is done. with RUST_LOG=zakuro_gpu::twins=debug,
-    /// every TWIN_FRAMES of them, says what frame interpolation did for each
-    /// buffer, to tell what the pictures in between cost and where.
+    /// a frame of the title's is done, see TwinLog::frame.
     pub(crate) fn twin_frame(&mut self) {
-        self.twin_frames += 1;
-        if self.twin_frames < TWIN_FRAMES {
-            return;
-        }
-        self.twin_frames = 0;
-        let work = std::mem::take(&mut self.twin_work);
-        if !log::log_enabled!(target: "zakuro_gpu::twins", log::Level::Debug) {
-            return;
-        }
-        let mut each: Vec<_> = work.into_iter().collect();
-        each.sort_by_key(|&((addr, ..), _)| addr);
-        let lines: Vec<String> = each
-            .iter()
-            .map(|((addr, width, height, kind), [draws, transfers, uprights, copies])| {
-                format!("0x{addr:08X} {width}x{height} {kind:?}: {draws} draws, {transfers} transfers, {uprights} uprights, {copies} copies")
-            })
-            .collect();
-        log::debug!(
-            target: "zakuro_gpu::twins",
-            "pictures in between over {TWIN_FRAMES} frames{}: {}",
-            if self.twin_cuts { "" } else { ", every twin kept" },
-            if lines.is_empty() { "none".to_string() } else { lines.join("; ") }
-        );
+        self.twin_log.frame(self.twin_cuts);
     }
 
     /// what frame interpolation did for the surfaces at an address so far,
     /// as count_twin counts it, for the tests.
     #[cfg(test)]
     pub(crate) fn twin_work(&self, addr: u32) -> [u32; 4] {
-        let mut sum = [0; 4];
-        for (_, work) in self.twin_work.iter().filter(|((at, ..), _)| *at == addr) {
-            for (total, count) in sum.iter_mut().zip(work) {
-                *total += count;
-            }
-        }
-        sum
+        self.twin_log.at(addr)
     }
 
     /// whether a texture is rows of a surface with a twin.
@@ -3602,7 +3422,15 @@ impl Hardware {
             }
         };
         let face_size: u64 = (0..bound.levels).map(|level| ((bound.width >> level) * (bound.height >> level)) as u64 * 4).sum();
-        let offset = self.stage(face_size * 6, 16)?;
+        let offset = match self.stage(face_size * 6, 16) {
+            Ok(offset) => offset,
+            Err(error) => {
+                // SAFETY: nothing recorded uses the view yet
+                unsafe { self.device.destroy_image_view(layers, None) };
+                self.dropped.push((self.batch, image));
+                return Err(error);
+            }
+        };
         let staging = self.ring(offset, face_size * 6);
         let mut regions = Vec::with_capacity(6 * bound.levels as usize);
         let mut start = 0usize;
@@ -3853,32 +3681,14 @@ impl Hardware {
         Ok(pipeline)
     }
 
-    /// notes a pipeline the title used for the list kept beside the cache,
-    /// writing the list out now and then, a few at a time.
+    /// notes a pipeline the title used for the list kept beside the cache.
     fn remember(&mut self, key: PipelineKey) {
-        if key_bytes(&key).is_none() || !self.known_keys.insert(key) {
-            return;
-        }
-        self.new_keys.push(key);
-        if self.new_keys.len() >= KEYS_WRITTEN_TOGETHER {
-            self.write_keys();
-        }
+        self.used_keys.remember(key);
     }
 
     /// adds the pipelines noted since last time to the list on disk.
     fn write_keys(&mut self) {
-        let Some(path) = self.kept_pipelines.as_deref().map(keys_path) else { return };
-        if self.new_keys.is_empty() {
-            return;
-        }
-        let bytes: Vec<u8> = self.new_keys.drain(..).filter_map(|key| key_bytes(&key)).flatten().collect();
-        let written = std::fs::OpenOptions::new().create(true).append(true).open(&path).and_then(|mut file| {
-            use std::io::Write;
-            file.write_all(&bytes)
-        });
-        if let Err(error) = written {
-            log::warn!("could not keep the pipelines used in {}, {error}", path.display());
-        }
+        self.used_keys.write();
     }
 
     /// the pipeline for a key when the cache on disk has it, made without
@@ -6875,56 +6685,50 @@ fn pick(instance: &ash::Instance) -> Result<(vk::PhysicalDevice, u32), String> {
 
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn the_pipelines_used_are_kept_and_read_back_as_they_were() {
-        let mut fragment = [0; super::FRAGMENT_CONSTANTS];
-        fragment[3] = 0xDEAD_BEEF;
-        fragment[29] = 7;
-        let keys = [
-            super::PipelineKey { blend: Some(0x0123_4567), logic_op: None, mask: 0xF, depth: true, vertex: super::VertexStage::Placed, fragment },
-            super::PipelineKey {
-                blend: None,
-                logic_op: Some(crate::blend::LogicOp::Xor),
-                mask: 0x7,
-                depth: false,
-                vertex: super::VertexStage::Interpreted,
-                fragment,
-            },
-        ];
-        let dir = std::env::temp_dir().join(format!("zakuro keys {}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let cache = dir.join("title.bin");
-        let bytes: Vec<u8> = keys.iter().chain(&keys).filter_map(super::key_bytes).flatten().collect();
-        std::fs::write(super::keys_path(&cache), bytes).unwrap();
-        assert_eq!(super::read_keys(&cache), keys, "each once, as written");
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
     use super::*;
 
-    /// stale spans stay in order and apart, join where they meet or
-    /// overlap, leave the bytes between them to be told apart, and no more
-    /// than MOST_STALE_SPANS of them are kept.
+    /// a compiler with no threads, which gives every job back.
+    fn idle_compiler() -> Compiler {
+        let waiting = Queue {
+            translations: VecDeque::new(),
+            generic: VecDeque::new(),
+            compiles: Vec::new(),
+            stopped: false,
+            compiled: 0,
+            saved: std::time::Instant::now(),
+        };
+        Compiler { queue: Arc::new((Mutex::new(waiting), Condvar::new())), made: mpsc::channel().1, outstanding: 0, asked: QuickSet::default(), threads: Vec::new() }
+    }
+
+    fn plain_key() -> PipelineKey {
+        PipelineKey { blend: None, logic_op: None, mask: 0xF, depth: true, vertex: VertexStage::Placed, fragment: [0; FRAGMENT_CONSTANTS] }
+    }
+
+    /// a pipeline the compiler gives back at the start, having no threads,
+    /// is not taken for one asked for, so the draw that needs it makes it.
     #[test]
-    fn stale_spans_join_where_they_meet_and_no_more_are_kept() {
-        let stale = Stale::default().with((300, 400)).unwrap().with((0, 100)).unwrap();
-        assert_eq!(stale.spans(), [(0, 100), (300, 400)]);
-        // meeting one, then overlapping both
-        let met = stale.with((100, 150)).unwrap();
-        assert_eq!(met.spans(), [(0, 150), (300, 400)]);
-        assert_eq!(met.with((120, 320)).unwrap().spans(), [(0, 400)]);
-        // the bytes outside them, and whether any overlap
-        assert_eq!(stale.outside(50, 500), [(100, 300), (400, 500)]);
-        assert!(stale.outside(0, 100).is_empty());
-        assert!(stale.overlaps(99, 101) && !stale.overlaps(100, 300));
-        // nothing added for no bytes
-        assert_eq!(stale.with((200, 200)).unwrap(), stale);
-        let mut many = Stale::default();
-        for k in 0..MOST_STALE_SPANS as u32 {
-            many = many.with((k * 10, k * 10 + 5)).unwrap();
-        }
-        assert!(many.with((1000, 1005)).is_none(), "one more apart than kept");
-        assert!(many.with((5, 10)).is_some(), "joining two keeps them as many");
+    fn a_pipeline_given_back_at_the_start_is_made_when_drawn() {
+        let mut compiler = idle_compiler();
+        prewarm(&mut compiler, vec![(plain_key(), vk::ShaderModule::null())]);
+        assert!(!compiler.asked.contains(&plain_key()));
+    }
+
+    /// a pipeline on the list a title used before is not listed again when
+    /// it is used again, whether the list was made at the start or not.
+    #[test]
+    fn a_pipeline_used_before_is_not_listed_again() {
+        let Ok(device) = own_device() else { return };
+        let dir = std::env::temp_dir().join(format!("zakuro listed {}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cache = dir.join("title.bin");
+        std::fs::write(keys::keys_path(&cache), keys::key_bytes(&plain_key()).unwrap()).unwrap();
+        let mut hardware = Hardware::with_device(Arc::new(device), true, Some(cache.clone())).unwrap();
+        hardware.remember(plain_key());
+        hardware.write_keys();
+        drop(hardware);
+        let listed = std::fs::read(keys::keys_path(&cache)).unwrap().len() / keys::KEY_BYTES;
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(listed, 1, "listed once");
     }
 
     /// a block gathered with the words of the last one staged is read from

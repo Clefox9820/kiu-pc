@@ -71,14 +71,15 @@ impl Drop for Timer {
 mod tests {
     use super::*;
 
+    /// a timer adds the time it lived to its counter; one of the test's
+    /// own, which the draws of the tests running beside it do not add to.
     #[test]
-    fn a_timer_adds_to_its_counter_until_taken() {
-        take();
+    fn a_timer_adds_to_its_counter_until_dropped() {
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
         {
-            let _timer = time(&SHADING);
+            let _timer = time(&COUNTER);
             std::thread::sleep(std::time::Duration::from_millis(2));
         }
-        assert!(take().shading >= 2.0);
-        assert_eq!(take().shading, 0.0);
+        assert!(COUNTER.load(Ordering::Relaxed) >= 2_000_000);
     }
 }
