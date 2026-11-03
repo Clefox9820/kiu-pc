@@ -48,9 +48,33 @@ powershell -ExecutionPolicy Bypass -File scripts\setup.ps1 -Rom "D:\path\to\your
   big by Anime4K's network on the GPU, for sharper edges and text.
   **Anime4K + Restore** cleans lines and letters first, at twice the GPU
   time.
-- Single-screen play (work in progress): the "Top screen, the bottom one
-  over it in menus" layout, and `ZAKURO_PORTRAITS=1` for dialogue portraits
-  and the battle display on the top screen.
+
+### Playing on one screen (work in progress)
+
+Kid Icarus spreads its game over both of the 3DS's screens; this build can
+be played on the top screen alone:
+
+- **Esc > Options > Screens > "Top screen, the bottom one over it in
+  menus"** shows the top screen alone in battle, cutscenes and loading, and
+  the bottom screen over its middle where the game is not in play (the
+  title, the temple's menus, results, the pause menu), where the mouse
+  touches it. F9 switches layouts while playing, F10 between the top and the
+  bottom screen alone.
+- `ZAKURO_PORTRAITS=1` brings what the bottom screen shows in battle up to
+  the top one: the dialogue portraits, smaller, in the corner on the
+  speaker's side under the subtitles, fading in and out; the counters
+  (intensity, enemies defeated, hearts) under the score; the powers under
+  the health bar. Subtitles get a drop shadow and are centered. It is off
+  unless set:
+
+  ```bat
+  set ZAKURO_PORTRAITS=1
+  Play.bat
+  ```
+
+- Put the subtitles on the top screen with the game's own option,
+  **Options > Other > Subtitles > Upper**; the game applies it when a
+  chapter starts.
 
 ### Known issues
 
@@ -59,8 +83,8 @@ powershell -ExecutionPolicy Bypass -File scripts\setup.ps1 -Rom "D:\path\to\your
   USA release they were matched by code and not tried in play.
 - Local wireless play reaches the warm-up arena, but the battle does not
   start for the player who joined.
-- Widescreen was checked in one battle on foot and one in flight; cutscenes
-  and menus with 3D were not checked.
+- Widescreen was checked in battle on foot and in flight and in cutscenes;
+  menus with 3D were not checked.
 - Performance was measured on one PC only (Ryzen 5 5600G, integrated Radeon,
   Windows 10). Reports from other GPUs are welcome; include the `hitch:` and
   `pacing:` lines from `%APPDATA%\zakuro\zakuro.log`.
