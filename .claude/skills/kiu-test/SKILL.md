@@ -29,6 +29,7 @@ Load before claiming a change works, after any edit under `zakuro/`, and for any
 - `pacing:` counts are meaningless while the user plays or builds; compare per-frame work with `RUST_LOG=info,cranelift_jit=warn,zakuro::frames=debug` (took, drawing, waiting) and interleaved runs.
 - `ZAKURO_SHOT` saves the screens before the presenter, so it never shows a screen filter (FSR, Sharp); check those with `scripts\drive-window.ps1` `shot:` on a window bigger than the resolution (for example `resolution = 1`, `scale = 2`).
 - `ZAKURO_SHOT` PNGs carry alpha 0 in places: cropping them with System.Drawing needs `CompositingMode = SourceCopy`, or the crop comes out blank.
+- Zakuro's menus (pause, Settings) ignore posted clicks: use `drive-window.ps1`'s `rclick`; Settings scrolls only with a real wheel (`mouse_event` 0x0800 over the window), which `drive-window.ps1` has no step for.
 - In egui tests, `prev_pass.widgets` lists each `add_sized` button twice with the same rect: dedupe rects and filter by height before simulating a click.
 - `ZAKURO_SHOT` captures come before the screen filter, so FSR and Anime4K never show in them; a window shot needs the window uncovered and inside the screen's working area, which a scale above the screen does not fit.
 - Kid Icarus' HUD icons (powers, skull, heart) are ETC1A4 textures; ETC1 ones without alpha are models' but for portraits. A Sharp HUD change must keep ETC1A4 upscaled: compare `ZAKURO_SHOT` pairs with Sharp HUD on from the same slot; its runs are deterministic, so any difference is real.
