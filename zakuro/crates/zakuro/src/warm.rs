@@ -46,7 +46,7 @@ pub fn progress() -> Option<u8> {
 /// starts warming the program and the ROM at `rom`, when there is one.
 pub fn start(rom: Option<&str>) {
     // ZAKURO_NO_WARM=1 leaves it all to the disk, to compare the two
-    if std::env::var_os("ZAKURO_NO_WARM").is_some() {
+    if crate::dev_env::no_warm() {
         return;
     }
     let rom = rom.map(std::path::PathBuf::from);

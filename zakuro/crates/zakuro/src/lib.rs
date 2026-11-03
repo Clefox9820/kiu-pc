@@ -5,6 +5,7 @@
 mod audio;
 mod camera;
 mod cli;
+mod dev_env;
 mod discord;
 mod frame_log;
 mod gamepad;
@@ -839,9 +840,8 @@ impl App {
         self.keyboard.aim.forget_game_mode();
         self.paused = false;
         self.next_frame = Instant::now();
-        // ZAKURO_LOAD_SLOT=<1-9> goes straight on from that slot's state, for
-        // runs nobody has to steer to the same spot
-        if let Some(slot) = std::env::var("ZAKURO_LOAD_SLOT").ok().and_then(|slot| slot.parse().ok()).filter(|slot| (1..=9).contains(slot)) {
+        // ZAKURO_LOAD_SLOT goes straight on from that slot's state
+        if let Some(slot) = dev_env::load_slot() {
             self.menus.slot = slot;
             self.load_state();
         }

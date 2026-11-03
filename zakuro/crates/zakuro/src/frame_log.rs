@@ -15,7 +15,7 @@ use zakuro_core::System;
 /// them between builds pixel by pixel.
 fn save_screens(system: &mut System, frame: u64) {
     static PREFIX: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
-    let Some(prefix) = PREFIX.get_or_init(|| std::env::var("ZAKURO_SHOT").ok()) else { return };
+    let Some(prefix) = PREFIX.get_or_init(crate::dev_env::shot_prefix) else { return };
     for (screen, name) in [(zakuro_common::Screen::Top, "top"), (zakuro_common::Screen::Bottom, "bottom")] {
         for (between, suffix) in [(false, ""), (true, "-between")] {
             let Some((pixels, width, height)) = system.upright_screen(screen, between) else { continue };

@@ -301,18 +301,17 @@ struct Capture {
 
 impl Capture {
     fn from_env(rate: f64) -> Option<Capture> {
-        let path = std::env::var_os("ZAKURO_WAV")?.into();
-        let seconds = |name: &str, default: f64| std::env::var(name).ok().and_then(|v| v.parse().ok()).unwrap_or(default);
+        let asked = crate::dev_env::wav_capture()?;
         let step = rate / CAPTURE_RATE as f64;
         let mut queue = Queue::new(step, TARGET_DEFAULT);
         queue.starved = false;
         queue.level = 1.0;
         Some(Capture {
-            path,
-            skip: (seconds("ZAKURO_WAV_FROM", 5.0) * rate) as usize,
+            path: asked.path,
+            skip: (asked.from * rate) as usize,
             queue,
             out: Vec::new(),
-            wanted: (seconds("ZAKURO_WAV_SECONDS", 8.0) * CAPTURE_RATE as f64) as usize,
+            wanted: (asked.seconds * CAPTURE_RATE as f64) as usize,
         })
     }
 
