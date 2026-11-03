@@ -37,6 +37,9 @@
   menu; turning off "Take the mouse back" had no effect after switching
   windows; the "Loading the game into memory" notice could stay up for good
   when reading the game stopped short.
+- Fixed: once the game had made more than 128 cameras, widescreen could
+  widen a camera's view again each time it came back, so the scene kept
+  getting wider; a camera it can no longer tell about keeps its width.
 
 ## v0.1.0 — first release
 

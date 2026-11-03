@@ -17,7 +17,8 @@
  * 1.0667 for 16:9, 1.4 for 21:9. This divides that row by it for every
  * perspective matrix, so the game draws a wider scene into the same 400x240
  * instead of being stretched. It remembers what it applied to each camera,
- * so a shape changed during play takes effect without scaling twice.
+ * so a shape changed during play takes effect without scaling twice. Past
+ * 128 cameras, one it no longer remembers keeps the scale it has.
  */
 #include "overrides.h"
 
@@ -43,18 +44,30 @@ static uint32_t as_bits(float value) {
     return bits;
 }
 
-/* the slot that remembers camera, a free one, or failing both the first.
-   ponytail: linear scan of 128; a hash if the game ever has more cameras */
-static int slot_of(uint32_t camera) {
+/* the next slot a fresh camera takes once every slot is in use */
+static int reused;
+
+/* the slot that remembers camera, or a free one for it. Slots are never
+   freed, since nothing here sees a camera go away, so once all are in use a
+   camera missing from them may be one that lost its slot with its matrix
+   already scaled. Only a matrix worked out just now is known to be unscaled:
+   a fresh camera takes the slots in turn, and any other gets -1 and is left
+   as it is, rather than scaled twice. The scan is linear, which is enough
+   for the cameras the game has. */
+static int slot_of(uint32_t camera, int fresh) {
     int free = -1;
     for (int i = 0; i < CAMERAS; i++) {
         if (applied[i].camera == camera) return i;
         if (free < 0 && applied[i].camera == 0) free = i;
     }
-    int slot = free < 0 ? 0 : free;
-    applied[slot].camera = camera;
-    applied[slot].scale = 1.0f;
-    return slot;
+    if (free < 0) {
+        if (!fresh) return -1;
+        free = reused;
+        reused = (reused + 1) % CAMERAS;
+    }
+    applied[free].camera = camera;
+    applied[free].scale = 1.0f;
+    return free;
 }
 
 RECOMP_OVERRIDE(0x0039025C) {
@@ -68,7 +81,8 @@ RECOMP_OVERRIDE(0x0039025C) {
 
     float widening = as_float(mem_read32(ctx, WIDENING));
     float scale = widening > 0.0f ? 1.0f / widening : 1.0f;
-    int slot = slot_of(camera);
+    int slot = slot_of(camera, fresh);
+    if (slot < 0) return;
     if (fresh) applied[slot].scale = 1.0f; /* worked out just now, unscaled */
     if (applied[slot].scale == scale) return;
 
