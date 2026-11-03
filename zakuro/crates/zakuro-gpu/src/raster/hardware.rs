@@ -3552,7 +3552,15 @@ impl Hardware {
             }
         };
         let face_size: u64 = (0..bound.levels).map(|level| ((bound.width >> level) * (bound.height >> level)) as u64 * 4).sum();
-        let offset = self.stage(face_size * 6, 16)?;
+        let offset = match self.stage(face_size * 6, 16) {
+            Ok(offset) => offset,
+            Err(error) => {
+                // SAFETY: nothing recorded uses the view yet
+                unsafe { self.device.destroy_image_view(layers, None) };
+                self.dropped.push((self.batch, image));
+                return Err(error);
+            }
+        };
         let staging = self.ring(offset, face_size * 6);
         let mut regions = Vec::with_capacity(6 * bound.levels as usize);
         let mut start = 0usize;

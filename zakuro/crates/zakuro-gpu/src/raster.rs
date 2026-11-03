@@ -8511,4 +8511,77 @@ mod tests {
         let vertex = |x: f32, y: f32| Vertex { clip: [x, y, -0.5, 1.0], color, texcoords: [[0.0; 2]; 3], quaternion: [0.0, 0.0, 0.0, 1.0], view: [0.0; 3], texcoord0_w: 1.0 };
         [(x.0, y.0), (x.1, y.0), (x.1, y.1), (x.0, y.0), (x.1, y.1), (x.0, y.1)].into_iter().map(|(x, y)| vertex(x, y)).collect()
     }
+
+    /// a vertex of a 2D draw at x, y in clip space.
+    #[cfg(feature = "vulkan")]
+    fn flat_vertex(x: f32, y: f32) -> Vertex {
+        Vertex { clip: [x, y, -0.5, 1.0], color: RED, texcoords: [[0.0; 2]; 3], quaternion: [0.0, 0.0, 0.0, 1.0], view: [0.0; 3], texcoord0_w: 1.0 }
+    }
+
+    /// a draw's triangles cover a buffer when one covers it or two make a
+    /// rectangle over it, neither culled; anything else says why not.
+    #[cfg(feature = "vulkan")]
+    #[test]
+    fn a_draw_covers_its_buffer_with_one_triangle_or_one_rectangle() {
+        let (buffer, viewport) = ((4, 4), (0.0, 0.0, 4.0, 4.0));
+        let covering = [flat_vertex(-1.0, -1.0), flat_vertex(3.0, -1.0), flat_vertex(-1.0, 3.0)];
+        assert_eq!(uncovered(&covering, 0, 0, viewport, buffer), None, "one triangle over all of it");
+        assert_eq!(uncovered(&quad((-1.0, 1.0), (-1.0, 1.0), RED), 0, 0, viewport, buffer), None, "a rectangle of two");
+        assert_eq!(uncovered(&covering, 0, 1, viewport, buffer), Some("a triangle culled"));
+        assert_eq!(uncovered(&quad((-1.0, 0.5), (-1.0, 0.5), RED), 0, 0, viewport, buffer), Some("a rectangle short of the buffer"));
+        assert_eq!(uncovered(&[flat_vertex(-1.0, -1.0); 27], 0, 0, viewport, buffer), Some("too many triangles"));
+        let mut outside = covering;
+        outside[1].clip[2] = 0.5;
+        assert_eq!(uncovered(&outside, 0, 0, viewport, buffer), Some("a vertex outside the clip volume"));
+        assert_eq!(uncovered(&[], 0, 0, viewport, buffer), Some("no triangles"));
+        let flat = [flat_vertex(-1.0, -1.0), flat_vertex(0.0, 0.0), flat_vertex(1.0, 1.0)];
+        assert_eq!(uncovered(&flat, 0, 0, viewport, buffer), Some("a triangle flat"));
+        let small = [flat_vertex(-1.0, -1.0), flat_vertex(0.0, -1.0), flat_vertex(-1.0, 0.0)];
+        assert_eq!(uncovered(&small, 0, 0, viewport, buffer), Some("no triangle over the buffer, and not two"));
+        let mut off_corner = quad((-1.0, 1.0), (-1.0, 1.0), RED);
+        off_corner[5].clip[1] = 0.0;
+        assert_eq!(uncovered(&off_corner, 0, 0, viewport, buffer), Some("a vertex off the corners of one rectangle"));
+        let twice: Vec<Vertex> = quad((-1.0, 1.0), (-1.0, 1.0), RED)[..3].repeat(2);
+        assert_eq!(uncovered(&twice, 0, 0, viewport, buffer), Some("two triangles that do not make one rectangle"));
+    }
+
+    /// a draw writes all of every pixel it covers whatever its buffer held
+    /// unless something reads the buffer or keeps a pixel, which it says.
+    #[cfg(feature = "vulkan")]
+    #[test]
+    fn a_draw_that_may_keep_a_pixel_says_why() {
+        let memory = ConsoleMemory::default();
+        let target = (COLOR, 8 * 8 * 4);
+        let partial = |change: &dyn Fn(&mut Vec<u32>)| {
+            let mut registers = target_registers();
+            change(&mut registers);
+            partial_pixels(&registers, &memory, target, (8, 8))
+        };
+        assert_eq!(partial(&|_| {}), None);
+        let blending = |registers: &mut Vec<u32>, function: u32| {
+            registers[REG_COLOR_OPERATION] |= 0x100;
+            registers[REG_BLEND_FUNC] = function;
+        };
+        assert_eq!(partial(&|registers| blending(registers, 1 << 16 | 1 << 24)), None, "blending the source alone");
+        assert_eq!(partial(&|registers| registers[REG_COLOR_BUFFER_WRITE] = 0), Some("color writes off"));
+        assert_eq!(partial(&|registers| registers[REG_DEPTH_COLOR_MASK] = 0x7 << 8), Some("color mask"));
+        assert_eq!(partial(&|registers| blending(registers, 3)), Some("blend equation min or max"));
+        assert_eq!(partial(&|registers| blending(registers, 1 << 16 | 1 << 20)), Some("blend destination factor"));
+        assert_eq!(partial(&|registers| blending(registers, 4 << 16)), Some("blend source factor reads the buffer"));
+        assert_eq!(partial(&|registers| registers[REG_LOGIC_OP] = 0), Some("logic op"));
+        assert_eq!(partial(&|registers| registers[REG_ALPHA_TEST] = 1), Some("alpha test"));
+        assert_eq!(partial(&|registers| registers[REG_STENCIL_TEST] = 1), Some("stencil test"));
+        assert_eq!(partial(&|registers| registers[REG_DEPTH_COLOR_MASK] |= 1 | 4 << 4), Some("depth test"));
+        let depth_inside = |registers: &mut Vec<u32>| {
+            registers[REG_DEPTH_COLOR_MASK] |= 1 | 1 << 4;
+            registers[REG_DEPTH_BUFFER_ADDRESS] = (COLOR + 64) >> 3;
+        };
+        assert_eq!(partial(&depth_inside), Some("depth buffer inside the target"));
+        let texture_inside = |registers: &mut Vec<u32>| {
+            registers[REG_TEXTURE_CONFIG] = 1;
+            registers[TEXTURE_UNIT_BASES[0] + 1] = 8 << 16 | 8;
+            registers[TEXTURE_UNIT_BASES[0] + 4] = COLOR >> 3;
+        };
+        assert_eq!(partial(&texture_inside), Some("a texture inside the target"));
+    }
 }
