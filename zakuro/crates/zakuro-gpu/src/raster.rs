@@ -1907,12 +1907,12 @@ impl TextureCache {
         }
     }
 
-    /// a texture at the physical address is about to be looked up by key: a
-    /// compressed one a portrait was drawn with is a small picture from now
-    /// on, decoded again to be one.
+    /// a texture at the physical address is about to be looked up by key: an
+    /// etc1 one a portrait was drawn with is a small picture from now on,
+    /// decoded again to be one.
     fn bound(&mut self, physical: u32, key: TextureKey) {
-        let compressed = matches!(key.1, TextureFormat::Etc1 | TextureFormat::Etc1A4);
-        if !self.upscale || !compressed || !self.portrait_sources.contains(&physical) || !self.portrait_keys.insert(key.0) {
+        let compressed = key.1 == TextureFormat::Etc1;
+        if !self.upscale || !compressed ||!self.portrait_sources.contains(&physical) || !self.portrait_keys.insert(key.0) {
             return;
         }
         if let Some(old) = self.entries.remove(&key) {
@@ -2075,10 +2075,11 @@ fn anime4k_picture(upscale: Option<Upscale>, data: &[u8], texels: &Arc<[[u8; 4]]
 /// whether Anime4K makes a texture taken as upscale is bigger: a small
 /// picture, neither tiny nor a model's.
 fn upscales(upscale: Upscale, format: TextureFormat, width: u32, height: u32) -> bool {
-    // compressed ones are models' but for portraits, hilo8 holds normals,
-    // not colors, and a format not known is left as it is
+    // etc1 ones are models' but for portraits; etc1a4, compressed with
+    // alpha, is what Kid Icarus' HUD icons are, so it is a picture. hilo8
+    // holds normals, not colors, and a format not known is left as it is
     let picture = match format {
-        TextureFormat::Etc1 | TextureFormat::Etc1A4 => upscale == Upscale::Portrait,
+        TextureFormat::Etc1 => upscale == Upscale::Portrait,
         TextureFormat::Hilo8 | TextureFormat::Unknown(_) => false,
         _ => true,
     };
@@ -4996,19 +4997,22 @@ mod tests {
         assert!(cache.decoded(letters, &[0x5A; 256]).1.is_some(), "letters are made bigger");
     }
 
-    /// both compressed formats are models' textures but for portraits, and
-    /// a format the cache does not know is left as it is.
+    /// etc1 textures are models' but for portraits, etc1a4 ones are HUD
+    /// icons made bigger like any picture, and a format the cache does not
+    /// know is left as it is.
     #[test]
     fn compressed_textures_are_made_bigger_only_for_portraits() {
         let mut cache = TextureCache::default();
         cache.set_upscale(true);
-        let etc1a4 = (0x2000, TextureFormat::Etc1A4, 16, 16, 1);
-        assert!(cache.decoded(etc1a4, &[0; 256]).1.is_none(), "a model's");
+        let etc1 = (0x2000, TextureFormat::Etc1, 16, 16, 1);
+        assert!(cache.decoded(etc1, &[0; 128]).1.is_none(), "a model's");
         let unknown = (0x3000, TextureFormat::Unknown(15), 16, 16, 1);
         assert!(cache.decoded(unknown, &[0; 1024]).1.is_none(), "an unknown format's");
         cache.note_portrait(0x2000);
-        cache.bound(0x2000, etc1a4);
-        assert!(cache.decoded(etc1a4, &[0; 256]).1.is_some(), "a portrait's");
+        cache.bound(0x2000, etc1);
+        assert!(cache.decoded(etc1, &[0; 128]).1.is_some(), "a portrait's");
+        let etc1a4 = (0x5000, TextureFormat::Etc1A4, 16, 16, 1);
+        assert!(cache.decoded(etc1a4, &[0; 256]).1.is_some(), "a HUD icon's, as before");
         // a picture's own format needs no portrait to be one
         let rgba4 = (0x4000, TextureFormat::Rgba4, 16, 16, 1);
         cache.decoded(rgba4, &[0x5A; 512]);
