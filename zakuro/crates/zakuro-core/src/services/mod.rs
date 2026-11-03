@@ -13,6 +13,7 @@ pub mod dsp_mixer;
 pub mod dsp_voices;
 pub mod frd;
 pub mod fs;
+mod fs_reads;
 pub mod glyphs;
 pub mod gsp;
 pub mod hid;
