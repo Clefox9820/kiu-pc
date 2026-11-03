@@ -91,10 +91,11 @@ pub enum Filter {
     Sharp,
     Pixels,
     Fsr,
+    Anime4k,
 }
 
 impl Filter {
-    pub const ALL: [Filter; 4] = [Filter::Smooth, Filter::Sharp, Filter::Pixels, Filter::Fsr];
+    pub const ALL: [Filter; 5] = [Filter::Smooth, Filter::Sharp, Filter::Pixels, Filter::Fsr, Filter::Anime4k];
 
     pub fn name(self) -> &'static str {
         match self {
@@ -102,6 +103,7 @@ impl Filter {
             Filter::Sharp => "Sharp",
             Filter::Pixels => "Pixels",
             Filter::Fsr => "FSR (AMD)",
+            Filter::Anime4k => "Anime4K",
         }
     }
 
@@ -111,6 +113,7 @@ impl Filter {
             Filter::Sharp => zakuro_gpu::ScreenFilter::Sharp,
             Filter::Pixels => zakuro_gpu::ScreenFilter::Pixels,
             Filter::Fsr => zakuro_gpu::ScreenFilter::Fsr,
+            Filter::Anime4k => zakuro_gpu::ScreenFilter::Anime4k,
         }
     }
 }

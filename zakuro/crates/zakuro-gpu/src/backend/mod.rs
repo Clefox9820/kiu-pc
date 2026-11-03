@@ -126,6 +126,12 @@ pub enum ScreenFilter {
     /// screen's two pictures in one for 3D. the GL presenter draws it
     /// smooth.
     Fsr,
+    /// Anime4K's CNN x2 M (bloc97, MIT) in place of FSR's upscaling: a
+    /// screen the Vulkan presenter draws bigger than its pixels is
+    /// antialiased with SMAA, made twice as big by Anime4K's passes on the
+    /// GPU, then brought to the window's size by EASU and sharpened with
+    /// RCAS, as FSR's is. elsewhere, and in the GL presenter, it is FSR.
+    Anime4k,
 }
 
 impl ScreenFilter {
@@ -135,7 +141,7 @@ impl ScreenFilter {
             ScreenFilter::Smooth => 0,
             ScreenFilter::Pixels => 1,
             ScreenFilter::Sharp => 2,
-            ScreenFilter::Fsr => 3,
+            ScreenFilter::Fsr | ScreenFilter::Anime4k => 3,
         }
     }
 }

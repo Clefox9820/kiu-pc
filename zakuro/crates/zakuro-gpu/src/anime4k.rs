@@ -37,6 +37,8 @@ struct Term {
 }
 
 struct Pass {
+    /// the tensors it reads, in the order the shader binds them.
+    inputs: Vec<usize>,
     output: usize,
     terms: Vec<Term>,
     bias: [f32; 4],
@@ -53,12 +55,42 @@ pub struct Network {
 
 /// the network, read once.
 pub fn network() -> Option<&'static Network> {
-    static NETWORK: OnceLock<Option<Network>> = OnceLock::new();
-    NETWORK
-        .get_or_init(|| {
-            parse(SHADER).map_err(|error| log::warn!("could not read Anime4K's network, {error}")).ok()
-        })
-        .as_ref()
+    read_once(&NETWORK_VL, SHADER)
+}
+
+/// M, the network the screen filter runs on the GPU every frame, four
+/// times lighter than VL. its passes' shaders are made from the same file,
+/// see the screen_shaders test.
+pub const SCREEN_SHADER: &str = include_str!("anime4k/Anime4K_Upscale_CNN_x2_M.glsl");
+
+/// the screen filter's network, read once.
+pub fn screen_network() -> Option<&'static Network> {
+    read_once(&NETWORK_M, SCREEN_SHADER)
+}
+
+static NETWORK_VL: OnceLock<Option<Network>> = OnceLock::new();
+static NETWORK_M: OnceLock<Option<Network>> = OnceLock::new();
+
+fn read_once(network: &'static OnceLock<Option<Network>>, source: &str) -> Option<&'static Network> {
+    network.get_or_init(|| parse(source).map_err(|error| log::warn!("could not read Anime4K's network, {error}")).ok()).as_ref()
+}
+
+impl Network {
+    /// each pass's inputs, in the order its shader binds them, and output.
+    /// tensor 0 is the picture.
+    pub fn graph(&self) -> impl Iterator<Item = (&[usize], usize)> {
+        self.passes.iter().map(|pass| (pass.inputs.as_slice(), pass.output))
+    }
+
+    /// how many tensors there are, the picture's among them.
+    pub fn tensors(&self) -> usize {
+        self.tensors
+    }
+
+    /// the tensors the last pass takes each color's 2x2 texels from.
+    pub fn residuals(&self) -> &[usize] {
+        &self.residuals
+    }
 }
 
 fn parse(source: &str) -> Result<Network, String> {
@@ -116,7 +148,8 @@ fn parse(source: &str) -> Result<Network, String> {
             Some(name) => {
                 let output = names.len();
                 names.insert(name, output);
-                passes.push(Pass { output, terms, bias });
+                let inputs = binds.iter().map(|name| names.get(name).copied().ok_or(format!("{name} is not made"))).collect::<Result<_, _>>()?;
+                passes.push(Pass { inputs, output, terms, bias });
             }
             None => return Err("a pass saves nothing".to_owned()),
         }
@@ -162,6 +195,18 @@ pub fn upscale(network: &Network, texels: &[[u8; 4]], width: u32, height: u32) -
         }
     });
     picture
+}
+
+/// the texels made twice as big by filtering alone, what the network adds
+/// to, for tests to tell it did.
+#[cfg(test)]
+pub(crate) fn upscale_filtered(texels: &[[u8; 4]], width: u32, height: u32) -> Vec<u8> {
+    let (w, h) = (width as usize, height as usize);
+    let source: Vec<[f32; 4]> = texels.iter().map(|texel| texel.map(|channel| channel as f32 / 255.0)).collect();
+    (0..h * 2)
+        .flat_map(|oy| (0..w * 2).map(move |ox| (ox, oy)))
+        .flat_map(|(ox, oy)| filtered(&source, w, h, (ox as f32 + 0.5) / 2.0 - 0.5, (oy as f32 + 0.5) / 2.0 - 0.5).map(unit))
+        .collect()
 }
 
 fn unit(value: f32) -> u8 {
@@ -256,6 +301,74 @@ fn filtered(texels: &[[f32; 4]], w: usize, h: usize, x: f32, y: f32) -> [f32; 4]
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// the screen filter's shaders, one a pass of M's: each reads its
+    /// tensors texel by texel, clamped at the edges as mpv's are, with
+    /// mpv's own code for the pass, and the last puts each texel's four
+    /// channels on the 2x2 texels it becomes, over the picture made bigger.
+    fn screen_shaders(source: &str) -> Vec<String> {
+        let network = parse(source).unwrap();
+        let mut shaders = Vec::new();
+        for block in source.split("//!DESC").skip(1) {
+            let binds: Vec<&str> = block.lines().filter_map(|line| line.trim().strip_prefix("//!BIND ")).map(str::trim).collect();
+            let save = block.lines().find_map(|line| line.trim().strip_prefix("//!SAVE ")).map(str::trim).unwrap();
+            let mut glsl = String::from(
+                "#version 450\n// made from Anime4K_Upscale_CNN_x2_M.glsl, Anime4K by bloc97 (MIT, see that file),\n// by anime4k.rs's write_screen_shaders test: do not edit.\nlayout(location = 0) out vec4 fragment;\n",
+            );
+            for (binding, name) in binds.iter().enumerate() {
+                glsl += &format!("layout(set = 0, binding = {binding}) uniform sampler2D {name};\n");
+            }
+            if save == "MAIN" {
+                let residuals = &binds[1..];
+                let fetch = |channel: usize| format!("texelFetch({}, at / 2, 0)[sub]", residuals[channel.min(residuals.len() - 1)]);
+                glsl += "void main() {\n    ivec2 at = ivec2(gl_FragCoord.xy);\n    int sub = (at.y % 2) * 2 + at.x % 2;\n";
+                glsl += "    vec4 base = texture(MAIN, gl_FragCoord.xy / vec2(textureSize(MAIN, 0) * 2));\n";
+                glsl += &format!("    fragment = vec4(clamp(base.rgb + vec3({}, {}, {}), 0.0, 1.0), 1.0);\n}}\n", fetch(0), fetch(1), fetch(2));
+            } else {
+                for name in &binds {
+                    glsl += &format!(
+                        "#define {name}_texOff(o) texelFetch({name}, clamp(ivec2(gl_FragCoord.xy) + ivec2(o), ivec2(0), textureSize({name}, 0) - 1), 0)\n#define {name}_tex(p) texelFetch({name}, ivec2(gl_FragCoord.xy), 0)\n#define {name}_pos 0\n"
+                    );
+                }
+                for line in block.lines().skip(1).filter(|line| !line.trim_start().starts_with("//!") && !line.trim().is_empty()) {
+                    glsl += line.trim_end();
+                    glsl += "\n";
+                }
+                glsl += "void main() {\n    fragment = hook();\n}\n";
+            }
+            shaders.push(glsl);
+        }
+        assert_eq!(shaders.len(), network.passes.len() + 1, "a shader a pass, and the last");
+        shaders
+    }
+
+    fn screen_shader_path(index: usize) -> String {
+        format!("{}/shaders/anime4k/pass{index}.frag", env!("CARGO_MANIFEST_DIR"))
+    }
+
+    /// writes the screen filter's shaders, which tools\glslang then
+    /// compiles to SPIR-V: `glslang -V --target-env vulkan1.0 passN.frag -o
+    /// passN.frag.spv`.
+    #[test]
+    #[ignore]
+    fn write_screen_shaders() {
+        std::fs::create_dir_all(format!("{}/shaders/anime4k", env!("CARGO_MANIFEST_DIR"))).unwrap();
+        for (index, glsl) in screen_shaders(SCREEN_SHADER).iter().enumerate() {
+            std::fs::write(screen_shader_path(index), glsl).unwrap();
+        }
+    }
+
+    #[test]
+    fn the_screen_shaders_are_made_from_the_network_shipped() {
+        let shaders = screen_shaders(SCREEN_SHADER);
+        for (index, glsl) in shaders.iter().enumerate() {
+            let written = std::fs::read_to_string(screen_shader_path(index)).unwrap_or_default().replace("\r\n", "\n");
+            assert_eq!(&written, glsl, "pass{index}.frag is out of date: run write_screen_shaders and compile it again");
+        }
+        let network = screen_network().unwrap();
+        assert_eq!(network.graph().count() + 1, shaders.len());
+        assert_eq!(network.graph().next().unwrap().0, &[0], "the first pass reads the picture alone");
+    }
 
     #[test]
     fn both_sizes_of_the_network_are_read_whole() {

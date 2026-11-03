@@ -300,6 +300,12 @@ Tools used to work on it:
   or interlaced 3D gets EASU alone. Checked in a flight and a land battle,
   drawn at 1x in 2x and 3x windows on a Ryzen 5 5600G: smooth, sharp edges
   where Smooth shows stairs, at frame times within 0.5 ms of Smooth's.
+- **Screen filter: Anime4K** works as FSR does, but makes each screen twice
+  as big with Anime4K's CNN x2 M (bloc97/Anime4K, MIT) on the GPU between
+  SMAA and EASU, so edges and the HUD's letters come out sharper. Its
+  shaders are made from Anime4K's own file by a test in `anime4k.rs`. On a
+  Ryzen 5 5600G's integrated GPU it took 0.55 ms a screen drawn at 1x and
+  4.2 ms at 3x. Vulkan presenter only; the OpenGL one draws it as Smooth.
 - **Sharp HUD** (off by default) remakes the game's small pictures, the
   HUD's, menus' and portraits', twice as big with Anime4K's CNN x2 VL
   (bloc97/Anime4K, MIT), run on the CPU off the game's thread the first

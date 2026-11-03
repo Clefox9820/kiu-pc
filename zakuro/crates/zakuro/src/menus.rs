@@ -717,7 +717,7 @@ impl Menus {
                     }
                 })
                 .response
-                .on_hover_text("How the screens' pixels look scaled up: smooth, sharp with soft edges, or plain squares.");
+                .on_hover_text("How the screens' pixels look scaled up: smooth, sharp with soft edges, plain squares, AMD's FSR, or Anime4K's neural upscaler, which runs on the GPU when the window is bigger than the 3D is drawn.");
                 ui.checkbox(&mut settings.integer_scale, "Scale by whole numbers only")
                     .on_hover_text("Every pixel gets the same size, with a border around the screens.");
                 egui::ComboBox::from_label("Top screen shape").selected_text(settings.top_shape.name()).show_ui(ui, |ui| {
