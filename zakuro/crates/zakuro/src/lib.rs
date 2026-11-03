@@ -955,6 +955,7 @@ impl App {
         self.link_room();
         self.menus.menu_open = false;
         self.keyboard.release();
+        self.keyboard.forget_game_mode();
         self.paused = false;
         self.next_frame = Instant::now();
         // ZAKURO_LOAD_SLOT=<1-9> goes straight on from that slot's state, for
@@ -980,6 +981,7 @@ impl App {
         }
         self.menus.menu_open = false;
         self.keyboard.release();
+        self.keyboard.forget_game_mode();
     }
 
     fn key(&mut self, event: KeyEvent, consumed: bool) {
@@ -1012,9 +1014,7 @@ impl App {
                     return;
                 }
                 KeyCode::Escape if self.game.is_some() => {
-                    self.menus.menu_open = !self.menus.menu_open;
-                    self.set_mouse_aim(None);
-                    self.keyboard.release();
+                    self.toggle_menu();
                     return;
                 }
                 KeyCode::F1 => {
@@ -1069,11 +1069,20 @@ impl App {
                 }
                 self.apply_settings();
             } else if button == gilrs::Button::Mode && self.game.is_some() {
-                self.menus.menu_open = !self.menus.menu_open;
-                self.menus.settings_open = false;
-                self.keyboard.release();
+                self.toggle_menu();
             }
         }
+    }
+
+    /// opens or closes the menu over the game, with Escape or Home: the
+    /// settings opened from it close too, and the mouse aim lets go of the
+    /// pointer, for the game's next word to pick it again once play goes on.
+    fn toggle_menu(&mut self) {
+        self.menus.menu_open = !self.menus.menu_open;
+        self.menus.settings_open = false;
+        self.set_mouse_aim(None);
+        self.keyboard.release();
+        self.keyboard.forget_game_mode();
     }
 
     /// whether the pointer is busy with something other than the game.

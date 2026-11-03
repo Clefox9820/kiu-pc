@@ -137,11 +137,17 @@ impl Keyboard {
         self.fire = false;
         self.held = false;
         self.walk = false;
-        // the game's mode is told again once the keyboard is back
-        self.game = None;
-        self.quiet = 0;
+        // the game's mode stays: the same play goes on when the keyboard is
+        // back, see forget_game_mode
         self.mouse_buttons = PadState::default();
         self.wheel = None;
+    }
+
+    /// forgets the kind of play the game last said, so its next word picks
+    /// the aim mode again, as it does once aim was turned off on purpose.
+    pub fn forget_game_mode(&mut self) {
+        self.game = None;
+        self.quiet = 0;
     }
 
     /// turns mouse aim on in a mode, the stylus down in the middle, or off.
@@ -560,6 +566,20 @@ mod tests {
         assert_eq!(keyboard.game_mode(0), Some(None), "quiet for long, a menu: aim off");
         assert_eq!(keyboard.game_mode(0), None, "said once");
         assert_eq!(keyboard.game_mode(GAME_FLYING), Some(Some(AimMode::Air)), "back in play");
+    }
+
+    /// the keyboard let go when the window loses the focus is no change of
+    /// play: coming back to the same battle leaves the aim as the player and
+    /// the settings had it, but turning aim off on purpose has the game's
+    /// word pick it again.
+    #[test]
+    fn letting_go_of_the_keys_keeps_the_game_mode() {
+        let mut keyboard = Keyboard::new(Keys::default());
+        assert_eq!(keyboard.game_mode(GAME_FLYING), Some(Some(AimMode::Air)));
+        keyboard.release();
+        assert_eq!(keyboard.game_mode(GAME_FLYING), None, "the focus back in the same play");
+        keyboard.forget_game_mode();
+        assert_eq!(keyboard.game_mode(GAME_FLYING), Some(Some(AimMode::Air)), "told again after the menu");
     }
 
     #[test]
