@@ -114,7 +114,7 @@ fn picture(ui: &mut Ui, settings: &mut Settings) {
                 })
                 .response
         });
-        row(ui, "Filter", "How the screens' pixels look scaled up. FSR and Anime4K work when the window is bigger than the 3D is drawn; Anime4K is the sharper, at a small cost to the GPU.", |ui| {
+        row(ui, "Filter", "How the screens' pixels look scaled up. FSR and Anime4K work when the window is bigger than the 3D is drawn; Anime4K is the sharper, at a small cost to the GPU; Anime4K + Restore cleans lines and letters more, at twice that cost.", |ui| {
             egui::ComboBox::from_id_salt("kiu filter")
                 .selected_text(settings.filter.name())
                 .show_ui(ui, |ui| {

@@ -306,6 +306,10 @@ Tools used to work on it:
   shaders are made from Anime4K's own file by a test in `anime4k.rs`. On a
   Ryzen 5 5600G's integrated GPU it took 0.55 ms a screen drawn at 1x and
   4.2 ms at 3x. Vulkan presenter only; the OpenGL one draws it as Smooth.
+  **Anime4K + Restore** runs Anime4K's Restore CNN M first, as Anime4K's
+  own fast mode does: letters and outlines come out cleaner, clearly at 2x
+  and slightly at 3x, at twice the GPU time (on the 5600G's iGPU, top screen
+  at 2x 3.6 ms instead of 1.9, at 3x 8.0 ms instead of 4.1).
 - **Sharp HUD** (off by default) remakes the game's small pictures, the
   HUD's, menus' and portraits', twice as big with Anime4K's CNN x2 VL
   (bloc97/Anime4K, MIT), run on the CPU off the game's thread the first

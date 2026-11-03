@@ -132,16 +132,28 @@ pub enum ScreenFilter {
     /// GPU, then brought to the window's size by EASU and sharpened with
     /// RCAS, as FSR's is. elsewhere, and in the GL presenter, it is FSR.
     Anime4k,
+    /// Anime4K as above, with its Restore CNN M before doubling, as its own
+    /// fast mode runs: cleaner lines and letters, at twice the GPU's time.
+    Anime4kRestore,
 }
 
 impl ScreenFilter {
+    /// whether Anime4K doubles a screen, and whether Restore runs first.
+    pub(crate) fn anime4k(self) -> Option<bool> {
+        match self {
+            ScreenFilter::Anime4k => Some(false),
+            ScreenFilter::Anime4kRestore => Some(true),
+            _ => None,
+        }
+    }
+
     /// the number the present shaders know it by.
     pub(crate) fn mode(self) -> i32 {
         match self {
             ScreenFilter::Smooth => 0,
             ScreenFilter::Pixels => 1,
             ScreenFilter::Sharp => 2,
-            ScreenFilter::Fsr | ScreenFilter::Anime4k => 3,
+            ScreenFilter::Fsr | ScreenFilter::Anime4k | ScreenFilter::Anime4kRestore => 3,
         }
     }
 }

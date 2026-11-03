@@ -7,6 +7,7 @@
   separate program, download or cache.
 - Added the **Anime4K** screen filter: like FSR, but each screen is made
   twice as big by Anime4K's network on the GPU, for sharper edges and text.
+  **Anime4K + Restore** cleans lines and letters first, at twice the GPU time.
 - Removed the AI option "HD HUD, menus and portraits" (Real-ESRGAN):
   `scripts\setup.ps1` no longer downloads it and `Play.bat` no longer sets
   `ZAKURO_UPSCALER`. A `cache\hd` folder an earlier build left in the data

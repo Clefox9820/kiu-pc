@@ -49,8 +49,11 @@ pub struct Network {
     passes: Vec<Pass>,
     tensors: usize,
     /// the tensors the last pass takes each color's 2x2 texels from, one
-    /// for all of them or one a color.
+    /// for all of them or one a color, or for a Restore network, the one
+    /// its last pass writes, added to the picture at its size.
     residuals: Vec<usize>,
+    /// whether it restores the picture at its size rather than doubling it.
+    restores: bool,
 }
 
 /// the network, read once.
@@ -68,8 +71,19 @@ pub fn screen_network() -> Option<&'static Network> {
     read_once(&NETWORK_M, SCREEN_SHADER)
 }
 
+/// Restore CNN M, which the screen filter runs before doubling, as Anime4K's
+/// own fast mode does: it mends blurred and jagged lines at the picture's
+/// size. its shaders are made as the upscaler's are.
+pub const RESTORE_SHADER: &str = include_str!("anime4k/Anime4K_Restore_CNN_M.glsl");
+
+/// the screen filter's Restore network, read once.
+pub fn restore_network() -> Option<&'static Network> {
+    read_once(&NETWORK_RESTORE, RESTORE_SHADER)
+}
+
 static NETWORK_VL: OnceLock<Option<Network>> = OnceLock::new();
 static NETWORK_M: OnceLock<Option<Network>> = OnceLock::new();
+static NETWORK_RESTORE: OnceLock<Option<Network>> = OnceLock::new();
 
 fn read_once(network: &'static OnceLock<Option<Network>>, source: &str) -> Option<&'static Network> {
     network.get_or_init(|| parse(source).map_err(|error| log::warn!("could not read Anime4K's network, {error}")).ok()).as_ref()
@@ -91,13 +105,20 @@ impl Network {
     pub fn residuals(&self) -> &[usize] {
         &self.residuals
     }
+
+    /// whether it restores the picture at its size, its last pass's
+    /// output being the picture restored, rather than doubling it.
+    pub fn restores(&self) -> bool {
+        self.restores
+    }
 }
 
 fn parse(source: &str) -> Result<Network, String> {
     let mut names: HashMap<&str, usize> = HashMap::from([("MAIN", 0)]);
     let mut passes = Vec::new();
-    let mut residuals = Vec::new();
+    let (mut residuals, mut restores) = (Vec::new(), false);
     for block in source.split("//!DESC").skip(1) {
+        let doubles = block.lines().next().is_some_and(|desc| desc.contains("Depth-to-Space"));
         let (mut binds, mut save) = (Vec::new(), None);
         let mut reads: HashMap<&str, (usize, Half)> = HashMap::new();
         let (mut terms, mut bias) = (Vec::new(), [0.0; 4]);
@@ -141,14 +162,22 @@ fn parse(source: &str) -> Result<Network, String> {
                 bias = numbers(inside.unwrap_or_default())?.try_into().map_err(|_| format!("not 4 biases in {line}"))?;
             }
         }
+        let tensor = |name: &&str| names.get(name).copied().ok_or(format!("{name} is not made"));
         match save {
-            Some("MAIN") => {
-                residuals = binds.iter().filter(|&&name| name != "MAIN").map(|name| names.get(name).copied().ok_or(format!("{name} is not made"))).collect::<Result<_, _>>()?;
+            Some("MAIN") if doubles => {
+                residuals = binds.iter().filter(|&&name| name != "MAIN").map(tensor).collect::<Result<_, _>>()?;
             }
             Some(name) => {
+                let inputs = binds.iter().map(tensor).collect::<Result<_, _>>()?;
                 let output = names.len();
-                names.insert(name, output);
-                let inputs = binds.iter().map(|name| names.get(name).copied().ok_or(format!("{name} is not made"))).collect::<Result<_, _>>()?;
+                if name == "MAIN" {
+                    // a Restore network's last pass makes the picture again:
+                    // a tensor of its own here, added to the picture
+                    restores = true;
+                    residuals = vec![output];
+                } else {
+                    names.insert(name, output);
+                }
                 passes.push(Pass { inputs, output, terms, bias });
             }
             None => return Err("a pass saves nothing".to_owned()),
@@ -157,7 +186,8 @@ fn parse(source: &str) -> Result<Network, String> {
     if passes.is_empty() || residuals.is_empty() {
         return Err("no network in it".to_owned());
     }
-    Ok(Network { passes, tensors: names.len(), residuals })
+    let tensors = names.len() + usize::from(restores);
+    Ok(Network { passes, tensors, residuals, restores })
 }
 
 fn numbers(list: &str) -> Result<Vec<f32>, String> {
@@ -206,6 +236,20 @@ pub(crate) fn upscale_filtered(texels: &[[u8; 4]], width: u32, height: u32) -> V
     (0..h * 2)
         .flat_map(|oy| (0..w * 2).map(move |ox| (ox, oy)))
         .flat_map(|(ox, oy)| filtered(&source, w, h, (ox as f32 + 0.5) / 2.0 - 0.5, (oy as f32 + 0.5) / 2.0 - 0.5).map(unit))
+        .collect()
+}
+
+/// the texels restored by a Restore network at their size: what its last
+/// pass makes added to their colors, alpha as it was. the screen filter
+/// does this on the GPU, tests check it against this.
+#[cfg(test)]
+pub(crate) fn restore(network: &Network, texels: &[[u8; 4]], width: u32, height: u32) -> Vec<[u8; 4]> {
+    let tensors = run(network, texels.iter().map(|texel| texel.map(|channel| channel as f32 / 255.0)).collect(), width as usize, height as usize);
+    let added = &tensors[network.residuals[0]];
+    texels
+        .iter()
+        .zip(added)
+        .map(|(texel, added)| [0, 1, 2, 3].map(|channel| if channel == 3 { texel[3] } else { unit(texel[channel] as f32 / 255.0 + added[channel]) }))
         .collect()
 }
 
@@ -302,23 +346,24 @@ fn filtered(texels: &[[f32; 4]], w: usize, h: usize, x: f32, y: f32) -> [f32; 4]
 mod tests {
     use super::*;
 
-    /// the screen filter's shaders, one a pass of M's: each reads its
-    /// tensors texel by texel, clamped at the edges as mpv's are, with
-    /// mpv's own code for the pass, and the last puts each texel's four
-    /// channels on the 2x2 texels it becomes, over the picture made bigger.
-    fn screen_shaders(source: &str) -> Vec<String> {
+    /// the screen filter's shaders made from a network's file, a pass a
+    /// shader: each reads its tensors texel by texel, clamped at the edges
+    /// as mpv's are, with mpv's own code for the pass, and an upscaler's
+    /// last puts each texel's four channels on the 2x2 texels it becomes,
+    /// over the picture made bigger.
+    fn screen_shaders(source: &str, file: &str) -> Vec<String> {
         let network = parse(source).unwrap();
         let mut shaders = Vec::new();
         for block in source.split("//!DESC").skip(1) {
             let binds: Vec<&str> = block.lines().filter_map(|line| line.trim().strip_prefix("//!BIND ")).map(str::trim).collect();
-            let save = block.lines().find_map(|line| line.trim().strip_prefix("//!SAVE ")).map(str::trim).unwrap();
-            let mut glsl = String::from(
-                "#version 450\n// made from Anime4K_Upscale_CNN_x2_M.glsl, Anime4K by bloc97 (MIT, see that file),\n// by anime4k.rs's write_screen_shaders test: do not edit.\nlayout(location = 0) out vec4 fragment;\n",
+            let doubles = block.lines().next().is_some_and(|desc| desc.contains("Depth-to-Space"));
+            let mut glsl = format!(
+                "#version 450\n// made from {file}, Anime4K by bloc97 (MIT, see that file),\n// by anime4k.rs's write_screen_shaders test: do not edit.\nlayout(location = 0) out vec4 fragment;\n"
             );
             for (binding, name) in binds.iter().enumerate() {
                 glsl += &format!("layout(set = 0, binding = {binding}) uniform sampler2D {name};\n");
             }
-            if save == "MAIN" {
+            if doubles {
                 let residuals = &binds[1..];
                 let fetch = |channel: usize| format!("texelFetch({}, at / 2, 0)[sub]", residuals[channel.min(residuals.len() - 1)]);
                 glsl += "void main() {\n    ivec2 at = ivec2(gl_FragCoord.xy);\n    int sub = (at.y % 2) * 2 + at.x % 2;\n";
@@ -338,36 +383,68 @@ mod tests {
             }
             shaders.push(glsl);
         }
-        assert_eq!(shaders.len(), network.passes.len() + 1, "a shader a pass, and the last");
+        let last = usize::from(!network.restores);
+        assert_eq!(shaders.len(), network.passes.len() + last, "a shader a pass, and an upscaler's last");
         shaders
     }
 
-    fn screen_shader_path(index: usize) -> String {
-        format!("{}/shaders/anime4k/pass{index}.frag", env!("CARGO_MANIFEST_DIR"))
+    /// the screen filter's networks: the shaders' names, the file, and the
+    /// network read from it.
+    fn screen_networks() -> [(&'static str, &'static str, &'static Network); 2] {
+        [
+            ("restore", "Anime4K_Restore_CNN_M.glsl", restore_network().unwrap()),
+            ("pass", "Anime4K_Upscale_CNN_x2_M.glsl", screen_network().unwrap()),
+        ]
+    }
+
+    fn screen_shader_path(name: &str, index: usize) -> String {
+        format!("{}/shaders/anime4k/{name}{index}.frag", env!("CARGO_MANIFEST_DIR"))
+    }
+
+    fn source(name: &str) -> &'static str {
+        if name == "restore" { RESTORE_SHADER } else { SCREEN_SHADER }
     }
 
     /// writes the screen filter's shaders, which tools\glslang then
     /// compiles to SPIR-V: `glslang -V --target-env vulkan1.0 passN.frag -o
-    /// passN.frag.spv`.
+    /// passN.frag.spv`, and the same for restoreN.frag.
     #[test]
     #[ignore]
     fn write_screen_shaders() {
         std::fs::create_dir_all(format!("{}/shaders/anime4k", env!("CARGO_MANIFEST_DIR"))).unwrap();
-        for (index, glsl) in screen_shaders(SCREEN_SHADER).iter().enumerate() {
-            std::fs::write(screen_shader_path(index), glsl).unwrap();
+        for (name, file, _) in screen_networks() {
+            for (index, glsl) in screen_shaders(source(name), file).iter().enumerate() {
+                std::fs::write(screen_shader_path(name, index), glsl).unwrap();
+            }
         }
     }
 
     #[test]
-    fn the_screen_shaders_are_made_from_the_network_shipped() {
-        let shaders = screen_shaders(SCREEN_SHADER);
-        for (index, glsl) in shaders.iter().enumerate() {
-            let written = std::fs::read_to_string(screen_shader_path(index)).unwrap_or_default().replace("\r\n", "\n");
-            assert_eq!(&written, glsl, "pass{index}.frag is out of date: run write_screen_shaders and compile it again");
+    fn the_screen_shaders_are_made_from_the_networks_shipped() {
+        for (name, file, network) in screen_networks() {
+            let shaders = screen_shaders(source(name), file);
+            for (index, glsl) in shaders.iter().enumerate() {
+                let written = std::fs::read_to_string(screen_shader_path(name, index)).unwrap_or_default().replace("\r\n", "\n");
+                assert_eq!(&written, glsl, "{name}{index}.frag is out of date: run write_screen_shaders and compile it again");
+            }
+            assert_eq!(network.graph().count() + usize::from(!network.restores()), shaders.len());
+            assert_eq!(network.graph().next().unwrap().0, &[0], "the first pass reads the picture alone");
         }
-        let network = screen_network().unwrap();
-        assert_eq!(network.graph().count() + 1, shaders.len());
-        assert_eq!(network.graph().next().unwrap().0, &[0], "the first pass reads the picture alone");
+        let restore = restore_network().unwrap();
+        assert!(restore.restores() && !screen_network().unwrap().restores());
+        assert_eq!(restore.graph().last().unwrap().0[0], 0, "its last pass reads the picture, to add to it");
+    }
+
+    /// Restore's last pass is added to the picture: a flat colour comes
+    /// back near itself, alpha untouched.
+    #[test]
+    fn a_flat_picture_is_restored_near_itself() {
+        let texels = vec![[120u8, 140, 160, 200]; 16 * 16];
+        let restored = restore(restore_network().unwrap(), &texels, 16, 16);
+        assert!(restored.iter().all(|texel| texel[3] == 200));
+        let flat = texels[0];
+        let worst = restored.iter().flat_map(|texel| (0..3).map(move |channel| texel[channel].abs_diff(flat[channel]))).max().unwrap();
+        assert!(worst <= 8, "a flat colour moved by {worst}");
     }
 
     #[test]

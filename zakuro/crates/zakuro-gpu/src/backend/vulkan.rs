@@ -32,8 +32,22 @@ const ANIME4K_SPIRV: [&[u8]; 9] = [
     include_bytes!("../../shaders/anime4k/pass7.frag.spv"),
     include_bytes!("../../shaders/anime4k/pass8.frag.spv"),
 ];
+/// Anime4K's Restore CNN M, run before the upscaler as Anime4K's fast mode
+/// does, made the same way.
+const RESTORE_SPIRV: [&[u8]; 8] = [
+    include_bytes!("../../shaders/anime4k/restore0.frag.spv"),
+    include_bytes!("../../shaders/anime4k/restore1.frag.spv"),
+    include_bytes!("../../shaders/anime4k/restore2.frag.spv"),
+    include_bytes!("../../shaders/anime4k/restore3.frag.spv"),
+    include_bytes!("../../shaders/anime4k/restore4.frag.spv"),
+    include_bytes!("../../shaders/anime4k/restore5.frag.spv"),
+    include_bytes!("../../shaders/anime4k/restore6.frag.spv"),
+    include_bytes!("../../shaders/anime4k/restore7.frag.spv"),
+];
 /// what Anime4K's passes write: signed, and finer than a colour.
 const TENSOR_FORMAT: vk::Format = vk::Format::R16G16B16A16_SFLOAT;
+/// the output of Anime4K's last pass, the screen twice as big.
+const DOUBLED: usize = usize::MAX;
 
 /// SMAA's precomputed tables, from its Textures/AreaTex.h and SearchTex.h:
 /// the area each pattern of edges covers, two channels, and how far a
@@ -621,7 +635,8 @@ impl VulkanPresenter {
 
     /// the frame's places, each marked with how it is drawn, see through.
     fn mark_sharpened(&self, places: Vec<(Viewport, Shown)>, sizes: &[(u32, u32); 3]) -> Vec<Place> {
-        let usable = matches!(self.filter, ScreenFilter::Fsr | ScreenFilter::Anime4k) && self.fsr.as_ref().is_some_and(|fsr| !fsr.broken);
+        let filters = self.filter == ScreenFilter::Fsr || self.filter.anime4k().is_some();
+        let usable = filters && self.fsr.as_ref().is_some_and(|fsr| !fsr.broken);
         places
             .into_iter()
             .map(|(viewport, shown)| (viewport, shown, through(usable, shown, viewport, sizes[screen_index(shown)])))
@@ -655,7 +670,18 @@ impl VulkanPresenter {
         }
         // Anime4K's images for each screen a sharpened place shows, made
         // after SMAA's, whose result they read
-        if self.filter == ScreenFilter::Anime4k {
+        if let Some(restore) = self.filter.anime4k() {
+            // its passes made again, with Restore or without, once the
+            // filter changed between the two
+            if fsr.anime4k.as_ref().is_some_and(|anime4k| anime4k.restore != restore) {
+                unsafe { self.device.device_wait_idle() }.map_err(vk_fail("waiting for idle"))?;
+                if let Some(old) = fsr.anime4k.take() {
+                    old.destroy(&self.device);
+                }
+                fsr.anime4k = Anime4k::new(&self.device, fsr.colour_pass, restore)
+                    .map_err(|error| log::warn!("{error}, Anime4K's screen filter is FSR from now on"))
+                    .ok();
+            }
             for index in 0..3 {
                 let sharpened = places.iter().any(|&(_, shown, through)| screen_index(shown) == index && through == Through::Sharpened);
                 let (Some(anime4k), Some(smaa)) = (&mut fsr.anime4k, &fsr.screens[index]) else { continue };
@@ -665,7 +691,7 @@ impl VulkanPresenter {
                 unsafe { self.device.device_wait_idle() }.map_err(vk_fail("waiting for idle"))?;
                 anime4k.drop_screen(&self.device, index);
                 let (main, size) = (smaa.result.texture.view, smaa.size);
-                match anime4k.screen(&self.device, &self.memory_properties, fsr.colour_pass, self.descriptor_layout, self.sampler, main, size) {
+                match anime4k.screen(&self.device, &self.memory_properties, self.descriptor_layout, self.sampler, main, size) {
                     Ok(screen) => anime4k.screens[index] = Some(screen),
                     Err(error) => {
                         // FSR's upscaling from then on
@@ -891,7 +917,7 @@ impl VulkanPresenter {
             // the FSR filter's screens antialiased, and upscaled before the
             // window's pass sharpens them
             if let Some(fsr) = self.fsr.as_ref().filter(|_| places.iter().any(|place| place.2 != Through::Plain)) {
-                fsr.record(device, command_buffer, places, &crops, self.extent, self.filter == ScreenFilter::Anime4k);
+                fsr.record(device, command_buffer, places, &crops, self.extent, self.filter.anime4k().is_some());
             }
 
             let clear = [vk::ClearValue {
@@ -2055,7 +2081,8 @@ impl Fsr {
         let easu = create_pipeline(device, colour_pass, &[picture_layout], FRAGMENT_SPIRV, CONSTANTS)?;
         let rcas = create_pipeline(device, window_pass, &[picture_layout], RCAS_SPIRV, RCAS_CONSTANTS)?;
         let (area, search) = upload_tables(device, memory_properties, queue, command_pool)?;
-        let anime4k = Anime4k::new(device, colour_pass).map_err(|error| log::warn!("Anime4K's screen filter can't be made, {error}")).ok();
+        // without Restore until the filter asks for it
+        let anime4k = Anime4k::new(device, colour_pass, false).map_err(|error| log::warn!("Anime4K's screen filter can't be made, {error}")).ok();
         Ok(Fsr {
             edges_pass,
             colour_pass,
@@ -2153,7 +2180,7 @@ impl Fsr {
                 }
             }
             if let Some((anime4k, screen)) = doubled(index) {
-                anime4k.record(device, command_buffer, self.colour_pass, screen);
+                anime4k.record(device, command_buffer, screen);
             }
         }
 
@@ -2217,20 +2244,26 @@ impl Fsr {
     }
 }
 
-/// Anime4K's CNN x2 M as the screen filter, see ScreenFilter::Anime4k: a
-/// shader a pass, each drawing one tensor at the screen's size from those
-/// before it, SMAA's result the first, and the last the screen twice as
-/// big. its sets come from a pool of its own, with room for every screen's.
+/// Anime4K as the screen filter, see ScreenFilter::Anime4k: Restore CNN M
+/// when on, then CNN x2 M, a shader a pass, each drawing one tensor at the
+/// screen's size from those before it, SMAA's result the first, and the
+/// last the screen twice as big. Restore's last pass is the screen restored,
+/// which the upscaler reads as its picture. its sets come from a pool of
+/// its own, with room for every screen's.
 ///
 /// one set of images serves both frames in flight, as SMAA's do.
 struct Anime4k {
     tensor_pass: vk::RenderPass,
+    colour_pass: vk::RenderPass,
     pool: vk::DescriptorPool,
     /// each pass's pipeline, its set's layout, the tensors it reads and the
-    /// one it writes, 0 for the last, which writes the picture.
+    /// one it writes, DOUBLED for the last.
     passes: Vec<(Pipeline, vk::DescriptorSetLayout, Vec<usize>, usize)>,
-    /// how many tensors there are, the picture's among them.
-    tensors: usize,
+    /// the format of each tensor from 1 on, tensor 0 being SMAA's result:
+    /// a colour for the screen restored, signed and finer for the rest.
+    targets: Vec<vk::Format>,
+    /// whether Restore runs before the upscaler.
+    restore: bool,
     /// the images of the top screen, the bottom one and the right eye's,
     /// made with SMAA's and again whenever those are.
     screens: [Option<Anime4kScreen>; 3],
@@ -2250,30 +2283,52 @@ struct Anime4kScreen {
 }
 
 impl Anime4k {
-    fn new(device: &ash::Device, colour_pass: vk::RenderPass) -> Result<Anime4k, PresentError> {
-        let network = crate::anime4k::screen_network().ok_or_else(|| fail("its network can't be read"))?;
-        let mut graph: Vec<(Vec<usize>, usize)> = network.graph().map(|(inputs, output)| (inputs.to_vec(), output)).collect();
-        // the last puts the residuals on the picture
-        graph.push((std::iter::once(0).chain(network.residuals().iter().copied()).collect(), 0));
-        if graph.len() != ANIME4K_SPIRV.len() {
-            return Err(fail(format!("its network has {} passes and {} shaders", graph.len(), ANIME4K_SPIRV.len())));
+    /// its passes, Restore's first when restore is on.
+    fn new(device: &ash::Device, colour_pass: vk::RenderPass, restore: bool) -> Result<Anime4k, PresentError> {
+        let upscaler = crate::anime4k::screen_network().ok_or_else(|| fail("its network can't be read"))?;
+        let mut graph: Vec<(Vec<usize>, usize, &[u8])> = Vec::new();
+        let mut targets = Vec::new();
+        // the picture the upscaler reads: SMAA's result, or Restore's of it
+        let mut picture = 0;
+        if restore {
+            let restorer = crate::anime4k::restore_network().ok_or_else(|| fail("its Restore network can't be read"))?;
+            if restorer.graph().count() != RESTORE_SPIRV.len() {
+                return Err(fail(format!("its Restore network has {} passes and {} shaders", restorer.graph().count(), RESTORE_SPIRV.len())));
+            }
+            for ((inputs, output), spirv) in restorer.graph().zip(RESTORE_SPIRV) {
+                graph.push((inputs.to_vec(), output, spirv));
+            }
+            picture = restorer.residuals()[0];
+            targets.extend((1..restorer.tensors()).map(|tensor| if tensor == picture { COLOUR_FORMAT } else { TENSOR_FORMAT }));
         }
+        // the upscaler's tensors come after Restore's, its picture before them
+        let global = |tensor: usize| if tensor == 0 { picture } else { picture + tensor };
+        if upscaler.graph().count() + 1 != ANIME4K_SPIRV.len() {
+            return Err(fail(format!("its network has {} passes and {} shaders", upscaler.graph().count() + 1, ANIME4K_SPIRV.len())));
+        }
+        for ((inputs, output), spirv) in upscaler.graph().zip(ANIME4K_SPIRV) {
+            graph.push((inputs.iter().map(|&tensor| global(tensor)).collect(), global(output), spirv));
+        }
+        targets.extend((1..upscaler.tensors()).map(|_| TENSOR_FORMAT));
+        // the last puts the residuals on the picture
+        let last = std::iter::once(picture).chain(upscaler.residuals().iter().map(|&tensor| global(tensor))).collect();
+        graph.push((last, DOUBLED, ANIME4K_SPIRV[ANIME4K_SPIRV.len() - 1]));
+
         let tensor_pass = create_target_pass(device, TENSOR_FORMAT)?;
         let mut anime4k =
-            Anime4k { tensor_pass, pool: vk::DescriptorPool::null(), passes: Vec::new(), tensors: network.tensors(), screens: [None, None, None] };
+            Anime4k { tensor_pass, colour_pass, pool: vk::DescriptorPool::null(), passes: Vec::new(), targets, restore, screens: [None, None, None] };
         // what was made goes again, should anything fail
         let made = (|| {
-            let pictures = graph.iter().map(|(inputs, _)| inputs.len() as u32).sum::<u32>() + 1;
+            let pictures = graph.iter().map(|(inputs, _, _)| inputs.len() as u32).sum::<u32>() + 1;
             let sizes = [vk::DescriptorPoolSize::default().ty(vk::DescriptorType::COMBINED_IMAGE_SAMPLER).descriptor_count(3 * pictures)];
             let info = vk::DescriptorPoolCreateInfo::default()
                 .flags(vk::DescriptorPoolCreateFlags::FREE_DESCRIPTOR_SET)
                 .pool_sizes(&sizes)
                 .max_sets(3 * (graph.len() as u32 + 1));
             anime4k.pool = unsafe { device.create_descriptor_pool(&info, None) }.map_err(vk_fail("creating Anime4K's descriptor pool"))?;
-            for (index, (inputs, output)) in graph.iter().enumerate() {
+            for (inputs, output, spirv) in &graph {
                 let layout = create_descriptor_layout(device, inputs.len() as u32)?;
-                let render_pass = if *output == 0 { colour_pass } else { tensor_pass };
-                match create_pipeline(device, render_pass, &[layout], ANIME4K_SPIRV[index], 4) {
+                match create_pipeline(device, anime4k.pass_for(*output), &[layout], spirv, 4) {
                     Ok(pipeline) => anime4k.passes.push((pipeline, layout, inputs.clone(), *output)),
                     Err(error) => {
                         unsafe { device.destroy_descriptor_set_layout(layout, None) };
@@ -2292,13 +2347,20 @@ impl Anime4k {
         }
     }
 
+    /// the render pass a pass writing output draws in.
+    fn pass_for(&self, output: usize) -> vk::RenderPass {
+        match output {
+            DOUBLED => self.colour_pass,
+            tensor if self.targets[tensor - 1] == COLOUR_FORMAT => self.colour_pass,
+            _ => self.tensor_pass,
+        }
+    }
+
     /// its images for a screen of this size, whose SMAA result is main.
-    #[allow(clippy::too_many_arguments)]
     fn screen(
         &self,
         device: &ash::Device,
         memory_properties: &vk::PhysicalDeviceMemoryProperties,
-        colour_pass: vk::RenderPass,
         picture_layout: vk::DescriptorSetLayout,
         sampler: vk::Sampler,
         main: vk::ImageView,
@@ -2306,14 +2368,14 @@ impl Anime4k {
     ) -> Result<Anime4kScreen, PresentError> {
         let (mut tensors, mut sets) = (Vec::new(), Vec::new());
         let made = (|| {
-            for _ in 1..self.tensors {
-                tensors.push(Target::new(device, memory_properties, self.tensor_pass, TENSOR_FORMAT, size)?);
+            for (index, &format) in self.targets.iter().enumerate() {
+                tensors.push(Target::new(device, memory_properties, self.pass_for(index + 1), format, size)?);
             }
             for (_, layout, inputs, _) in &self.passes {
                 let views: Vec<vk::ImageView> = inputs.iter().map(|&tensor| if tensor == 0 { main } else { tensors[tensor - 1].texture.view }).collect();
                 sets.push(picture_set(device, self.pool, *layout, sampler, &views)?);
             }
-            let result = Target::new(device, memory_properties, colour_pass, COLOUR_FORMAT, (size.0 * 2, size.1 * 2))?;
+            let result = Target::new(device, memory_properties, self.colour_pass, COLOUR_FORMAT, (size.0 * 2, size.1 * 2))?;
             match picture_set(device, self.pool, picture_layout, sampler, &[result.texture.view]) {
                 Ok(set) => Ok((result, set)),
                 Err(error) => {
@@ -2337,12 +2399,13 @@ impl Anime4k {
     }
 
     /// records its passes over a screen, after SMAA's.
-    fn record(&self, device: &ash::Device, command_buffer: vk::CommandBuffer, colour_pass: vk::RenderPass, screen: &Anime4kScreen) {
+    fn record(&self, device: &ash::Device, command_buffer: vk::CommandBuffer, screen: &Anime4kScreen) {
         for (index, ((layout, pipeline), _, _, output)) in self.passes.iter().enumerate() {
-            let (render_pass, target, (width, height)) = match *output {
-                0 => (colour_pass, &screen.result, (screen.size.0 * 2, screen.size.1 * 2)),
-                tensor => (self.tensor_pass, &screen.tensors[tensor - 1], screen.size),
+            let (target, (width, height)) = match *output {
+                DOUBLED => (&screen.result, (screen.size.0 * 2, screen.size.1 * 2)),
+                tensor => (&screen.tensors[tensor - 1], screen.size),
             };
+            let render_pass = self.pass_for(*output);
             let extent = vk::Extent2D { width, height };
             begin_pass(device, command_buffer, render_pass, target.framebuffer, extent);
             set_viewport(device, command_buffer, Viewport { x: 0.0, y: 0.0, width: width as f32, height: height as f32 }, extent);
@@ -2837,7 +2900,6 @@ mod tests {
             .address_mode_w(vk::SamplerAddressMode::CLAMP_TO_EDGE);
         let sampler = unsafe { device.create_sampler(&sampler_info, None) }.unwrap();
         let colour_pass = create_target_pass(device, COLOUR_FORMAT).unwrap();
-        let mut anime4k = Anime4k::new(device, colour_pass).unwrap();
 
         // a red disc over a gradient, edges and slopes both
         let (width, height) = (32u32, 24u32);
@@ -2861,18 +2923,26 @@ mod tests {
         });
         free_buffer(device, staging);
 
-        let screen = anime4k.screen(device, &memory_properties, colour_pass, picture_layout, sampler, picture.view, (width, height)).unwrap();
-        run(&shared, pool, |command_buffer| anime4k.record(device, command_buffer, colour_pass, &screen));
-        let gpu = read_back(&shared, &memory_properties, pool, screen.result.texture.image, (width * 2, height * 2));
-        let cpu = crate::anime4k::upscale(crate::anime4k::screen_network().unwrap(), &texels, width, height);
-        let worst = gpu.iter().zip(&cpu).map(|(gpu, cpu)| gpu.abs_diff(*cpu)).max().unwrap();
-        assert!(worst <= 3, "a channel {worst} off the CPU's");
-        // and the network did more than filter
-        let filtered = crate::anime4k::upscale_filtered(&texels, width, height);
-        assert!(gpu.iter().zip(&filtered).any(|(gpu, filtered)| gpu.abs_diff(*filtered) > 8), "no different from filtering");
-
-        anime4k.screens[0] = Some(screen);
-        anime4k.destroy(device);
+        // the upscaler alone, then Restore before it
+        for restore in [false, true] {
+            let mut anime4k = Anime4k::new(device, colour_pass, restore).unwrap();
+            let screen = anime4k.screen(device, &memory_properties, picture_layout, sampler, picture.view, (width, height)).unwrap();
+            run(&shared, pool, |command_buffer| anime4k.record(device, command_buffer, &screen));
+            let gpu = read_back(&shared, &memory_properties, pool, screen.result.texture.image, (width * 2, height * 2));
+            // on the CPU: Restore's picture kept as a colour, as on the GPU, then doubled
+            let source = match restore {
+                true => crate::anime4k::restore(crate::anime4k::restore_network().unwrap(), &texels, width, height),
+                false => texels.clone(),
+            };
+            let cpu = crate::anime4k::upscale(crate::anime4k::screen_network().unwrap(), &source, width, height);
+            let worst = gpu.iter().zip(&cpu).map(|(gpu, cpu)| gpu.abs_diff(*cpu)).max().unwrap();
+            assert!(worst <= 4, "restore {restore}: a channel {worst} off the CPU's");
+            // and the networks did more than filter
+            let filtered = crate::anime4k::upscale_filtered(&texels, width, height);
+            assert!(gpu.iter().zip(&filtered).any(|(gpu, filtered)| gpu.abs_diff(*filtered) > 8), "restore {restore}: no different from filtering");
+            anime4k.screens[0] = Some(screen);
+            anime4k.destroy(device);
+        }
         picture.destroy(device);
         unsafe {
             device.destroy_sampler(sampler, None);
