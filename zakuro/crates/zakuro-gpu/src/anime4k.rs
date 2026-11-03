@@ -136,7 +136,7 @@ fn blocks(source: &str) -> impl Iterator<Item = Block<'_>> {
     source.split("//!DESC").skip(1).map(|text| Block {
         doubles: text.lines().next().is_some_and(|desc| desc.contains("Depth-to-Space")),
         binds: text.lines().filter_map(|line| line.trim().strip_prefix("//!BIND ")).map(str::trim).collect(),
-        save: text.lines().filter_map(|line| line.trim().strip_prefix("//!SAVE ")).map(str::trim).last(),
+        save: text.lines().filter_map(|line| line.trim().strip_prefix("//!SAVE ")).map(str::trim).next_back(),
         text,
     })
 }

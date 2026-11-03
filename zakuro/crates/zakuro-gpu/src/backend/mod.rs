@@ -137,14 +137,29 @@ pub enum ScreenFilter {
     Anime4kRestore,
 }
 
+/// which of Anime4K's networks a screen filter runs on the GPU.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Anime4kChain {
+    /// CNN x2 M alone.
+    Upscale,
+    /// Restore CNN M, then CNN x2 M.
+    RestoreThenUpscale,
+}
+
 impl ScreenFilter {
-    /// whether Anime4K doubles a screen, and whether Restore runs first.
-    pub(crate) fn anime4k(self) -> Option<bool> {
+    /// the networks of Anime4K's it runs, none for a filter not Anime4K's.
+    pub(crate) fn anime4k(self) -> Option<Anime4kChain> {
         match self {
-            ScreenFilter::Anime4k => Some(false),
-            ScreenFilter::Anime4kRestore => Some(true),
+            ScreenFilter::Anime4k => Some(Anime4kChain::Upscale),
+            ScreenFilter::Anime4kRestore => Some(Anime4kChain::RestoreThenUpscale),
             _ => None,
         }
+    }
+
+    /// whether the Vulkan presenter draws a screen bigger than its pixels
+    /// through the FSR filter's passes, FSR's own or Anime4K's.
+    pub(crate) fn upscales(self) -> bool {
+        self == ScreenFilter::Fsr || self.anime4k().is_some()
     }
 
     /// the number the present shaders know it by.
