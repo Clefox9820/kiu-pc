@@ -45,6 +45,19 @@ pub struct Activity {
     pub since: u64,
 }
 
+impl Activity {
+    /// what the game is doing: in a menu, or in play on foot or flying, in
+    /// the chapter of the stage it read last (see chapter), since `started`.
+    pub fn new(in_play: bool, flying: bool, last_read: &std::collections::HashMap<String, String>, started: u64) -> Activity {
+        let doing = match (in_play, flying) {
+            (false, _) => Doing::Menus,
+            (true, false) => Doing::OnFoot,
+            (true, true) => Doing::Flying,
+        };
+        Activity { doing, chapter: chapter(last_read), since: started }
+    }
+}
+
 /// the story's chapter the game is in, from the stage it last read: chapter
 /// NN flies in `stage/aNNxx.zrc` and lands in `gNNxx.zrc` (seen in chapter 1),
 /// with `bNNxx.zrc` beside them, in both releases' RomFS (`us/`, `eu/`).
@@ -56,28 +69,45 @@ pub fn chapter(last_read: &std::collections::HashMap<String, String>) -> Option<
 }
 
 /// the presence shown, kept up to date by a thread of its own so a slow or
-/// missing Discord never holds up a frame.
+/// missing Discord never holds up a frame. the thread starts with the first
+/// activity to show, so none runs while the presence is off.
 pub struct Presence {
     shown: Option<Activity>,
-    to: Sender<Option<Activity>>,
+    to: Option<Sender<Option<Activity>>>,
 }
 
 impl Presence {
     pub fn new() -> Presence {
-        let (to, from) = mpsc::channel();
-        // ponytail: the thread sleeps for the program's life even with the presence off
-        if let Err(error) = std::thread::Builder::new().name("discord".into()).spawn(move || run(&from)) {
-            log::warn!("no Discord presence, {error}");
-        }
-        Presence { shown: None, to }
+        Presence { shown: None, to: None }
     }
 
     /// shows what the game is doing, or nothing, when it has changed.
     pub fn show(&mut self, activity: Option<Activity>) {
-        if activity != self.shown {
-            self.shown = activity;
-            let _ = self.to.send(activity);
+        if activity == self.shown {
+            return;
         }
+        self.shown = activity;
+        if self.to.is_none() && activity.is_some() {
+            let (to, from) = mpsc::channel();
+            match std::thread::Builder::new().name("discord".into()).spawn(move || run(&from)) {
+                Ok(_) => self.to = Some(to),
+                Err(error) => log::warn!("no Discord presence, {error}"),
+            }
+        }
+        if let Some(to) = &self.to {
+            let _ = to.send(activity);
+        }
+    }
+}
+
+impl crate::App {
+    /// what the running game is doing, on the player's Discord profile when
+    /// the settings ask for it.
+    pub(crate) fn show_presence(&mut self) {
+        let activity = self.game.as_ref().filter(|_| self.settings.discord_presence).map(|game| {
+            Activity::new(game.play.in_play(), game.play.flying(), &game.system.services.fs.last_read, game.started)
+        });
+        self.presence.show(activity);
     }
 }
 
@@ -94,7 +124,7 @@ fn run(from: &Receiver<Option<Activity>>) {
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => return,
         }
-        // ponytail: a Discord closed while nothing changes is only noticed at the next change
+        // a Discord closed while nothing changes is only noticed at the next change
         if !pending {
             continue;
         }
@@ -153,7 +183,7 @@ fn open(n: u32) -> io::Result<Box<dyn Pipe>> {
 }
 
 fn set_activity(pipe: &mut impl Pipe, activity: Option<Activity>, pid: u32) -> io::Result<()> {
-    // ponytail: the JSON is written by hand, its strings are this file's own and need no escaping
+    // the JSON is written by hand, its strings are this file's own and need no escaping
     let activity = match activity {
         Some(activity) => {
             // a menu in a chapter is its pause menu or its results, no part of the chapter
@@ -242,6 +272,21 @@ mod tests {
         assert!(written(Doing::OnFoot, Some(4)).contains(r#""activity":{"details":"Fighting on foot","state":"Chapter 4","timestamps":{"start":1}}"#));
         assert!(!written(Doing::Menus, Some(4)).contains("Chapter"));
         assert!(!written(Doing::Flying, None).contains("state"));
+    }
+
+    #[test]
+    fn an_activity_says_what_the_game_is_doing_in_which_chapter() {
+        let read: std::collections::HashMap<String, String> = [("us/stage".to_owned(), "g0401.zrc".to_owned())].into();
+        assert_eq!(Activity::new(false, true, &read, 5), Activity { doing: Doing::Menus, chapter: Some(4), since: 5 });
+        assert_eq!(Activity::new(true, false, &read, 5).doing, Doing::OnFoot);
+        assert_eq!(Activity::new(true, true, &read, 5).doing, Doing::Flying);
+    }
+
+    #[test]
+    fn no_thread_runs_while_the_presence_is_off() {
+        let mut presence = Presence::new();
+        presence.show(None);
+        assert!(presence.to.is_none());
     }
 
     #[test]

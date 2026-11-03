@@ -1372,16 +1372,7 @@ impl App {
             self.menus.message = Some("The room closed, or the connection to it was lost.".into());
         }
         self.download_play();
-        let activity = self.game.as_ref().filter(|_| self.settings.discord_presence).map(|game| discord::Activity {
-            doing: match (game.play.in_play(), game.play.flying()) {
-                (false, _) => discord::Doing::Menus,
-                (true, false) => discord::Doing::OnFoot,
-                (true, true) => discord::Doing::Flying,
-            },
-            chapter: discord::chapter(&game.system.services.fs.last_read),
-            since: game.started,
-        });
-        self.presence.show(activity);
+        self.show_presence();
 
         // a game waiting on its keyboard waits for the user, not running
         let typing = self.game.as_ref().is_some_and(|game| game.system.keyboard_request().is_some());
