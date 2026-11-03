@@ -40,7 +40,9 @@ powershell -ExecutionPolicy Bypass -File scripts\setup.ps1 -Rom "D:\path\to\your
 - Widescreen (Top screen shape 16:9 or 21:9) widens the 3D scene and keeps
   the top screen's HUD in proportion: each 2D piece along an edge is
   squeezed back toward that edge and the rest, such as markers, around its
-  own middle. Portraits and badge figures stay in place.
+  own middle. Portraits and badge figures stay in place. Checked in battle
+  on foot and in flight, in cutscenes, and in the menus that draw 3D (the
+  title, the temple, the Arms Altar, the Idols viewer).
 - **Sharp HUD** (off by default): small pictures, the HUD's, menus' and
   portraits', remade twice as big by Anime4K inside the game, with no
   separate program, download or cache.
@@ -83,8 +85,6 @@ be played on the top screen alone:
   USA release they were matched by code and not tried in play.
 - Local wireless play reaches the warm-up arena, but the battle does not
   start for the player who joined.
-- Widescreen was checked in battle on foot and in flight and in cutscenes;
-  menus with 3D were not checked.
 - Performance was measured on one PC only (Ryzen 5 5600G, integrated Radeon,
   Windows 10). Reports from other GPUs are welcome; include the `hitch:` and
   `pacing:` lines from `%APPDATA%\zakuro\zakuro.log`.

@@ -283,8 +283,9 @@ seconds; include them in a bug report.
   along an edge is squeezed back toward that edge, and the rest, such as
   markers, around its own middle; portraits and badge figures stay in
   place. A shape changed during play applies to each camera the next time
-  the game asks for its projection. Checked in battle on foot and in flight
-  and in cutscenes; menus with 3D were not checked.
+  the game asks for its projection. Checked in battle on foot and in flight,
+  in cutscenes, and in the menus that draw 3D (the title, the temple, the
+  Arms Altar, the Idols viewer).
 - **Screen filter: FSR (AMD)**, when the window is bigger than the
   resolution the game is drawn at, first smooths each screen's jagged edges
   with SMAA (iryoku/smaa, MIT), then upscales it with AMD FidelityFX Super
