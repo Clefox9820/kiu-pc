@@ -36,8 +36,10 @@ use crate::shader::glsl::{self, SEMANTICS};
 use crate::shader::{Program, ShaderUnit, Vec4, DESCRIPTOR_SIZE, INPUT_REGISTERS, PROGRAM_SIZE};
 use crate::GpuMemory;
 use hasher::{QuickMap, QuickSet};
+use keys::UsedKeys;
 
 mod hasher;
+mod keys;
 
 const SHADE_SPIRV: &[u8] = include_bytes!("../../shaders/shade.vert.spv");
 const VERTEX_SPIRV: &[u8] = include_bytes!("../../shaders/raster.vert.spv");
@@ -1126,66 +1128,6 @@ pub(crate) struct Dynamic {
 
 /// every generic pipeline a draw can need when the blend state is dynamic,
 /// with the vertex stages that draws have.
-/// pipelines noted before the list on disk grows by them.
-const KEYS_WRITTEN_TOGETHER: usize = 16;
-/// a key on disk: the blend register and whether it blends, the logic op
-/// as one more than its number or none, depth, the vertex stage, the write
-/// mask, then the fragment constants, all little endian.
-const KEY_BYTES: usize = 12 + 4 * FRAGMENT_CONSTANTS;
-
-/// where the pipelines a title used are listed, beside its cache.
-fn keys_path(cache: &std::path::Path) -> std::path::PathBuf {
-    cache.with_extension("keys")
-}
-
-/// a key as it is kept, none for a translated program's, whose module is
-/// made anew each run.
-fn key_bytes(key: &PipelineKey) -> Option<[u8; KEY_BYTES]> {
-    let vertex = match key.vertex {
-        VertexStage::Placed => 0,
-        VertexStage::Interpreted => 1,
-        VertexStage::Translated(_) => return None,
-    };
-    let mut bytes = [0; KEY_BYTES];
-    bytes[..4].copy_from_slice(&key.blend.unwrap_or(0).to_le_bytes());
-    bytes[4] = key.blend.is_some() as u8;
-    bytes[5] = key.logic_op.and_then(|op| LogicOp::ALL.iter().position(|&each| each == op)).map_or(0, |index| index as u8 + 1);
-    bytes[6] = key.depth as u8;
-    bytes[7] = vertex;
-    bytes[8..12].copy_from_slice(&key.mask.to_le_bytes());
-    for (at, constant) in bytes[12..].chunks_exact_mut(4).zip(key.fragment) {
-        at.copy_from_slice(&constant.to_le_bytes());
-    }
-    Some(bytes)
-}
-
-fn key_from_bytes(bytes: &[u8]) -> Option<PipelineKey> {
-    let word = |at: usize| u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap());
-    let vertex = match bytes[7] {
-        0 => VertexStage::Placed,
-        1 => VertexStage::Interpreted,
-        _ => return None,
-    };
-    let logic_op = match bytes[5] {
-        0 => None,
-        n => Some(*LogicOp::ALL.get(n as usize - 1)?),
-    };
-    let mut fragment = [0; FRAGMENT_CONSTANTS];
-    for (constant, at) in fragment.iter_mut().zip((12..KEY_BYTES).step_by(4)) {
-        *constant = word(at);
-    }
-    let blend = (bytes[4] != 0).then(|| word(0));
-    Some(PipelineKey { blend, logic_op, mask: word(8), depth: bytes[6] != 0, vertex, fragment })
-}
-
-/// the pipelines a title used before, from the list beside its cache, each
-/// once, none when there is no list or it is unreadable.
-fn read_keys(cache: &std::path::Path) -> Vec<PipelineKey> {
-    let bytes = std::fs::read(keys_path(cache)).unwrap_or_default();
-    let mut seen = std::collections::HashSet::new();
-    bytes.chunks_exact(KEY_BYTES).filter_map(key_from_bytes).filter(|key| seen.insert(*key)).collect()
-}
-
 fn generic_keys(shades: bool) -> Vec<PipelineKey> {
     let vertices: &[VertexStage] = if shades { &[VertexStage::Interpreted, VertexStage::Placed] } else { &[VertexStage::Placed] };
     let mut keys = Vec::new();
@@ -1297,6 +1239,21 @@ struct Queue {
     /// that was, which a thread with nothing else to do sees to.
     compiled: usize,
     saved: std::time::Instant,
+}
+
+/// sends the compiler the pipelines a title used before, with their vertex
+/// shaders' modules, so that one first seen in an earlier run is ready
+/// before it is drawn again, until it gives one back, having no threads.
+fn prewarm(compiler: &mut Compiler, jobs: Vec<(PipelineKey, vk::ShaderModule)>) {
+    for (key, module) in jobs {
+        if compiler.asked.contains(&key) {
+            continue;
+        }
+        if compiler.send(Job::Compile(key, module)).is_some() {
+            break;
+        }
+        compiler.asked.insert(key);
+    }
 }
 
 /// threads translating programs and compiling pipelines, which takes the
@@ -1801,10 +1758,8 @@ pub struct Hardware {
     /// the file they are kept in, none for nowhere.
     kept_pipelines: Option<Arc<std::path::Path>>,
     /// the keys of the pipelines the title used, kept beside them so the
-    /// next run makes them all while it starts rather than as it plays,
-    /// and those not written there yet.
-    known_keys: std::collections::HashSet<PipelineKey>,
-    new_keys: Vec<PipelineKey>,
+    /// next run makes them all while it starts rather than as it plays.
+    used_keys: UsedKeys,
     /// how many times the host waited for work done, for the tests to tell
     /// what waits without timing it.
     #[cfg(test)]
@@ -2080,8 +2035,7 @@ impl Hardware {
                 draws: 0,
                 pipeline_cache,
                 kept_pipelines,
-                known_keys: std::collections::HashSet::new(),
-                new_keys: Vec::new(),
+                used_keys: UsedKeys::default(),
                 #[cfg(test)]
                 waited_done: 0,
                 #[cfg(test)]
@@ -2128,18 +2082,14 @@ impl Hardware {
             }
             // then every pipeline the title used before, so that one first
             // seen in an earlier run is ready before it is drawn again
-            let used = hardware.kept_pipelines.as_deref().map(read_keys).unwrap_or_default();
+            let (used_keys, used) = UsedKeys::read(hardware.kept_pipelines.as_deref());
+            hardware.used_keys = used_keys;
             if !hardware.waits && !used.is_empty() {
                 log::info!(target: "zakuro_gpu::pipelines", "making the {} pipelines the title used before", used.len());
             }
-            for key in used {
-                if hardware.waits || !hardware.known_keys.insert(key) || !hardware.compiler.asked.insert(key) {
-                    continue;
-                }
-                let module = hardware.vertex_module(key.vertex);
-                if hardware.compiler.send(Job::Compile(key, module)).is_some() {
-                    break;
-                }
+            if !hardware.waits {
+                let jobs = used.into_iter().map(|key| (key, hardware.vertex_module(key.vertex))).collect();
+                prewarm(&mut hardware.compiler, jobs);
             }
             Ok(hardware)
         }
@@ -3853,32 +3803,14 @@ impl Hardware {
         Ok(pipeline)
     }
 
-    /// notes a pipeline the title used for the list kept beside the cache,
-    /// writing the list out now and then, a few at a time.
+    /// notes a pipeline the title used for the list kept beside the cache.
     fn remember(&mut self, key: PipelineKey) {
-        if key_bytes(&key).is_none() || !self.known_keys.insert(key) {
-            return;
-        }
-        self.new_keys.push(key);
-        if self.new_keys.len() >= KEYS_WRITTEN_TOGETHER {
-            self.write_keys();
-        }
+        self.used_keys.remember(key);
     }
 
     /// adds the pipelines noted since last time to the list on disk.
     fn write_keys(&mut self) {
-        let Some(path) = self.kept_pipelines.as_deref().map(keys_path) else { return };
-        if self.new_keys.is_empty() {
-            return;
-        }
-        let bytes: Vec<u8> = self.new_keys.drain(..).filter_map(|key| key_bytes(&key)).flatten().collect();
-        let written = std::fs::OpenOptions::new().create(true).append(true).open(&path).and_then(|mut file| {
-            use std::io::Write;
-            file.write_all(&bytes)
-        });
-        if let Err(error) = written {
-            log::warn!("could not keep the pipelines used in {}, {error}", path.display());
-        }
+        self.used_keys.write();
     }
 
     /// the pipeline for a key when the cache on disk has it, made without
@@ -6875,32 +6807,51 @@ fn pick(instance: &ash::Instance) -> Result<(vk::PhysicalDevice, u32), String> {
 
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn the_pipelines_used_are_kept_and_read_back_as_they_were() {
-        let mut fragment = [0; super::FRAGMENT_CONSTANTS];
-        fragment[3] = 0xDEAD_BEEF;
-        fragment[29] = 7;
-        let keys = [
-            super::PipelineKey { blend: Some(0x0123_4567), logic_op: None, mask: 0xF, depth: true, vertex: super::VertexStage::Placed, fragment },
-            super::PipelineKey {
-                blend: None,
-                logic_op: Some(crate::blend::LogicOp::Xor),
-                mask: 0x7,
-                depth: false,
-                vertex: super::VertexStage::Interpreted,
-                fragment,
-            },
-        ];
-        let dir = std::env::temp_dir().join(format!("zakuro keys {}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let cache = dir.join("title.bin");
-        let bytes: Vec<u8> = keys.iter().chain(&keys).filter_map(super::key_bytes).flatten().collect();
-        std::fs::write(super::keys_path(&cache), bytes).unwrap();
-        assert_eq!(super::read_keys(&cache), keys, "each once, as written");
-        let _ = std::fs::remove_dir_all(&dir);
+    use super::*;
+
+    /// a compiler with no threads, which gives every job back.
+    fn idle_compiler() -> Compiler {
+        let waiting = Queue {
+            translations: VecDeque::new(),
+            generic: VecDeque::new(),
+            compiles: Vec::new(),
+            stopped: false,
+            compiled: 0,
+            saved: std::time::Instant::now(),
+        };
+        Compiler { queue: Arc::new((Mutex::new(waiting), Condvar::new())), made: mpsc::channel().1, outstanding: 0, asked: QuickSet::default(), threads: Vec::new() }
     }
 
-    use super::*;
+    fn plain_key() -> PipelineKey {
+        PipelineKey { blend: None, logic_op: None, mask: 0xF, depth: true, vertex: VertexStage::Placed, fragment: [0; FRAGMENT_CONSTANTS] }
+    }
+
+    /// a pipeline the compiler gives back at the start, having no threads,
+    /// is not taken for one asked for, so the draw that needs it makes it.
+    #[test]
+    fn a_pipeline_given_back_at_the_start_is_made_when_drawn() {
+        let mut compiler = idle_compiler();
+        prewarm(&mut compiler, vec![(plain_key(), vk::ShaderModule::null())]);
+        assert!(!compiler.asked.contains(&plain_key()));
+    }
+
+    /// a pipeline on the list a title used before is not listed again when
+    /// it is used again, whether the list was made at the start or not.
+    #[test]
+    fn a_pipeline_used_before_is_not_listed_again() {
+        let Ok(device) = own_device() else { return };
+        let dir = std::env::temp_dir().join(format!("zakuro listed {}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cache = dir.join("title.bin");
+        std::fs::write(keys::keys_path(&cache), keys::key_bytes(&plain_key()).unwrap()).unwrap();
+        let mut hardware = Hardware::with_device(Arc::new(device), true, Some(cache.clone())).unwrap();
+        hardware.remember(plain_key());
+        hardware.write_keys();
+        drop(hardware);
+        let listed = std::fs::read(keys::keys_path(&cache)).unwrap().len() / keys::KEY_BYTES;
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(listed, 1, "listed once");
+    }
 
     /// stale spans stay in order and apart, join where they meet or
     /// overlap, leave the bytes between them to be told apart, and no more
