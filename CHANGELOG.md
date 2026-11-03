@@ -37,6 +37,10 @@
   menu; turning off "Take the mouse back" had no effect after switching
   windows; the "Loading the game into memory" notice could stay up for good
   when reading the game stopped short.
+- A saved state from another Zakuro version loads only when that version is
+  known to save states the same way (0.2.29 for this 0.2.31); any other is
+  turned down, naming its version, instead of possibly loading into the
+  wrong place.
 
 ## v0.1.0 — first release
 

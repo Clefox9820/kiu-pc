@@ -271,18 +271,32 @@ impl<'a> Reader<'a> {
     }
 }
 
+/// the versions of Zakuro, besides this one, known to save a state field for
+/// field as this one does. 0.2.29 is the version before this 0.2.31 here,
+/// and every type a state saves is the same in both, past fields neither
+/// saves.
+///
+/// when the version changes and what a state saves does not, the version it
+/// had goes on this list. when what a state saves changes, the list is
+/// emptied, since no earlier version saves the same any more.
+const COMPATIBLE_VERSIONS: &[&str] = &["0.2.29"];
+
 /// reads what a state saves, `bytes`, which Zakuro `version` wrote.
 ///
-/// a state of this version is read as it is. another version's is taken
-/// when it reads to the last byte as this one's does, and turned down
-/// otherwise. reading to the last byte does not prove the layout is the
-/// same: two versions whose fields moved or changed meaning, with the same
-/// lengths, read without an error into the wrong fields.
-// a list of the versions known to save the same layout would be stricter,
-// and would turn down states this takes now.
+/// a state of this version is read as it is. a state of a version on
+/// `COMPATIBLE_VERSIONS` is taken when it reads to the last byte as this
+/// one's does. any other is turned down: reading to the last byte does not
+/// prove the layout is the same, since two versions whose fields moved or
+/// changed meaning, with the same lengths, read without an error into the
+/// wrong fields.
 fn read_saved(version: &str, bytes: &[u8]) -> Result<Saved, String> {
     if version == VERSION {
         return postcard::from_bytes(bytes).map_err(|error| format!("the state could not be read, {error}"));
+    }
+    if !COMPATIBLE_VERSIONS.contains(&version) {
+        return Err(format!(
+            "it was saved by Zakuro {version}, whose states this {VERSION} cannot read; save a new one"
+        ));
     }
     match postcard::take_from_bytes::<Saved>(bytes) {
         Ok((saved, [])) => {
@@ -355,17 +369,19 @@ mod tests {
         assert_eq!(byte, [1]);
     }
 
-    /// a state another Zakuro saved is taken when what it saves reads to
-    /// the last byte as this one's does, and turned down, changing nothing,
-    /// when it does not.
+    /// a state is taken from this version, and from a version known to save
+    /// the same, when what it saves reads to the last byte. a state from any
+    /// other version is turned down, naming that version, and so is one
+    /// that does not read to the last byte. nothing changes when it is
+    /// turned down.
     #[test]
-    fn a_state_of_another_version_is_taken_when_it_reads_the_same() {
+    fn a_state_of_another_version_is_taken_when_its_version_saves_the_same() {
         let (mut system, _) = system_with_thread();
         system.cpu.regs[3] = 7;
         let state = system.save_state().unwrap();
-        // the same state as another version labels it, with what it saves
-        // one byte longer when extra
-        let relabel = |extra: bool| {
+        // the same state as `version` labels it, with what it saves one byte
+        // longer when extra
+        let relabel = |version: &str, extra: bool| {
             let mut reader = super::Reader(&state);
             reader.take(super::MAGIC.len()).unwrap();
             let length = reader.u32().unwrap() as usize;
@@ -376,20 +392,27 @@ mod tests {
                 saved.push(0);
             }
             let mut out = super::MAGIC.to_vec();
-            out.extend_from_slice(&5u32.to_le_bytes());
-            out.extend_from_slice(b"0.0.1");
+            out.extend_from_slice(&(version.len() as u32).to_le_bytes());
+            out.extend_from_slice(version.as_bytes());
             out.extend_from_slice(&program_id.to_le_bytes());
             super::section(&mut out, &saved);
             out.extend_from_slice(reader.0);
             out
         };
-        system.cpu.regs[3] = 9;
-        system.load_state(&relabel(false)).unwrap();
-        assert_eq!(system.cpu.regs[3], 7);
-        system.cpu.regs[3] = 9;
-        let error = system.load_state(&relabel(true)).unwrap_err();
-        assert!(error.contains("saved by Zakuro 0.0.1"), "{error}");
-        assert_eq!(system.cpu.regs[3], 9, "nothing changes");
+        // the maintainer's states from 0.2.29 keep loading in this version
+        for version in [super::VERSION, "0.2.29"] {
+            system.cpu.regs[3] = 9;
+            system.load_state(&relabel(version, false)).unwrap();
+            assert_eq!(system.cpu.regs[3], 7, "{version}");
+        }
+        for (version, extra) in [("0.0.1", false), ("0.2.29", true)] {
+            system.cpu.regs[3] = 9;
+            let error = system.load_state(&relabel(version, extra)).unwrap_err();
+            assert!(error.contains(&format!("saved by Zakuro {version}")), "{error}");
+            assert_eq!(system.cpu.regs[3], 9, "nothing changes");
+        }
+        let error = system.load_state(&relabel("0.0.1", false)).unwrap_err();
+        assert!(error.contains("save a new one"), "{error}");
     }
 
     /// a state of another game, or not a state at all, is turned down and
