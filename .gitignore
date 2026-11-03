@@ -1,7 +1,9 @@
 # Nothing from the game ever goes in this repository: not the ROM, not the
 # code 3dsrecomp translates from it, not what that compiles into.
 
-# game dumps
+# game dumps, and audio or icons taken from them
+*.wav
+*.ico
 *.3ds
 *.cci
 *.cia
@@ -25,6 +27,7 @@ code/
 *.so
 *.exe
 *.pdb
+*.res
 
 # what a run of the game leaves behind
 *.hints
@@ -44,3 +47,5 @@ target/
 # personal tooling
 /.engram/
 /.atl/
+/odd/
+/.claude/settings.local.json
