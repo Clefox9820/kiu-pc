@@ -236,7 +236,7 @@ impl Memory {
     /// the mailbox word at addr, when it is one.
     fn mailbox_word(addr: VAddr) -> Option<usize> {
         let index = addr.wrapping_sub(HOST_MAILBOX_VADDR) as usize / 4;
-        (addr >= HOST_MAILBOX_VADDR && addr % 4 == 0 && index < HOST_MAILBOX_WORDS).then_some(index)
+        (addr >= HOST_MAILBOX_VADDR && addr.is_multiple_of(4) && index < HOST_MAILBOX_WORDS).then_some(index)
     }
 
     /// watches the physical pages under a range for writes from now on,
@@ -986,7 +986,7 @@ mod tests {
         let mut memory = Memory::new(false, 0);
         memory.host_mailbox = [1, 2, 3, 4, 5];
         assert_eq!(memory.read32(HOST_MAILBOX_VADDR + 4), 2);
-        assert_eq!(memory.read32(HOST_MAILBOX_VADDR + 0x10), 5, "the fifth word, the top screen's widening");
+        assert_eq!(memory.read32(HOST_MAILBOX_VADDR + 0x10), 5, "the fifth word, the last one");
         memory.write32(HOST_MAILBOX_VADDR + 8, 0);
         assert_eq!(memory.host_mailbox, [1, 2, 0, 4, 5]);
         assert!(memory.fault_summary().is_empty(), "the mailbox is no fault");

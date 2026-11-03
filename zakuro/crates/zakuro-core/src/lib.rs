@@ -16,6 +16,7 @@ pub mod replay;
 pub mod room;
 pub mod recompiled;
 pub mod services;
+mod slow;
 pub mod state;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -454,26 +455,7 @@ impl System {
 
         self.note(pc);
 
-        let recompiled = {
-            let _timer = zakuro_gpu::stats::time(&zakuro_gpu::stats::RECOMPILED);
-            let started = std::time::Instant::now();
-            let (instructions, cycles) = (self.recompiled_instructions, self.cpu.cycles);
-            let ran = self.run_recompiled(deadline);
-            // one call that long is a frame the player feels, and where
-            let took = started.elapsed().as_secs_f64() * 1000.0;
-            if took >= 20.0 {
-                let thread = self.kernel.current().map_or_else(String::new, |t| format!("{} (priority {}, core {})", t.name, t.priority, t.processor_id));
-                let (instructions, cycles) = (self.recompiled_instructions - instructions, self.cpu.cycles - cycles);
-                log::warn!(
-                    target: "zakuro_core::slow",
-                    "recompiled code from {pc:08X} ran {took:.0} ms, to {:08X}, on {thread}, {instructions} instructions, {cycles} cycles, {:.0} MIPS",
-                    self.cpu.regs[15],
-                    instructions as f64 / took / 1000.0
-                );
-            }
-            ran
-        };
-        let exit = match recompiled {
+        let exit = match self.run_recompiled_timed(pc, deadline) {
             Some(exit) => {
                 self.ran_recompiled();
                 exit
@@ -505,16 +487,7 @@ impl System {
         }
         match exit {
             None => {}
-            Some(Exit::Supervisor(number)) => {
-                let _timer = zakuro_gpu::stats::time(&zakuro_gpu::stats::SERVICES);
-                let started = std::time::Instant::now();
-                kernel::svc::dispatch(self, number);
-                // a service request names itself when slow, see services
-                let took = started.elapsed();
-                if number != 0x32 && took.as_millis() >= 20 {
-                    log::warn!("slow syscall 0x{number:02X} took {:.0} ms", took.as_secs_f64() * 1000.0);
-                }
-            }
+            Some(Exit::Supervisor(number)) => self.dispatch_svc_timed(number),
             Some(Exit::Undefined { pc, opcode }) => {
                 let count = self.undefined_seen.entry(pc).or_insert(0);
                 *count += 1;

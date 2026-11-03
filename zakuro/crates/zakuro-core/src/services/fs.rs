@@ -217,7 +217,7 @@ pub struct FsState {
     pub busy_until: [u64; 2],
     /// the file of the game's RomFS each of its folders last had read, by
     /// folder: which level or scene a game loads shows in what it reads.
-    // ponytail: not in saved states, a loaded state knows it again at the next read
+    // not kept in saved states: a loaded state knows it again at the next read.
     #[serde(skip)]
     pub last_read: HashMap<String, String>,
 }
@@ -1111,8 +1111,8 @@ fn open_ncch_kind(system: &mut System, kind: u32) -> Option<u32> {
         SELF_NCCH_ROMFS | SELF_NCCH_UPDATE_ROMFS => {
             let update = title.update().filter(|_| kind == SELF_NCCH_UPDATE_ROMFS);
             let (backing, path) = match update {
-                Some(update) => (romfs_backing(&update.title)?, "patch:/"),
-                None => (romfs_backing(title)?, "romfs:/"),
+                Some(update) => (romfs_backing(&update.title)?, super::fs_reads::PATCH),
+                None => (romfs_backing(title)?, super::fs_reads::ROMFS),
             };
             log::debug!("fs: opened {path}, {} MiB", backing.size() / (1024 * 1024));
             Some(system.services.fs.add_file(OpenFile { path: path.into(), backing }))
@@ -1207,7 +1207,7 @@ fn read_file(system: &mut System, file_id: u32, offset: u64, size: u32, dest: u3
             let data = slice.to_vec();
             system.write_from_service(dest, &data);
             if count > 0 {
-                note_romfs_read(system, &file.path, offset);
+                super::fs_reads::note_romfs_read(system, &file.path, offset);
             }
             count as u32
         }
@@ -1233,30 +1233,6 @@ fn read_file(system: &mut System, file_id: u32, offset: u64, size: u32, dest: u3
             count as u32
         }
     }
-}
-
-/// keeps which file of the game's own RomFS a read was in, by its folder.
-// ponytail: a RomFS with mods over it is read through its layers and not followed
-fn note_romfs_read(system: &mut System, path: &str, offset: u64) {
-    let Some(title) = system.title.as_ref() else { return };
-    let title = match path {
-        "romfs:/" => title,
-        "patch:/" => match title.update() {
-            Some(update) => &update.title,
-            None => return,
-        },
-        _ => return,
-    };
-    let Some(file) = title.romfs.as_ref().and_then(|romfs| romfs.path_at(romfs.base + offset)) else {
-        return;
-    };
-    let (folder, name) = file.rsplit_once('/').unwrap_or(("", file));
-    let last_read = &mut system.services.fs.last_read;
-    if last_read.get(folder).is_some_and(|last| last == name) {
-        return;
-    }
-    log::debug!("fs: reads {file}");
-    last_read.insert(folder.to_owned(), name.to_owned());
 }
 
 fn decode_path(system: &mut System, path_type: u32, path_size: u32, path_ptr: u32) -> String {
@@ -1285,34 +1261,3 @@ fn decode_path(system: &mut System, path_type: u32, path_size: u32, path_ptr: u3
 /// kept so the descriptor helper stays in scope for the mapped-buffer replies
 /// above, which build their descriptors by hand.
 pub const _MAPPED_BUFFER_RW: u32 = Descriptor::static_buffer(0, 0);
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use zakuro_fs::testing::{ncch, write};
-
-    #[test]
-    fn a_read_of_the_romfs_is_kept_by_its_folder() {
-        let game = write("fs-last-read", "game.cxi", &ncch(0x0004_0000_0FF3_DE02, Some(&[0; 8]), &[
-            ("us/stage/a0100.zrc", &[1; 64]),
-            ("us/stage/b0100.zrc", &[2; 64]),
-            ("us/voice/v.bin", &[3; 64]),
-        ]));
-        let mut system = crate::loader::load(&game, crate::Config::default()).unwrap();
-        let at = |system: &System, path: &str| {
-            let romfs = system.title.as_ref().unwrap().romfs.as_ref().unwrap();
-            romfs.file_data_offset(&romfs.lookup(path).unwrap()) - romfs.base
-        };
-        for path in ["us/stage/a0100.zrc", "us/voice/v.bin", "us/stage/b0100.zrc"] {
-            let offset = at(&system, path);
-            note_romfs_read(&mut system, "romfs:/", offset + 10);
-        }
-        let last_read = &system.services.fs.last_read;
-        assert_eq!(last_read.get("us/stage").map(String::as_str), Some("b0100.zrc"));
-        assert_eq!(last_read.get("us/voice").map(String::as_str), Some("v.bin"));
-        // a file that is not the RomFS is not looked into
-        let offset = at(&system, "us/stage/a0100.zrc");
-        note_romfs_read(&mut system, "sdmc:/save.bin", offset);
-        assert_eq!(system.services.fs.last_read.get("us/stage").map(String::as_str), Some("b0100.zrc"));
-    }
-}

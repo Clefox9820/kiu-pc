@@ -533,50 +533,6 @@ fn convert_strips<const BYTES: usize>(
     }
 }
 
-/// smooths where a compressed video's 8 by 8 blocks meet, across and down
-/// a plane of samples width to a row: a seam whose sides are both flat and
-/// whose step is small is a block's edge, not the picture's, and becomes a
-/// ramp over the four samples on each side, half a block; any other is
-/// left alone.
-// ponytail: one fixed strength, where a decoder's loop filter would follow
-// the stream's quantiser, which Y2R does not see
-fn deblock(plane: &mut [u8], width: usize, lines: usize) {
-    const BLOCK: usize = 8;
-    /// the most a block's edge steps by, and the most its sides vary from
-    /// one sample to the next
-    const STEP: i32 = 32;
-    const FLAT: i32 = 10;
-    /// the samples a seam's ramp runs over, half a block on each side
-    const SPAN: usize = BLOCK;
-    fn seam(plane: &mut [u8], at: [usize; SPAN]) {
-        let v = at.map(|i| plane[i] as i32);
-        let half = SPAN / 2;
-        let flat = v[..half].windows(2).chain(v[half..].windows(2)).all(|pair| (pair[0] - pair[1]).abs() < FLAT);
-        if !flat || (v[half - 1] - v[half]).abs() >= STEP {
-            return;
-        }
-        let last = (SPAN - 1) as i32;
-        for (k, &i) in at.iter().enumerate().take(SPAN - 1).skip(1) {
-            let k = k as i32;
-            plane[i] = ((v[0] * (last - k) + v[SPAN - 1] * k + last / 2) / last) as u8;
-        }
-    }
-    if plane.len() < width * lines {
-        return;
-    }
-    let offsets = |step: usize| std::array::from_fn::<isize, SPAN, _>(|k| (k as isize - (SPAN / 2) as isize) * step as isize);
-    for row in (0..lines).map(|y| y * width) {
-        for x in (BLOCK..width.saturating_sub(SPAN / 2 - 1)).step_by(BLOCK) {
-            seam(plane, offsets(1).map(|d| (row + x).wrapping_add_signed(d)));
-        }
-    }
-    for y in (BLOCK..lines.saturating_sub(SPAN / 2 - 1)).step_by(BLOCK) {
-        for x in 0..width {
-            seam(plane, offsets(width).map(|d| (y * width + x).wrapping_add_signed(d)));
-        }
-    }
-}
-
 /// runs the conversion the title set up.
 fn convert(system: &mut System) {
     let state = &system.services.y2r;
@@ -618,10 +574,7 @@ fn convert(system: &mut System) {
     // a video's frame, its compression's blocks smoothed out where they meet,
     // its colour planes at half the width, and half the lines in 4:2:0
     if let Layout::Planar { lines_per_chroma } = layout {
-        let Scratch { planes: [luma, chroma_u, chroma_v], .. } = &mut scratch;
-        deblock(luma, width, lines);
-        deblock(chroma_u, width / 2, lines / lines_per_chroma);
-        deblock(chroma_v, width / 2, lines / lines_per_chroma);
+        super::y2r_deblock::deblock_planes(&mut scratch.planes, width, lines, lines_per_chroma);
     }
     let bytes = match output_format {
         // 32 bit with alpha first in memory and then blue, green and red, 24
@@ -735,9 +688,9 @@ mod tests {
                 _ => None,
             };
             if let Some(chroma_lines) = chroma_lines {
-                crate::services::y2r::deblock(&mut luma, width, lines);
-                crate::services::y2r::deblock(&mut chroma_u, width / 2, chroma_lines);
-                crate::services::y2r::deblock(&mut chroma_v, width / 2, chroma_lines);
+                crate::services::y2r_deblock::deblock(&mut luma, width, lines);
+                crate::services::y2r_deblock::deblock(&mut chroma_u, width / 2, chroma_lines);
+                crate::services::y2r_deblock::deblock(&mut chroma_v, width / 2, chroma_lines);
             }
             let yuv = |x: usize, y: usize| -> (i32, i32, i32) {
                 match format {
@@ -798,44 +751,6 @@ mod tests {
         let terms = Terms::new(c);
         let luma = terms.luma(y);
         terms.chroma(u, v).map(|term| channel(luma + term) as u8)
-    }
-
-    /// a compressed video's blocks: a step where two flat 8 by 8 blocks
-    /// meet is smoothed into a ramp, across the plane and down it; a real
-    /// edge, a step that is not at a block's side and a textured side stay
-    /// as they are.
-    #[test]
-    fn video_blocks_are_smoothed_where_they_meet() {
-        let plane = |left: u8, right: u8| -> Vec<u8> { (0..16).map(|x| if x < 8 { left } else { right }).collect::<Vec<u8>>().repeat(8) };
-        let mut flat = plane(100, 112);
-        deblock(&mut flat, 16, 8);
-        let line = flat[..16].to_vec();
-        assert!(line.windows(2).all(|w| w[0] <= w[1]), "a ramp, {line:?}");
-        assert!(line[8] - line[7] < 6, "no step left at the seam, {line:?}");
-        assert!(flat.chunks(16).all(|row| row == line), "every row alike");
-        // a bigger step between flat blocks, as a dark scene's are, goes too,
-        // over a wider ramp
-        let mut bigger = plane(100, 128);
-        deblock(&mut bigger, 16, 8);
-        let line = bigger[..16].to_vec();
-        assert!(line.windows(2).all(|w| w[0] <= w[1]) && line[8] - line[7] < 6, "a bigger step smoothed, {line:?}");
-        assert!(line[5] > 100 && line[10] < 128, "over four samples on each side, {line:?}");
-        let mut edge = plane(20, 200);
-        deblock(&mut edge, 16, 8);
-        assert_eq!(edge, plane(20, 200), "a real edge stays");
-        let mut off: Vec<u8> = (0..16).map(|x| if x < 5 { 100 } else { 112 }).collect::<Vec<u8>>().repeat(8);
-        let before = off.clone();
-        deblock(&mut off, 16, 8);
-        assert_eq!(off, before, "a step off the block's side stays");
-        let mut textured: Vec<u8> = (0..16).map(|x| if x % 2 == 0 { 90 } else { 120 }).collect::<Vec<u8>>().repeat(8);
-        let before = textured.clone();
-        deblock(&mut textured, 16, 8);
-        assert_eq!(textured, before, "texture stays");
-        // where a row of blocks meets the one below
-        let mut tall: Vec<u8> = (0..16).flat_map(|y| [if y < 8 { 100u8 } else { 112 }; 8]).collect();
-        deblock(&mut tall, 8, 16);
-        let column: Vec<u8> = (0..16).map(|y| tall[y * 8]).collect();
-        assert!(column.windows(2).all(|w| w[0] <= w[1]) && column[8] - column[7] < 6, "no step down the seam, {column:?}");
     }
 
     /// black, white and grey come out the way BT.601 says, full range.

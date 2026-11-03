@@ -1013,6 +1013,13 @@ const SYSTEM_TICK_COST: u64 = 150;
 /// process has run, which here started at tick 0; type 1 is the object's
 /// reference count. Kid Icarus: Uprising asks for type 0 over and over while
 /// it joins a local wireless room, and waits forever on an error.
+///
+/// the handle in r1 is not looked at: the only caller seen asks about its
+/// own process, whose ticks are the CPU's, and every object here answers a
+/// reference count of 1. a handle that names nothing, or another process,
+/// still gets success, and so does an unknown type, with 0.
+// the console answers an invalid handle and an unknown type with an error;
+// checking them waits for a title that needs it.
 fn get_handle_info(system: &mut System) {
     let kind = system.cpu.regs[2];
     let value: u64 = match kind {
