@@ -1014,20 +1014,34 @@ const SYSTEM_TICK_COST: u64 = 150;
 /// reference count. Kid Icarus: Uprising asks for type 0 over and over while
 /// it joins a local wireless room, and waits forever on an error.
 ///
-/// the handle in r1 is not looked at: the only caller seen asks about its
-/// own process, whose ticks are the CPU's, and every object here answers a
-/// reference count of 1. a handle that names nothing, or another process,
-/// still gets success, and so does an unknown type, with 0.
-// the console answers an invalid handle and an unknown type with an error;
-// checking them waits for a title that needs it.
+/// the handle must name the process, by its pseudo-handle or by a handle of
+/// its own: there is only the one process here, whose ticks are the CPU's,
+/// and every object here answers a reference count of 1. any other handle
+/// is an invalid handle and any other type an invalid enum value, as on the
+/// console.
 fn get_handle_info(system: &mut System) {
+    let handle = system.cpu.regs[1];
     let kind = system.cpu.regs[2];
+    // the pseudo-handle is not resolved, so asking does not make the
+    // kernel's process object before something else does
+    let process = handle == CURRENT_PROCESS
+        || system
+            .kernel
+            .handles
+            .resolve(handle)
+            .is_some_and(|object| matches!(system.kernel.objects.get(object), Some(KObject::Process)));
+    if !process {
+        log::debug!("svcGetHandleInfo type {kind} on handle 0x{handle:X}, which is not a process");
+        system.cpu.regs[0] = errors::INVALID_HANDLE.0;
+        return;
+    }
     let value: u64 = match kind {
         0 => system.cpu.cycles,
         1 => 1,
         _ => {
-            log::debug!("svcGetHandleInfo type {kind} is not implemented");
-            0
+            log::debug!("svcGetHandleInfo type {kind} on handle 0x{handle:X} is not a type there is");
+            system.cpu.regs[0] = errors::INVALID_ENUM_VALUE.0;
+            return;
         }
     };
     system.cpu.regs[0] = 0;
@@ -1244,6 +1258,47 @@ mod tests {
         assert_eq!(system.cpu.regs[0], 0);
         assert_eq!(system.cpu.regs[1] as u64 | (system.cpu.regs[2] as u64) << 32, 123_456_789_012);
         assert!(!system.unimplemented_svcs.contains(&0x29));
+    }
+
+    /// svcGetHandleInfo, r1 = handle, r2 = type, giving back r0 and the
+    /// value in r1 and r2.
+    fn handle_info(system: &mut System, handle: u32, kind: u32) -> (u32, u64) {
+        system.cpu.regs[1] = handle;
+        system.cpu.regs[2] = kind;
+        dispatch(system, 0x29);
+        (system.cpu.regs[0], system.cpu.regs[1] as u64 | (system.cpu.regs[2] as u64) << 32)
+    }
+
+    /// the process, by its pseudo-handle or a handle of its own, answers
+    /// type 0 with its ticks and type 1 with its reference count.
+    #[test]
+    fn the_process_answers_both_types_of_handle_info() {
+        let mut system = System::new(crate::Config::default());
+        system.cpu.cycles = 42;
+        let object = system.kernel.process_object();
+        let own = system.kernel.handles.create(&mut system.kernel.objects, object, "Process");
+        for handle in [CURRENT_PROCESS, own] {
+            assert_eq!(handle_info(&mut system, handle, 0), (0, 42));
+            assert_eq!(handle_info(&mut system, handle, 1), (0, 1));
+        }
+    }
+
+    /// a handle that names nothing, or something other than a process, is
+    /// an invalid handle, as on the console.
+    #[test]
+    fn handle_info_turns_down_a_handle_that_is_not_a_process() {
+        let mut system = System::new(crate::Config::default());
+        let (_, event) = system.kernel.create_event(super::super::sync::ResetType::OneShot, "event");
+        for handle in [0x1234, event, CURRENT_THREAD] {
+            assert_eq!(handle_info(&mut system, handle, 0).0, errors::INVALID_HANDLE.0, "0x{handle:X}");
+        }
+    }
+
+    /// a type the kernel does not have is an invalid enum value.
+    #[test]
+    fn handle_info_turns_down_an_unknown_type() {
+        let mut system = System::new(crate::Config::default());
+        assert_eq!(handle_info(&mut system, CURRENT_PROCESS, 7).0, errors::INVALID_ENUM_VALUE.0);
     }
 
     /// svcControlMemory with an operation, giving back r0 and r1.
