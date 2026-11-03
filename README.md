@@ -125,8 +125,8 @@ delete those too if you do not want to keep your saves.
 ## Controls
 
 Defaults are laid out for this game. They can be changed in
-**Settings > Controls** (Esc, **Options**, **All settings** while playing).
-The mouse aim speeds are in **Options**.
+**Settings > Controls** (Esc, **Options** while playing), next to the mouse
+aim speeds.
 
 | Input | 3DS / action |
 | --- | --- |
@@ -152,14 +152,15 @@ The mouse aim speeds are in **Options**.
 | F1 | Pause |
 | Tab | Fast forward |
 
-**Esc > Options** gathers what makes the game nicer to play, in the game's
-own menu style: resolution, smoother motion, screens, filter, sound, the
-mouse aim speeds, inverting the vertical aim, pausing while another window
-is in front, taking the mouse aim back when you return to the window, the
-game's language, and a Discord status (off by default) that shows whether
-you are in the menus, on foot or flying, the story's chapter you are
-playing, and for how long, when the Discord app is open on the same
-computer. Everything else is under **All settings**.
+**Esc > Options** opens Zakuro's settings, drawn in the game's own menu
+style. Besides resolution, smoother motion, screens, filter, sound and the
+game's language, they hold what this port adds: under **Controls**, the
+mouse aim speeds and inverting the vertical aim; under **Interface**,
+pausing while another window is in front, taking the mouse aim back when
+you return to the window, a Fullscreen button, and a Discord status (off by
+default) that shows whether you are in the menus, on foot or flying, the
+story's chapter you are playing, and for how long, when the Discord app is
+open on the same computer.
 
 Mouse aim also switches by itself: on foot, flying, or off in menus; 1, 2
 or 3 picks one until the game changes mode. A short notice is shown when

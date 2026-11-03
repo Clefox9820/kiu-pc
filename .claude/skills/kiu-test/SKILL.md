@@ -29,6 +29,8 @@ Load before claiming a change works, after any edit under `zakuro/`, and for any
 - `pacing:` counts are meaningless while the maintainer plays or builds; compare per-frame work with `RUST_LOG=info,cranelift_jit=warn,zakuro::frames=debug` (took, drawing, waiting) and interleaved runs.
 - `ZAKURO_SHOT` saves the screens before the presenter, so it never shows a screen filter (FSR, Sharp); check those with `scripts\drive-window.ps1` `shot:` on a window bigger than the resolution (for example `resolution = 1`, `scale = 2`).
 - `ZAKURO_SHOT` PNGs carry alpha 0 in places: cropping them with System.Drawing needs `CompositingMode = SourceCopy`, or the crop comes out blank.
+- In egui tests, `prev_pass.widgets` lists each `add_sized` button twice with the same rect: dedupe rects and filter by height before simulating a click.
+- `ZAKURO_SHOT` captures come before the screen filter, so FSR and Anime4K never show in them; a window shot needs the window uncovered and inside the screen's working area, which a scale above the screen does not fit.
 - Compare sound between builds with `ZAKURO_WAV=<file.wav>` (`ZAKURO_WAV_FROM`, `ZAKURO_WAV_SECONDS`) from the same save state with no input; `build\port-usa` builds straight from this repo's `zakuro/`, so it is the port to switch between code versions, then rebuild it on the branch.
 - To see whether a texture replacement is used at all, make it fully transparent in a throwaway build: if the picture still shows, the draw never takes it.
 - Behaviour changes need a test that fails before the fix (RED) and passes after (GREEN) when a deterministic test is possible.

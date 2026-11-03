@@ -14,7 +14,8 @@ Load when pulling newer Zakuro into `zakuro/`, resolving conflicts with upstream
 ## Hard Rules
 
 - `zakuro/` is a `git subtree --squash` of https://github.com/fearkov/zakuro (MIT); keep `zakuro/LICENSE` and credit.
-- The squash commit holds upstream's whole tree, `docs/screenshots/*.png` (game captures) included, even when the merge drops them: check `git ls-tree -r <squash>` before pushing, since CI only checks the checked-out tree.
+- A squash commit can hold upstream's whole tree, `docs/screenshots/*.png` (game captures) included, even when the merge drops them: check `git ls-tree -r <squash>` before pushing. CI checks every commit a push adds, so such a commit fails it.
+- Our changes to the subtree are `git diff <last squash>^{tree} HEAD:zakuro`, run from the repository root: from inside `zakuro/` the pathspec gains a `zakuro/` prefix and the diff comes out empty without an error.
 - Never send AI-written code upstream without human review and disclosure: the author discards fully AI-written contributions.
 - Only general fixes go upstream (warm preload, GS mode 2, pipeline keys, diagnostics). KIU-specific parts (mouse aim modes, controls panel, KIU default keymap) stay in this repo.
 - When upstream already did something we also did, redo the conflicted files with `git merge-file --diff3` against our tip without those commits (base = the previous upstream split, theirs = the new upstream commit): ours drops out by itself and the conflicts shrink (0.2.31: raster.rs from 39 to 9).

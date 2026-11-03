@@ -91,7 +91,8 @@ The log is at `%APPDATA%\zakuro\zakuro.log`.
 
 - `hitch:` lines mark slow frames and give a per-frame breakdown of where
   the time went.
-- `zakuro_core::slow` lines name recompiled calls that took 20 ms or more.
+- `zakuro_core::slow` lines name recompiled calls, syscalls and service
+  requests that took 20 ms or more.
 - Page fault counts show whether the program or ROM was still being loaded
   from disk (see the warm-up in the README; `ZAKURO_NO_WARM=1` turns it off
   for comparison).

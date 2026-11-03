@@ -28,6 +28,15 @@
   interrupted unpack of gcc no longer leaves half a toolchain behind.
 - The `no game files` check reads every commit a push adds, and also
   blocks `tools/`, `build/`, `Play.bat`, game audio and icons.
+- **Esc > Options** now opens Zakuro's own settings, in the same Kid Icarus
+  look, instead of a window of its own: inverting the mouse aim and taking
+  the mouse back are under **Controls**, pausing in the background, the
+  Discord status and Fullscreen under **Interface**. Every setting keeps its
+  name in `settings.toml`.
+- Fixed: the controller's Home button left the mouse aim on over the pause
+  menu; turning off "Take the mouse back" had no effect after switching
+  windows; the "Loading the game into memory" notice could stay up for good
+  when reading the game stopped short.
 
 ## v0.1.0 — first release
 

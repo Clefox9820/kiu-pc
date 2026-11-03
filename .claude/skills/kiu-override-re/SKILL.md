@@ -16,7 +16,7 @@ Load when a change needs the game itself to behave differently (true mouse camer
 - Never state a function's purpose, address or formula without evidence from the binary or a runtime trace; AI-assisted RE has fabricated functions before (acnl-re). Mark unverified findings as such.
 - Overrides are hand-written C in this repo; they may reference addresses but must not copy disassembly or game bytes.
 - Never edit generated code in `build/port/code/`.
-- Overrides are written with European addresses only. Every address they name, comments included, needs its USA address in `$UsaAddresses` in `scripts/setup.ps1`; otherwise the USA build stops. Get it with `scripts\find-usa-addresses.ps1 -Europe <eur rom> -Usa <usa rom>`, never by guessing an offset. If it reports `not found`, the function changed between releases: find it by hand and say so.
+- Overrides are written with European addresses only. Every address they name, comments included, needs its USA address in `overrides/usa-addresses.psd1`; otherwise the USA build stops (every 8-digit address in the code segment and every `RECOMP_` mark are checked). Get it with `scripts\find-usa-addresses.ps1 -Europe <eur rom> -Usa <usa rom>`, never by guessing an offset. If it reports `not found`, the function changed between releases: find it by hand and say so.
 - A save state holds what the game worked out before it was saved: values cached at boot (the camera's projection matrix at camera+0x6C) never change when you patch their inputs from a state. Trace from boot instead: a scratch `zakuro-core` example that steps the interpreter and prints the PC writing a watched address found 0x003902B0 that way.
 - Gateway cheats: the first hex digit of a line is the code type; an address at 0x10000000 or above needs a `D3000000 <base>` offset line, or the write lands elsewhere.
 - Every override needs an in-game verification step the user can run, plus a RAM or image check when possible.
@@ -36,7 +36,7 @@ Load when a change needs the game itself to behave differently (true mouse camer
 2. Locate candidates with a runtime trace (log writes to a watched address, or `zakuro_core::slow` thread/PC hints).
 3. Read the function in the generated C or a disassembler; write down evidence (address, inputs, outputs).
 4. Write the override (see 3dsrecomp `docs/overrides.md`), pass it with `--overrides`, rebuild (`kiu-build`).
-5. Run `scripts\find-usa-addresses.ps1`, add what it reports to `$UsaAddresses`, and rerun it until it prints `setup.ps1 has every USA address`. Rebuild both releases.
+5. Run `scripts\find-usa-addresses.ps1`, add what it reports to `overrides/usa-addresses.psd1`, and rerun it until it prints `overrides\usa-addresses.psd1 has every USA address`. Rebuild both releases.
 6. Verify with the check from step 1 in both releases and ask the user to confirm in play.
 
 ## Output Contract
