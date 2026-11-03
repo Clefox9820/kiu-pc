@@ -5,10 +5,11 @@ release `0004000000030200` or USA release `0004000000030100`), made from your
 own copy of the game.
 
 The game's ARM CPU code is statically recompiled to C with
-[3dsrecomp](https://github.com/fearkov/3dsrecomp) (pinned at commit
+[3dsrecomp](https://github.com/fearkov/3dsrecomp) (translator pinned at commit
 `c3f21f94ba50d688025febc8974ff348d471b587`) and linked into the runtime of the
 [Zakuro](https://github.com/fearkov/zakuro) 3DS emulator, which is included
-here in `zakuro/` with changes for this game.
+here in `zakuro/` with changes for this game. 3dsrecomp's runtime library is
+the one `zakuro/Cargo.lock` names, which runs code from that translator.
 
 ## What is native and what is emulated
 
@@ -62,7 +63,8 @@ function by address.
   compilers to run in parallel from the free RAM, measured once at the start.
 
 The setup script downloads its own toolchain into `tools/` (WinLibs gcc 16.2
-and Rust for the GNU target), so nothing needs to be installed system-wide.
+and Rust 1.99.1 for the GNU target, each checked against its published
+SHA-256), so nothing needs to be installed system-wide.
 Apart from small temporary files, it only writes inside the repository
 folder.
 
@@ -77,7 +79,7 @@ powershell -ExecutionPolicy Bypass -File scripts\setup.ps1 -Rom "D:\path\to\your
 The script:
 
 1. Checks that the ROM is *Kid Icarus: Uprising* and is decrypted.
-2. Installs gcc and Rust into `tools/`.
+2. Installs gcc and Rust into `tools/`, checking each download.
 3. Clones and builds 3dsrecomp at the pinned commit.
 4. Translates the game's code into `build/port` (`build/port-usa` for the
    USA release).
@@ -153,19 +155,62 @@ aim speeds.
 | Tab | Fast forward |
 
 **Esc > Options** opens Zakuro's settings, drawn in the game's own menu
-style. Besides resolution, smoother motion, screens, filter, sound and the
-game's language, they hold what this port adds: under **Controls**, the
-mouse aim speeds and inverting the vertical aim; under **Interface**,
-pausing while another window is in front, taking the mouse aim back when
-you return to the window, a Fullscreen button, and a Discord status (off by
-default) that shows whether you are in the menus, on foot or flying, the
-story's chapter you are playing, and for how long, when the Discord app is
-open on the same computer.
+style. Besides resolution, frame interpolation, sound and the game's
+language, they hold what this port adds:
+
+- **Graphics**: Sharp HUD, the screen layouts for
+  [playing on one screen](#playing-on-one-screen-work-in-progress), the
+  FSR and Anime4K filters, and the top screen's shape (16:9 or 21:9).
+- **Controls**: the mouse aim speeds for flying and on foot, inverting the
+  vertical aim, and taking the mouse aim back when you return to the window.
+- **Interface**: pausing while another window is in front, a Fullscreen
+  button, and a Discord status (off by default) that shows whether you are
+  in the menus, on foot or flying, the story's chapter you are playing, and
+  for how long, when the Discord app is open on the same computer.
+
+Every setting is kept in `%APPDATA%\zakuro\settings.toml`.
 
 Mouse aim also switches by itself: on foot, flying, or off in menus; 1, 2
 or 3 picks one until the game changes mode. A short notice is shown when
 the aim mode changes. Mode 3 recenters the stylus instead of letting it
 reach the screen edge, which avoids the game's quick "flick" camera spin.
+
+## Playing on one screen (work in progress)
+
+Kid Icarus spreads its game over both of the 3DS's screens. This build can
+be played on the top screen alone:
+
+1. In **Esc > Options > Graphics > Screens**, pick **"Top screen, the
+   bottom one over it in menus"** (`auto` in `settings.toml`). The top
+   screen shows alone in battle, cutscenes and loading; where the game is
+   not in play (the title, the temple's menus, results, the pause menu) the
+   bottom screen shows over its middle, and the mouse touches it there.
+   While playing, F9 switches layouts and F10 switches between the top and
+   the bottom screen alone.
+2. Start the game with `ZAKURO_PORTRAITS=1` to bring what the bottom screen
+   shows in battle up to the top one:
+
+   ```bat
+   set ZAKURO_PORTRAITS=1
+   Play.bat
+   ```
+
+   - The dialogue portraits, smaller, in the lower corner on the speaker's
+     side under the subtitles, fading in, out and between pictures. The
+     game's own draws are reused, so expressions stay the game's.
+   - The counters (intensity, enemies defeated, hearts) under the score, and
+     the powers (the orbs in the air, the power palette on foot) under the
+     health bar, a frame behind.
+   - Subtitles with a dark drop shadow, each line centered on the screen.
+
+   It is off unless set, because it recognises portraits and subtitles by
+   their shape, which another game could also draw. Portraits are only taken
+   while the overrides say a battle is on, so menu pictures of the same kind
+   are left alone.
+3. Put the subtitles on the top screen with the game's own option,
+   **Options > Other > Subtitles > Upper**. The game applies it when a
+   chapter starts, so a save state from the middle of a chapter keeps what
+   was set then.
 
 ## Performance
 
@@ -211,75 +256,20 @@ If you still see stutter, the log at `%APPDATA%\zakuro\zakuro.log` contains
 `hitch:` lines with a per-frame breakdown and a `pacing:` line every 10
 seconds; include them in a bug report.
 
-## Single screen (work in progress)
-
-The goal is to play on the top screen alone. So far:
-
-- `ZAKURO_PORTRAITS=1` draws the dialogue portraits from the bottom screen
-  on the top screen as well: smaller, in the lower left or right corner on
-  the speaker's side, under the subtitles, fading in, out and between
-  pictures. The game's own draws are reused, so expressions stay the
-  game's. Portraits are only taken while the game overrides say a battle
-  is on, so menu pictures of the same kind are left alone. It also gives
-  the top screen's subtitles a dark drop shadow so they read over bright
-  scenes, and centers each of their lines on the screen: the game writes
-  them left-aligned into its text buffer, and the letters it writes there
-  say how wide each line is. It is off unless set, because it recognises portraits and
-  subtitles by their shape, which another game could also draw.
-- The screen layout "Top screen, the bottom one over it in menus" (`auto`
-  in `settings.toml`) shows the top screen alone in battle and the bottom
-  screen over its middle when the game is not in play: the title, the
-  temple's menus, results and the pause menu. The mouse touches it there.
-  It follows the same in-play signal, so it also shows during cutscenes
-  and loading.
-- Subtitles on the top screen are the game's own option. The game applies
-  it when a chapter starts, so a save state from the middle of a chapter
-  keeps what was set then.
-- With `ZAKURO_PORTRAITS=1`, the bottom screen's battle display shows on the
-  top screen too, a frame behind: the counters (intensity, enemies
-  defeated, hearts) under the score, and the powers (the orbs in the air,
-  the power palette on foot) under the health bar, both against the
-  screen's edge. The game's own draws are moved there, picked by where
-  they are on the bottom screen.
-
-Tools used to work on it:
-
-- `ZAKURO_LOAD_SLOT=<1-9>` starts the game from that save-state slot, for
-  runs that should begin at the same place.
-- `ZAKURO_SHOT=<path prefix>` saves both screens as the GPU shows them every
-  600 frames, as `<prefix>-<frame>-top.png` and `-bottom.png`. Runs from the
-  same slot with no input draw the same frames, so two builds can be compared
-  pixel by pixel, the pictures in between included (`-top-between.png`).
-  Windows' own captures of the game window come out white while the display
-  is asleep.
-- `ZAKURO_TWIN_ALL=1` has frame interpolation draw every picture in between as
-  it did before it knew which screens the window shows, so one build can be
-  compared both ways; `RUST_LOG=zakuro_gpu::twins=debug` says what it drew for
-  each buffer every 600 frames.
-- The log counts late frames every 10 s (`pacing:`) and names slow service
-  requests. `RUST_LOG=info,zakuro::frames=debug` logs every frame's time and
-  draws, and `zakuro_gpu::waits=debug` every wait for the GPU, with the line
-  that asked for it.
-- `ZAKURO_LOG_DRAWS=1` logs each texture drawn and the buffer it goes into,
-  named as `ZAKURO_DUMP_TEXTURES=<folder>` saves the pictures, to tell which
-  draws are which. It slows drawing.
-
 ## Status and known issues
 
 - The game runs with the recompiled code; about 99.4% of executed
   instructions are native.
-- Mouse aim on foot (mode 3) was recently redesigned and has not yet been
-  confirmed in real play. Feedback is welcome.
 - Vertices are shaded on a dedicated GPU and on the CPU with an integrated
   one: on a Ryzen 5600G at 2x with frame interpolation the GPU's shading
   took two thirds of its time and left up to a sixth of a flight's frames
   late, the CPU's 1% at most. `ZAKURO_CPU_SHADERS=1` or
   `ZAKURO_GPU_SHADERS=1` picks one.
 - Mouse look on foot, mouse aim while flying and the automatic aim mode
-  come from hand-written
-  overrides in `overrides/`, found for the European release
-  (`0004000000030200`) and not yet confirmed in real play. Builds made
-  before it was added need `scripts\setup.ps1 -Force` to get it.
+  come from hand-written overrides in `overrides/`, found for the European
+  release (`0004000000030200`) and not yet confirmed in long real play.
+  Feedback is welcome. A build made before an override changed needs
+  `scripts\setup.ps1 -Force` to get it.
 - For the USA release, `scripts\setup.ps1` writes a copy of the overrides to
   `build/overrides-usa` with that release's addresses, listed in
   `overrides/usa-addresses.psd1`. The functions were matched by their code
@@ -291,8 +281,10 @@ Tools used to work on it:
   wider 3D scene instead of stretching it, through an override of the
   camera's projection. Zakuro keeps the HUD in proportion: each 2D piece
   along an edge is squeezed back toward that edge, and the rest, such as
-  markers, around its own middle. A shape changed during play applies to
-  each camera the next time the game asks for its projection.
+  markers, around its own middle; portraits and badge figures stay in
+  place. A shape changed during play applies to each camera the next time
+  the game asks for its projection. Checked in battle on foot and in flight
+  and in cutscenes; menus with 3D were not checked.
 - **Screen filter: FSR (AMD)**, when the window is bigger than the
   resolution the game is drawn at, first smooths each screen's jagged edges
   with SMAA (iryoku/smaa, MIT), then upscales it with AMD FidelityFX Super
@@ -333,12 +325,36 @@ Tools used to work on it:
   `RUST_LOG=info,zakuro_core::services::uds=trace` to log every packet.
 - Performance was measured on one PC (Ryzen 5 5600G, integrated Radeon,
   Windows 10). On that driver, Vulkan's presentation in fifo mode, the only
-  vsync mode it offers, blocks until the GPU finishes the frame; presenting
-  from a thread of its own on a second queue is being tried. Reports from
-  other GPUs are welcome.
+  vsync mode it offers, blocks until the GPU finishes the frame. Reports
+  from other GPUs are welcome; include the `hitch:` and `pacing:` lines from
+  the log.
 - The changes to Zakuro in this repository were written with AI assistance.
   They have not been sent upstream; the Zakuro author does not accept fully
   AI-written contributions, so a human must review them first.
+
+## Development tools
+
+Environment variables used to work on the port:
+
+- `ZAKURO_LOAD_SLOT=<1-9>` starts the game from that save-state slot, for
+  runs that should begin at the same place.
+- `ZAKURO_SHOT=<path prefix>` saves both screens as the GPU shows them every
+  600 frames, as `<prefix>-<frame>-top.png` and `-bottom.png`. Runs from the
+  same slot with no input draw the same frames, so two builds can be compared
+  pixel by pixel, the pictures in between included (`-top-between.png`).
+  Windows' own captures of the game window come out white while the display
+  is asleep.
+- `ZAKURO_TWIN_ALL=1` has frame interpolation draw every picture in between as
+  it did before it knew which screens the window shows, so one build can be
+  compared both ways; `RUST_LOG=zakuro_gpu::twins=debug` says what it drew for
+  each buffer every 600 frames.
+- The log counts late frames every 10 s (`pacing:`) and names slow service
+  requests. `RUST_LOG=info,zakuro::frames=debug` logs every frame's time and
+  draws, and `zakuro_gpu::waits=debug` every wait for the GPU, with the line
+  that asked for it.
+- `ZAKURO_LOG_DRAWS=1` logs each texture drawn and the buffer it goes into,
+  named as `ZAKURO_DUMP_TEXTURES=<folder>` saves the pictures, to tell which
+  draws are which. It slows drawing.
 
 ## Credits
 
@@ -346,6 +362,9 @@ Tools used to work on it:
   this possible.
 - [WinLibs](https://winlibs.com/) for the gcc build used on Windows.
 - The [Rust](https://www.rust-lang.org/) project.
+- [bloc97/Anime4K](https://github.com/bloc97/Anime4K) for the Anime4K
+  networks, [iryoku/smaa](https://github.com/iryoku/smaa) for SMAA, and AMD
+  for FidelityFX Super Resolution 1.
 
 ## License
 

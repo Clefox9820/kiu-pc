@@ -54,8 +54,8 @@ powershell -ExecutionPolicy Bypass -File scripts\setup.ps1 -Rom "D:\path\to\your
 Kid Icarus spreads its game over both of the 3DS's screens; this build can
 be played on the top screen alone:
 
-- **Esc > Options > Screens > "Top screen, the bottom one over it in
-  menus"** shows the top screen alone in battle, cutscenes and loading, and
+- **Esc > Options > Graphics > Screens > "Top screen, the bottom one over
+  it in menus"** shows the top screen alone in battle, cutscenes and loading, and
   the bottom screen over its middle where the game is not in play (the
   title, the temple's menus, results, the pause menu), where the mouse
   touches it. F9 switches layouts while playing, F10 between the top and the
