@@ -236,7 +236,7 @@ impl Memory {
     /// the mailbox word at addr, when it is one.
     fn mailbox_word(addr: VAddr) -> Option<usize> {
         let index = addr.wrapping_sub(HOST_MAILBOX_VADDR) as usize / 4;
-        (addr >= HOST_MAILBOX_VADDR && addr % 4 == 0 && index < HOST_MAILBOX_WORDS).then_some(index)
+        (addr >= HOST_MAILBOX_VADDR && addr.is_multiple_of(4) && index < HOST_MAILBOX_WORDS).then_some(index)
     }
 
     /// watches the physical pages under a range for writes from now on,
